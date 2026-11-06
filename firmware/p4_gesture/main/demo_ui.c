@@ -285,9 +285,10 @@ void demo_ui_emit_boot_report(void)
     demo_emit("DEMO:TOUCH cst820_0x15=%s i2c=[%s] lvgl_indev=%d",
               bsp_touch_present() ? "OK" : "NO_ACK", bsp_touch_last_scan(),
               bsp_touch_present());
-    demo_emit("DEMO:PWR hold=OK survived=%d vbus=%d batt=%dmV pad_hold=%d",
-              bsp_power_download_survived(), bsp_power_usb_attached(),
-              bsp_power_battery_mv(), bsp_power_pad_hold_active());
+    demo_emit("DEMO:PWR hold=OK key_at_boot=%d survived=%d vbus=%d batt=%dmV pad_hold=%d",
+              bsp_power_key_at_boot(), bsp_power_download_survived(),
+              bsp_power_usb_attached(), bsp_power_battery_mv(),
+              bsp_power_pad_hold_active());
     demo_emit("DEMO:RESULT AUTOFLASH=READY LVGL=%s TOUCH=%s HID=READY",
               bsp_display_lvgl_ready() ? "OK" : "FAIL",
               bsp_touch_present() ? "OK" : "NO_CTP");

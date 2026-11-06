@@ -22,6 +22,7 @@ static const char *TAG = "BSP_POWER";
 RTC_NOINIT_ATTR static uint32_t s_dl_marker;
 static bool s_download_survived;
 static bool s_pad_hold_active;
+static bool s_key_at_boot;      /* 开机锁存瞬间电源键是否仍被按住 */
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_channel_t s_adc_chan;
@@ -56,7 +57,10 @@ void bsp_power_prepare_download_reset(void)
 
 void bsp_power_init(void)
 {
-    /* 第一件事：锁存电源。这块板靠 PWR_HOLD 维持 VSYS，松手即掉电。 */
+    /* 按键开机的最后一步，也是 app_main 的第一件事：
+       SW1 按下时 D1/Q1 已把 VSYS 接到 SYS_PWR_EN（硬件上电），固件一上来
+       把 PWR_HOLD 拉高，让 Q2 接管 Q1 栅极 —— 此后松手也不掉电。
+       必须尽早：晚一毫秒，用户就得多按住一毫秒。 */
     bsp_gpio_out(PIN_PWR_HOLD, 1);
 
     /* 先读诊断，再释放上一次复位遗留的 pad hold。顺序不能反：释放 hold
@@ -80,6 +84,14 @@ void bsp_power_init(void)
     bsp_gpio_in(PIN_VBUS_ON, false);
     bsp_gpio_in(PIN_PWR_DET, true);
     bsp_gpio_in(PIN_BUCK_PG, true);
+
+    /* 记录开机瞬间 SW1 是否还按着（1 = 正常的「按住电源键开机」）。
+       仅用于日志 / 开机报告，不参与供电判定：锁存已经在函数第一行完成，
+       此后无论按键状态如何都保持开机，本版本也不做任何关机动作。 */
+    s_key_at_boot = bsp_power_key_pressed();
+    /* 放在 ADC 初始化之前：即使电池采样不可用，开机事实也一定要有日志。 */
+    ESP_LOGI(TAG, "power ON latched (PWR_HOLD=1, no software power-off), key_at_boot=%d",
+             s_key_at_boot);
 
     adc_unit_t unit;
     if (adc_oneshot_io_to_channel(PIN_BAT_AD, &unit, &s_adc_chan) != ESP_OK) {
@@ -148,4 +160,5 @@ int bsp_power_battery_mv(void)
 
 bool bsp_power_usb_attached(void) { return bsp_gpio_read(PIN_VBUS_ON) != 0; }
 bool bsp_power_key_pressed(void)  { return bsp_gpio_read(PIN_PWR_DET) == 0; }
+bool bsp_power_key_at_boot(void)  { return s_key_at_boot; }
 bool bsp_power_buck_ok(void)      { return bsp_gpio_read(PIN_BUCK_PG) != 0; }

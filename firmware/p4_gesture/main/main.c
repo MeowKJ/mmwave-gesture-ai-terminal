@@ -4,7 +4,7 @@
  * 目标：一根 USB-C 线，验证「无感下载 + OLED/LVGL + 触摸」三件事。
  *
  * 顺序（刻意安排）：
- *   0. PWR_HOLD 拉高锁存 VSYS，释放上次下载留下的 pad hold —— 必须最先做
+ *   0. 电源键开机：PWR_HOLD 拉高锁存 VSYS，释放上次下载留下的 pad hold —— 必须最先做
  *   1. USB CDC+HID 尽早枚举 —— 即使后面显示初始化卡住，也能无感重新烧写
  *   2. 屏：官方 CO5300 组件 + 官方初始化表；纯色自检 -> LVGL
  *   3. 触摸：CST820 I2C 扫描 -> 注册成 LVGL indev -> DEMO UI
@@ -66,11 +66,13 @@ void app_main(void)
              esp_get_idf_version(), CONFIG_IDF_TARGET);
     ESP_LOGI(TAG, "reset_reason=%d", esp_reset_reason());
 
-    /* 0. 电源锁存（含下载复位掉电体检） */
+    /* 0. 电源键开机：SW1 按下由硬件上电，这里把 PWR_HOLD 锁存住，
+          之后松手不掉电。本版本不做长按动作、不做软件关机。 */
     bsp_power_init();
-    ESP_LOGI(TAG, "battery=%d mV, USB=%d, key=%d, buck_pg=%d, survived=%d",
+    ESP_LOGI(TAG, "=== POWER ON: PWR_HOLD latched, SW1 can be released now ===");
+    ESP_LOGI(TAG, "battery=%d mV, USB=%d, key=%d, key_at_boot=%d, buck_pg=%d, survived=%d",
              bsp_power_battery_mv(), bsp_power_usb_attached(),
-             bsp_power_key_pressed(), bsp_power_buck_ok(),
+             bsp_power_key_pressed(), bsp_power_key_at_boot(), bsp_power_buck_ok(),
              bsp_power_download_survived());
 
     /* 1. USB：下载通道 + HID 输入 + 日志，越早越好 */
@@ -115,15 +117,20 @@ void app_main(void)
     ESP_LOGI(TAG, "=== DEMO #1 ready: send HELP over USB CDC ===");
 
     unsigned round = 0;
+#if CONFIG_APP_USB_DOWNLOAD_ON_LONG_KEY
     unsigned key_held = 0;
+#endif
+    /* 电源键只负责开机：本版本不做长按动作，也不做任何软件关机。 */
     while (true) {
         bsp_touch_poll();            /* 注册 LVGL indev 后自动变成 no-op */
         bsp_radar_poll();
         uint32_t fps = sample_fps();
 
 #if CONFIG_APP_USB_DOWNLOAD_ON_LONG_KEY
-        /* 长按电源键 3 秒也可以主动请求无感下载（不方便跑脚本时的兜底）。
-           PWR_DET 按下为低；此时手还按着键，正好给 HOLD 电路保电。 */
+        /* 可选兜底（默认关闭）：长按电源键 3 秒请求 USB 下载。
+           这不是关机，但会 tud_disconnect() + esp_restart()，屏幕熄灭，
+           且 R13 下拉使复位窗口存在真掉电风险 —— 所以默认不编进固件。
+           PWR_DET 按下为低；手还按着键时正好给 HOLD 电路保电。 */
         if (bsp_power_key_pressed()) {
             if (++key_held >= 15) {
                 bsp_usb_request_download();

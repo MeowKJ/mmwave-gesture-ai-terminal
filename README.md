@@ -14,7 +14,7 @@
 | 音频 | ES8389 codec，I²C + I²S0 48 kHz 双向 |
 | 雷达 | 毫米波模块，UART + 电源/复位控制 |
 | USB | 原生 USB 2.0 HS OTG，TinyUSB CDC-ACM + HID 复合设备 |
-| 电源 | `PWR_HOLD`(GPIO29) 自锁 / `VBUS_ON`(GPIO28) 输入检测 / 电池 ADC |
+| 电源 | 电源键 SW1 按住开机 / `PWR_HOLD`(GPIO29) 自锁 / `VBUS_ON`(GPIO28) 输入检测 / 电池 ADC；无软件关机 |
 
 完整 GPIO 映射见 [`firmware/p4_gesture/main/board_pins.h`](firmware/p4_gesture/main/board_pins.h)。
 
@@ -39,7 +39,7 @@ esptool --before no-reset --after hard-reset（USB-OTG 走 watchdog_reset）
 ```
 
 应用态 PID `0x4005` = `0x4000 | CDC(1) | HID(4)`；ROM 下载态 PID `0x0012`。
-触发路径共四条：主机 magic、DTR/RTS 兼容脉冲、屏幕 `USB FLASH` 双击、长按电源键（CDC 亦可发 `DOWNLOAD`）。
+触发路径共三条：主机 magic（`MEOAVE-DOWNLOAD` / CDC 发 `DOWNLOAD`）、DTR/RTS 兼容脉冲、屏幕 `USB FLASH` 双击。**长按电源键 3 s 的兜底默认关闭**（`CONFIG_APP_USB_DOWNLOAD_ON_LONG_KEY`）：它会断开 USB 并复位，屏灭且在 R13 未改板时有真掉电风险，与「电源键只开机、不关机」的当前设计冲突。
 
 > 空片首次下载仍需按住 BOOT 上电烧一次，之后全程无感。
 
@@ -55,6 +55,21 @@ esptool --before no-reset --after hard-reset（USB-OTG 走 watchdog_reset）
 460×460 屏上显示 USB / VSYNC / FPS / 电源 / 触摸 I²C 状态；`RESCAN` / `USB FLASH`（双击确认）/ `CLEAR` 按钮；开机自检与心跳标记供主机脚本判定 PASS/FAIL。
 
 CDC 交互指令：`HELP / STATUS / SCAN / TOUCH x y / COLORS / CLEAR / HID / DOWNLOAD`。
+
+### 4. 电源键：只开机、不关机
+
+电源键 SW1 **只负责开机，本版本不做任何关机操作**。电路依据 `SCH_Schematic4_2026-11-06.pdf` / `Netlist_Schematic4_2026-11-06.tel`：
+
+1. 按住 SW1 → D1(BAT54W) 把 Q1(AO3401A, P-MOS) 栅极拉低 → VSYS 接通 `SYS_PWR_EN` → U10(SY8089) 出 3V3；同时 D2 把 `PWR_DET`(GPIO30) 拉低。
+2. ROM → 2nd bootloader → `app_main()` 第一行 `bsp_power_init()` 把 `PWR_HOLD`(GPIO29) 拉高 → Q2(AO3400A, N-MOS) 导通并接管 Q1 栅极。
+3. 看到 `POWER ON: PWR_HOLD latched, SW1 can be released now` 后即可松手，此后一直保持供电。开机报告里的 `key_at_boot` 记录锁存瞬间按键是否仍按着。
+
+注意事项：
+
+- **必须按住数百毫秒**，不能点一下就松手。R13(470K) 把 `PWR_HOLD` 下拉到 GND，固件配置 GPIO29 之前它是高阻，松手即掉电 —— 这是硬件约束，纯软件改不了；想改成点按开机需改板（自锁触发器或 RC 延时）。
+- **插 USB-C 不会自动开机**：VBUS 只到充电芯片 U4 和 `VBUS_ON` 分压检测，电源键是唯一开机入口。烧写全程也要按住 SW1。
+- 固件不提供任何拉低 `PWR_HOLD` 的接口，也没有 deep-sleep 断电：要关机只能断开电池 / 拔线。
+- 软件关机在硬件上可行（拉低 `PWR_HOLD` → Q2 关断 → R10 把 Q1 栅极拉回 VSYS → 3V3 掉电）。但按键仍按着时 D1 会旁路 Q2，必须松手才真正断电；后续要做需一并处理这个时序。
 
 ## 目录
 
@@ -97,7 +112,8 @@ VSCode 里也可直接跑任务 `DEMO #1 - run`。依赖 `pyserial` 与 `esptool
 
 - ✅ 沙盒外 IDF 原生环境 `ninja -t clean` 后全量 `ninja all`，`exit=0`；自有代码 0 warning。
 - ✅ `demo_test.py --check`、`flash_usb.py --dry-run`、反汇编校验（`0x501101c4` pad hold、`0x50110008` force-download）均通过。
-- ⚠️ **新板尚未接入实测**：烧写、点屏、物理触摸、ROM PID 重枚举、`hard-reset` 回应用均待上板验证。
+- ✅ 电源键行为按原理图 / 网表核实：Q1 AO3401A + Q2 AO3400A + D1/D2 BAT54W + R10/R13 470K；当前固件「按住开机、不做关机」，长按 3 s 下载兜底默认关闭。
+- ⚠️ **新板尚未接入实测**：烧写、点屏、物理触摸、ROM PID 重枚举、`hard-reset` 回应用均待上板验证。空片 ROM 日志已在 UART0(COM3) 读到，Flash 为空。
 - ⚠️ 硬件建议：原理图中 `R13(470K)` 把 `PWR_HOLD` 下拉到 GND，复位窗口 GPIO 高阻可能导致 3V3 掉电。固件已用 LP_SYS 常开域 pad hold 跨复位锁存，量产仍建议把 R13 改接 `VBUS_ON` 作为硬件保险。
 
 ## 许可

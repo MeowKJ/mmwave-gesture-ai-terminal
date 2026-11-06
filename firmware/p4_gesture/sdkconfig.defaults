@@ -42,3 +42,7 @@ CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
+
+# ---- 电源键 ----
+# 电源键只负责开机（按住 SW1 -> PWR_HOLD 自锁），不做长按动作、不做软件关机。
+# 长按 3 s 进 USB 下载模式的兜底由 Kconfig.projbuild 默认关闭，需要时 menuconfig 打开。

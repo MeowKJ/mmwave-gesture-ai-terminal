@@ -20,10 +20,18 @@
  *  - eFuse DIS_USB_OTG_DOWNLOAD_MODE 必须保持 0（默认）
  *  - D3 = USBLC6-2P6 ESD 管，HS 信号建议换 <1pF 低容器件
  *
- * 电源 HOLD：PWR_HOLD(GPIO29) 经 Q2 控 Q1 把 VSYS 锁存到 SYS_PWR_EN。
- *      R13(470K) 把 Q2 栅极下拉到 GND —— 芯片复位时 GPIO29 变高阻，
- *      3V3 会掉电，USB 下载随之中断。硬件必须把 R13 改接 VBUS_ON，
- *      否则「无感下载」不成立（详见交付说明）。
+ * 电源 HOLD / 按键开机（Schematic4 POWER 页，已按网表逐点核对）：
+ *      SW1(TS6611B3JTP, 1/3=GND) 按住 -> D1/D2(BAT54W) 把 Q1(AO3401A
+ *      P-MOS) 栅极网络拉低 -> VSYS 接通 SYS_PWR_EN -> U10 出 3V3；
+ *      同时 PWR_DET(GPIO30) 被拉低供 MCU 读取。
+ *      PWR_HOLD(GPIO29) -> Q2(AO3400A N-MOS) 栅极；固件第一件事把它拉高，
+ *      Q2 导通后接管 Q1 栅极，松手即保持供电（= 按了以后开机）。
+ *      R10(470K) 上拉 Q1 栅极、R13(470K) 下拉 PWR_HOLD，因此：
+ *        - 必须按住 SW1 直到 app_main 跑到 bsp_power_init()，不能点按即松手；
+ *        - 插 USB 不会自动开机（VBUS 只到 U4 充电与 VBUS_ON 分压检测）；
+ *        - 芯片复位时 GPIO29 变高阻 -> Q2 关断 -> 3V3 掉电，下载随之中断。
+ *      硬件建议把 R13 改接 VBUS_ON 作为「无感下载」保险（详见 README）。
+ *      软件关机（拉低 PWR_HOLD）硬件可行，但本版本刻意不实现。
  */
 #pragma once
 

@@ -34,10 +34,13 @@ config APP_AUDIO_CODEC_INIT
       bringing up a new codec revision with an unverified register map.
 
 config APP_USB_DOWNLOAD_ON_LONG_KEY
-    bool "Hold power key 3 s to enter USB download mode"
-    default y
+    bool "Hold power key 3 s to enter USB download mode (ON-only power key when off)"
+    default n
     help
-      Convenience fallback: a long press requests the same no-button USB
-      download path from the application, without a host-side magic string.
+      OFF by default: the power key only powers the board on. This build has
+      no long-press action and no software power-off.
+      Enable only as a host-free fallback to re-enter ROM USB download mode.
+      It disconnects USB and reboots the chip; with R13 pulling PWR_HOLD low,
+      the reset window can brown out the 3V3 rail.
 
 endmenu
