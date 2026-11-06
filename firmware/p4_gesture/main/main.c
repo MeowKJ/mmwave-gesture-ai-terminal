@@ -39,8 +39,12 @@ static int64_t s_last_fps_us;
 void bsp_platform_prepare_download(void)
 {
     ESP_LOGW(TAG, "prepare download: dropping display/audio/radar load");
-    bsp_display_set_brightness(0);
-    bsp_gpio_out(PIN_LCD_VCI_EN, 0);
+    /* Do not send a DSI brightness command here.  The DSI host can have a
+       full command FIFO while the panel/LVGL path is stopping; waiting for
+       it would wedge the usb_dl task before tud_disconnect() and watchdog.
+       The custom board drives LCD VCI_EN from GPIO20.  Keep it asserted while
+       entering ROM download so the power latch/display rail is not disturbed
+       during the USB transition. */
     bsp_gpio_out(PIN_PA_CTRL, 0);
     bsp_gpio_out(PIN_AUDIO_PWR_EN, 0);
     bsp_gpio_out(PIN_RADAR_PWR_EN, 0);

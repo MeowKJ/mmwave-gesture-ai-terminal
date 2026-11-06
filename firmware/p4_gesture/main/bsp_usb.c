@@ -231,17 +231,23 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
 {
     (void)itf;
     static bool armed;
+    static bool was_open;
     bool dtr = event->line_state_changed_data.dtr;
     bool rts = event->line_state_changed_data.rts;
     s_cdc_open = dtr;
 
     if (!dtr && rts) {
-        armed = true;
+        /* A normal host open may briefly expose this state.  Only arm the
+           compatibility pulse after the CDC session was already open. */
+        armed = was_open;
+        was_open = false;
     } else if (dtr && !rts && armed) {
         armed = false;
+        was_open = true;
         request_download("DTR/RTS pulse");
     } else if (dtr == rts) {
         armed = false;
+        if (dtr) was_open = true;
     }
 }
 

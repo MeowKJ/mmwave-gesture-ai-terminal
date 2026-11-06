@@ -38,6 +38,11 @@
 *.su
 
 ## 测试与临时数据
+/.local_cleanup/
+# PDF/原理图排查时生成的临时渲染，不包含原始参考资料。
+/tmp_*/
+/baseboard_schematic.png
+/official_mipi_adapter.png
 **/test-results/
 **/__pycache__/
 *.py[cod]

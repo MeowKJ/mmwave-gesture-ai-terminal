@@ -64,6 +64,12 @@ static const uint32_t s_colors[] = {
     0x0A1018, 0x800000, 0x006000, 0x000080, 0x505050,
 };
 
+#if LV_COLOR_DEPTH == 24
+#define DEMO_COLOR_MODE "rgb888"
+#else
+#define DEMO_COLOR_MODE "rgb565"
+#endif
+
 static bool eq(const char *a, const char *b) { return strcasecmp(a, b) == 0; }
 static bool starts(const char *a, const char *b) { return strncasecmp(a, b, strlen(b)) == 0; }
 
@@ -242,13 +248,13 @@ static void refresh_status_locked(void)
     snprintf(buf, sizeof(buf),
              "USB  VID=%04X PID=%04X  %s   VSYNC=%" PRIu32 "  FPS=%" PRIu32 "\n"
              "PWR  HOLD=OK  SURVIVED=%d  VBUS=%d  BAT=%dmV\n"
-             "LCD  %dx%d RGB565  1lane DSI  LVGL=9.4\n"
+             "LCD  %dx%d %s  1lane DSI  LVGL=9.4\n"
              "TP   CST820@0x15 %s   I2C[%s]\n"
              "LAST (%d,%d)  TAPS=%" PRIu32,
              USB_ESPRESSIF_VID, bsp_usb_pid(), s_usb_ready ? "READY" : "DOWN",
              s_vsync, s_fps,
              bsp_power_download_survived(), bsp_power_usb_attached(), s_battery_mv,
-             LCD_H_RES, LCD_V_RES,
+             LCD_H_RES, LCD_V_RES, DEMO_COLOR_MODE,
              bsp_touch_present() ? "OK" : "NO_ACK", bsp_touch_last_scan(),
              s_last_x, s_last_y, s_taps);
     lv_label_set_text(s_status, buf);
@@ -279,8 +285,9 @@ void demo_ui_emit_boot_report(void)
     demo_emit("DEMO:BOOT target=esp32p4 module=ESP32P4C5 demo=1");
     demo_emit("DEMO:USB vid=%04X pid=%04X rom_pid=%04X ready=%d",
               USB_ESPRESSIF_VID, bsp_usb_pid(), USB_ROM_PID, bsp_usb_ready());
-    demo_emit("DEMO:DISPLAY %dx%d rgb565 dsi1lane lvgl=%s vsync=%" PRIu32 " fps=%" PRIu32,
-              LCD_H_RES, LCD_V_RES, bsp_display_lvgl_ready() ? "OK" : "FAIL",
+    demo_emit("DEMO:DISPLAY %dx%d %s dsi1lane lvgl=%s vsync=%" PRIu32 " fps=%" PRIu32,
+              LCD_H_RES, LCD_V_RES, DEMO_COLOR_MODE,
+              bsp_display_lvgl_ready() ? "OK" : "FAIL",
               bsp_display_vsync_count(), s_fps);
     demo_emit("DEMO:TOUCH cst820_0x15=%s i2c=[%s] lvgl_indev=%d",
               bsp_touch_present() ? "OK" : "NO_ACK", bsp_touch_last_scan(),

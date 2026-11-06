@@ -1,5 +1,22 @@
 menu "Gesture Board Bring-up"
 
+config APP_FLS2_OFFICIAL_BASELINE
+    bool "Build the FLS2 official widgets demo with custom-board power/USB only"
+    default n
+    help
+      Selects a separate main file derived from the downloaded OSPTEK IDF6
+      LVGL9 example. Keep the gesture application unchanged. Build with the
+      separately generated build_fls2_source/sdkconfig and build_fls2_official.
+
+config APP_FLS2_AUTOTEST
+    bool "Repeat FLS2 widgets / solid colors / hardware bars after power-on"
+    depends on APP_FLS2_OFFICIAL_BASELINE
+    default n
+    help
+      Diagnostic-only loop, approximately 44 seconds per round. USB commands
+      LOOP OFF / LOOP ON pause and resume it. No repeated DCS reads, power
+      cycling, panel reset, timing changes or automatic damage verdict.
+
 config APP_COLOR_CYCLE_SEC
     int "Seconds per solid color in display self test"
     default 1

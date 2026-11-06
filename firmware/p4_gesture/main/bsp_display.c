@@ -1,13 +1,12 @@
 /*
  * 显示 BSP —— 依据 osptek 官方 esp32p4-idf6-co5300-mipi-lvgl-port-lvgl9
  *
- * 与官方例程的差异（都是为了这块板）：
- *  1. 增加 VCI_EN(GPIO20) 屏供电使能 + OLED_RST(GPIO12) 硬件复位
+ * 与官方例程的差异（都是为了这块自制板）：
+ *  1. 自制板的 VCI_EN / OLED_RST / OLED_TE 都由 ESP32-P4 直接引出，
+ *     不能套用官方 15-pin 转接板“硬件上拉、无需 GPIO 控制”的假设。
  *  2. 组件 esp_lcd_co5300 的 DCS 读 ID 已本地 patch 跳过（本屏不回 BTA，
  *     官方驱动无超时会卡死并触发 task_wdt）
- *  3. esp_lcd_panel_init() 之后补 set_pattern(BAR_VERTICAL)->(NONE)，
- *     否则 DSI bridge 的 DPI 输出不会真正打开，host_vsync 恒为 0
- *  4. 先跑纯色自检，再交给 LVGL
+ *  3. 先跑纯色自检，再交给 LVGL
  */
 #include "bsp_display.h"
 
@@ -59,10 +58,15 @@ static bool on_vsync(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_
 
 esp_err_t bsp_display_init(void)
 {
-    /* 屏供电：CN3.24 VCI_EN 高有效，R21 10K 上拉到 3V3 保证 GPIO 高阻时也供电。
-       先给电再硬复位，等 20ms 让屏内部 LDO 稳定。 */
-    bsp_gpio_out(PIN_LCD_VCI_EN, 1);
+    /* 自制板 LCD1 的电源/复位时序：
+       VCI_EN(GPIO20) -> 屏供电使能；OLED_RST(GPIO12) -> CO5300 硬复位。
+       两根线虽然各有 10K 上拉，但启动时仍显式配置，避免 GPIO 高阻期间
+       屏处于不确定状态。 */
+    bsp_gpio_out(PIN_LCD_VCI_EN, 0);
+    bsp_gpio_out(PIN_LCD_RST, 0);
     bsp_gpio_in(PIN_LCD_TE, false);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    bsp_gpio_out(PIN_LCD_VCI_EN, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
 
     /* MIPI DSI PHY 2.5V（P4 内部 LDO3，官方例程同款） */
@@ -114,6 +118,7 @@ esp_err_t bsp_display_init(void)
     };
 
     const esp_lcd_panel_dev_config_t panel_cfg = {
+        /* 自制板 OLED_RST 由 GPIO12 控制；不要使用官方转接板的 NC 配置。 */
         .reset_gpio_num = PIN_LCD_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = APP_BPP,
@@ -122,19 +127,22 @@ esp_err_t bsp_display_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_co5300(s_io, &panel_cfg, &s_panel), TAG, "new CO5300 failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init failed");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_co5300_set_brightness(s_panel, 100), TAG, "brightness failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_co5300_set_brightness(s_panel, 80), TAG, "brightness failed");
 
     const esp_lcd_dpi_panel_event_callbacks_t cbs = {.on_vsync = on_vsync};
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_register_event_callbacks(s_panel, &cbs, NULL),
                         TAG, "register vsync cb failed");
 
-    /* 关键：只有 pattern 发生变化才会 update_dpi_config 打开 DPI 输出 */
+    /* IDF6/CO5300 在这块 P4 DSI bridge 上需要第一次切换 DPI pattern
+       才会真正 enable video stream。官方测试用例也是先 BAR 再 NONE；
+       不做这一步时，panel_init() 可能返回 ESP_OK，但没有 VSYNC，
+       后面的 LVGL DSI display 也会创建失败，面板就一直黑。 */
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_set_pattern(s_panel, MIPI_DSI_PATTERN_BAR_VERTICAL),
-                        TAG, "set BAR pattern failed");
+                        TAG, "enable DSI color bars failed");
     vTaskDelay(pdMS_TO_TICKS(300));
-    ESP_LOGI(TAG, "DSI color bars, host_vsync=%" PRIu32, s_vsync);
+    ESP_LOGI(TAG, "DSI color bars started, vsync=%" PRIu32, s_vsync);
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_set_pattern(s_panel, MIPI_DSI_PATTERN_NONE),
-                        TAG, "set NONE pattern failed");
+                        TAG, "disable DSI color bars failed");
     vTaskDelay(pdMS_TO_TICKS(50));
 
     ESP_LOGI(TAG, "panel ready: %dx%d %dbpp, DSI 1lane %dMbps, DPI %dMHz, vsync=%" PRIu32,
