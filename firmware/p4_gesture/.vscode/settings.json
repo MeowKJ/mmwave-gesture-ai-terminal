@@ -1,0 +1,10 @@
+{
+  "idf.flashType": "UART",
+  "idf.flashBaudRate": "115200",
+  "idf.monitorBaudRate": "115200",
+  // 不要写死 idf.currentSetup（每台机器的 IDF 路径不同，由扩展自动检测）
+  "idf.customTerminalForMonitor": "",
+  "files.associations": {
+    "*.h": "c"
+  }
+}

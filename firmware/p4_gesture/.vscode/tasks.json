@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "DEMO #1 - run (flash + LVGL + touch test)",
+      "type": "shell",
+      "command": "python",
+      "args": ["demo_test.py", "--run"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "DEMO #1 - preflight only (no board)",
+      "type": "shell",
+      "command": "python",
+      "args": ["demo_test.py", "--check"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "DEMO #1 - live CDC monitor",
+      "type": "shell",
+      "command": "python",
+      "args": ["demo_test.py", "--monitor"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Flash (USB auto, no buttons)",
+      "type": "shell",
+      "command": "python",
+      "args": ["flash_usb.py"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": false }
+    },
+    {
+      "label": "Flash (USB auto, no-stub)",
+      "type": "shell",
+      "command": "python",
+      "args": ["flash_usb.py", "--no-stub"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Flash (show esptool command only)",
+      "type": "shell",
+      "command": "python",
+      "args": ["flash_usb.py", "--dry-run"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

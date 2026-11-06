@@ -1,0 +1,43 @@
+menu "Gesture Board Bring-up"
+
+config APP_COLOR_CYCLE_SEC
+    int "Seconds per solid color in display self test"
+    default 1
+    range 1 30
+
+config APP_AUDIO_BEEP
+    bool "Play a 1 kHz beep at startup (enables PA)"
+    default n
+
+config APP_RADAR_HEXDUMP
+    bool "Hex-dump radar UART data"
+    default y
+
+config APP_USB_HID_ENABLE
+    bool "TinyUSB composite CDC + HID on USB_DM/DP"
+    default y
+    help
+      CDC is the esptool flashing/console channel; HID is the gesture input
+      device. The CDC line-state callback reboots the chip into ROM download
+      mode so flashing needs no BOOT/EN button.
+
+config APP_SELFTEST_COLORS
+    bool "Run solid-color panel self test before LVGL UI"
+    default y
+
+config APP_AUDIO_CODEC_INIT
+    bool "Program the ES8389 register tables at startup"
+    default y
+    help
+      Writes the official Linux ES8389 init / power-on / unmute sequence.
+      Turn this off if you only want bus probing and I2S clocks, e.g. when
+      bringing up a new codec revision with an unverified register map.
+
+config APP_USB_DOWNLOAD_ON_LONG_KEY
+    bool "Hold power key 3 s to enter USB download mode"
+    default y
+    help
+      Convenience fallback: a long press requests the same no-button USB
+      download path from the application, without a host-side magic string.
+
+endmenu
