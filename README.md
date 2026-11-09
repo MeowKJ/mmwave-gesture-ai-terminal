@@ -21,7 +21,9 @@ python tools/meoave.py all
 - `tools/`：稳定的构建、测试、硬件验收入口
 - `PROJECT_PLAN.md`：当前目标、边界和验收标准
 
-界面字体是资源圆体 Resource Han Rounded SC（SIL OFL 1.1）。改了文案要增删汉字时，先补 `main/fonts/manifest.json` 的符号集，再跑 `python tools/meoave.py fonts` 重生成；`--set round|round_bold|chill|wenkai|yozai|maiyuan` 可整套换字体。
+界面字体是资源圆体 Resource Han Rounded SC（SIL OFL 1.1）。字体源文件（约 120 MB，六套可选字体）不打进仓库，放在 [fonts-v1 Release](https://github.com/MeowKJ/mmwave-gesture-ai-terminal/releases/tag/fonts-v1)，`python tools/meoave.py fonts --fetch` 会下载并逐个校验 SHA-256。
+
+改了文案要增删汉字时，先补 `main/fonts/manifest.json` 的符号集，再跑 `python tools/meoave.py fonts` 重生成；`--set round|round_bold|chill|wenkai|yozai|maiyuan` 可整套换字体。
 
 ## 重要边界
 

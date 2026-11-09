@@ -389,6 +389,10 @@ def fonts(config: dict, args: argparse.Namespace) -> None:
     command = [python_command(config), "tools/build_fonts.py"]
     if args.set:
         command += ["--set", args.set]
+    if args.fetch:
+        command.append("--fetch")
+    if args.list:
+        command.append("--list")
     if args.size:
         for size in args.size:
             command += ["--size", str(size)]
@@ -428,7 +432,10 @@ def main() -> int:
     font_parser = sub.add_parser("fonts", help="regenerate the LVGL Chinese font set")
     font_parser.add_argument("--set", choices=("round", "round_bold", "chill", "wenkai", "yozai", "maiyuan"),
                              help="switch font set: round=资源圆体(默认) round_bold=资源圆体粗 chill=寒蝉圆黑体 wenkai=霞鹜文楷 yozai=悠哉 maiyuan=荆南麦圆")
+    font_parser.add_argument("--fetch", action="store_true",
+                             help="download the fonts-v1 release bundle into build_ui_assets/fonts-src")
     font_parser.add_argument("--size", type=int, action="append", help="only this pixel size (repeatable)")
+    font_parser.add_argument("--list", action="store_true", help="list the verified font sets")
     font_parser.add_argument("--check", action="store_true", help="only verify the source font hash")
     sub.add_parser("clean", help="remove only configured generated build directories")
     args = parser.parse_args()

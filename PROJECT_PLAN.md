@@ -30,7 +30,9 @@
 - 用户先后反馈“字体不好看、看不出变化”“要圆圆的字体”，最终整套中文字库定为**资源圆体 Resource Han Rounded SC Medium**（SIL OFL 1.1）：思源黑体的全圆角版本，笔画端头是圆的，字面略饱，和 56px 圆角卡片、圆润图标同一套气质。
 - 迭代过程留档：Noto Sans CJK（原）→ 寒蝉圆黑体 Medium（圆角太细，用户看不出差异）→ 荆南麦圆体（手写，用户要“圆”不要“手写”）→ 资源圆体 Medium（当前）。四套都保留为一键可切的字体集。
 - 只换字形，不改规范：字号仍为 28px 正文 / 44px 名称与数值，ASCII 与符号集、触摸区、颜色、布局、眼睛与呼吸实现全部不动；16/20 两档历史字号一并重生成以保持同族，但界面仍未引用它们（属可后续删除的死重）。
-- 生成链可复现：`firmware/p4_gesture/main/fonts/manifest.json` 记录字体家族、源地址、SHA-256、逐档符号集与 lv_font_conv 版本；`python tools/meoave.py fonts` 重新生成，`--set round|round_bold|chill|wenkai|yozai|maiyuan` 可整套切换。字体源文件只放本机 `build_ui_assets/fonts-src/`，不进仓库。
+- 生成链可复现：`firmware/p4_gesture/main/fonts/manifest.json` 记录字体家族、源地址、逐文件 SHA-256、逐档符号集、lv_font_conv 版本和字体包位置；`python tools/meoave.py fonts` 重新生成，`--set round|round_bold|chill|wenkai|yozai|maiyuan` 可整套切换。
+- 字体源文件不进仓库：六套正文/标题字体加 Noto 对照共约 120MB，打包为 `meoave-fonts-v1.zip`（75MB）发布在仓库 `fonts-v1` Release，内含 `SHA256SUMS.txt`、OFL 1.1 全文与逐字体版权声明。六套字体**均为 OFL 1.1 且原样未修改**，允许随软件分发与商用，仅禁止单独出售字体文件；资源圆体上游只发 7z、单个 TTF 无稳定直链，这也是自建镜像的原因。
+- `python tools/meoave.py fonts --fetch` 自动取包：直链失败会改走 GitHub API 资源地址，支持断点续传，解压前校验整包 SHA-256、解压后逐文件校验；已实测在一次 504 后在第二条通道完成。本地缓存 `build_ui_assets/cache/`，`fonts-src/` 仍不进 Git。
 - 需要更胖更圆时用 `--set round_bold`（资源圆体 Bold）；更保守可用 `--set chill`；手写风可用 `maiyuan` / `wenkai` / `yozai`。切换后必须重跑桌面回归。
 - 验证：真实 LVGL 桌面回归全部 PASS（含逐字 glyph 存在性与非 placeholder 断言）、45 项 Python、50 项 adapter、产品编译与最终 ELF UI 符号检查通过；快照与对照在 `firmware/p4_gesture/test-results/cute-font-v1/`，`before-after.png` 为麦圆 → 资源圆体同版本对照，`font-candidates.png` 为麦圆／圆体 Medium／圆体 Bold 三选，`zoom-28px.png` 为 28px 小字放大。
 - 未烧录、未实屏验收：圆体在真实 AMOLED 上的笔画粗细与 28px 可读性仍需目视确认，不以桌面像素代替。
