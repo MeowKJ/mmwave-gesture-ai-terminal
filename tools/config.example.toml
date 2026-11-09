@@ -1,0 +1,26 @@
+# Copy this file to tools/config.toml for machine-specific paths.
+# Empty values fall back to environment variables or PATH discovery.
+
+[project]
+p4_dir = "firmware/p4_gesture"
+
+[toolchain]
+idf_path = ""
+idf_tools_path = ""
+idf_version = ""
+python = ""
+cmake = ""
+ninja = ""
+compiler_bin = ""
+esp_target = "esp32p4"
+
+[build]
+jobs = 8 # bound compiler parallelism for reproducible desktop builds
+product_dir = "build_meoave"
+hosted_dir = "build_meoave_hosted"
+product_defaults = "sdkconfig.defaults;sdkconfig.product.defaults"
+hosted_defaults = "sdkconfig.defaults;sdkconfig.hosted.defaults"
+
+[hardware]
+flash_report = "test-results/tools_flash.json"
+runtime_report = "test-results/tools_runtime.json"

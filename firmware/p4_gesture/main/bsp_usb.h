@@ -22,5 +22,9 @@ typedef void (*bsp_usb_line_cb_t)(const char *line, void *ctx);
 void bsp_usb_set_line_callback(bsp_usb_line_cb_t cb, void *ctx);
 
 /* 主动往 CDC 写一行（不经过 ESP_LOG，主机脚本用它读机器可读的 DEMO: 行） */
+/* Nonblocking, newline-terminated record, at most the configured CDC TX size.
+ * ESP_OK means the entire record was queued, not delivered. Saturation or
+ * concurrent admission refuses the whole record; callers may retry later.
+ * Disconnect can still discard or truncate data already in flight. */
 esp_err_t bsp_usb_cdc_write(const char *text);
 uint16_t bsp_usb_pid(void);

@@ -3,17 +3,10 @@
 # 公开仓库只同步自研源码。编译产物、第三方资料、本地调试数据一律排除。
 # ---------------------------------------------------------------------------
 
-## 工作区内部资料 / 第三方资料
-## 含原厂数据手册 PDF、底板原理图、Osptek 官方仓库完整副本，
-## 有版权与体积问题，不进公开仓库；也不包含本地 AI 工作记录。
+## 本机临时资料与第三方下载包不进仓库。
 /.workbuddy/
 /.docs/
 /.tmp_official_20261028/
-/firmware/_official_ref/
-/firmware/official_downloads/
-/firmware/official_test/
-/firmware/esp32p4/
-/firmware/p4_display_clean/
 
 ## ESP-IDF 生成物（sdkconfig 由 sdkconfig.defaults 重建）
 **/build/
@@ -21,6 +14,9 @@
 **/managed_components/
 **/sdkconfig
 **/sdkconfig.old
+**/sdkconfig.c5
+**/sdkconfig.product
+**/sdkconfig.hosted
 **/compile_commands.json
 **/.clangd
 **/.cache/
@@ -39,6 +35,8 @@
 
 ## 测试与临时数据
 /.local_cleanup/
+/tools/config.toml
+/tools/.venv/
 # PDF/原理图排查时生成的临时渲染，不包含原始参考资料。
 /tmp_*/
 /baseboard_schematic.png

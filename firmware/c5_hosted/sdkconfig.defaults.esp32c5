@@ -1,0 +1,152 @@
+# 1. CPU
+#--------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# 2. BT Configuration
+#---------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ONLY=y
+CONFIG_BT_BLUEDROID_ENABLED=
+CONFIG_BT_LE_SLEEP_ENABLE=y
+
+# 3.1 BLE over SPI/SDIO
+#-----------------------
+CONFIG_BT_LE_HCI_INTERFACE_USE_RAM=y
+
+# 3.2 BLE over UART
+#-------------------
+# Enable below config, delete sdkconfig, build/ and rebuild
+# CONFIG_BT_LE_HCI_INTERFACE_USE_UART=y
+# CONFIG_BT_LE_HCI_UART_TX_PIN=5
+# CONFIG_BT_LE_HCI_UART_RX_PIN=18
+# CONFIG_BT_LE_HCI_UART_FLOWCTRL=n
+# #CONFIG_BT_LE_HCI_UART_RTS_PIN=19
+# #CONFIG_BT_LE_HCI_UART_CTS_PIN=8
+
+
+# 4. Partition Table
+#--------------------
+CONFIG_PARTITION_TABLE_OFFSET=0xc000
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.esp32c5.csv"
+
+# 5. Mempool
+#------------
+CONFIG_ESP_CACHE_MALLOC=y
+
+
+# 6 Network split
+#---------------
+
+#CONFIG_ESP_HOSTED_NETWORK_SPLIT_ENABLED=n
+#CONFIG_LWIP_TCP_LOCAL_PORT_RANGE_START=61440
+#CONFIG_LWIP_TCP_LOCAL_PORT_RANGE_END=65535
+#CONFIG_LWIP_UDP_LOCAL_PORT_RANGE_START=61440
+#CONFIG_LWIP_UDP_LOCAL_PORT_RANGE_END=65535
+
+
+# 6.2 LWIP split examples
+#-------------------------
+#CONFIG_ESP_HOSTED_COPROCESSOR_EXAMPLE_MQTT=n
+
+
+# 7. Transport config
+#---------------------
+# CONFIG_ESP_SDIO_NSEND_PSAMPLE=y
+# CONFIG_ESP_SDIO_DEFAULT_SPEED=y
+# CONFIG_ESP_SDIO_STREAMING_MODE=n
+
+
+# 8. Wifi config
+#----------------
+CONFIG_WIFI_CMD_BASIC_ONLY=y
+
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_RX_BA_WIN=16
+
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+CONFIG_ESP_WIFI_IRAM_OPT=y
+
+# 9. LWIP config
+#----------------
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+CONFIG_LWIP_TCPIP_CORE_LOCKING_INPUT=y
+
+# 10. Optimizations
+#-------------------
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+
+# 11. Stats
+#-----------
+#CONFIG_ESP_HOSTED_FUNCTION_PROFILING=y
+CONFIG_ESP_PKT_STATS=y
+
+# 12. Priorities
+#----------------
+CONFIG_IPERF_TRAFFIC_TASK_PRIORITY=18
+CONFIG_IPERF_REPORT_TASK_PRIORITY=18
+
+
+#13. Mem optimizations
+#---------------------
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+
+#13. Mem optimizations
+#---------------------
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# 14. SPIRAM config
+#---------------------
+# CONFIG_SPIRAM=y
+# CONFIG_SPIRAM_MODE_QUAD=y
+# CONFIG_SPIRAM_SPEED_80M=y
+# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2000
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+
+#
+# ESP-Hosted - Network coprocessor
+#
+# CONFIG_ESP_SDIO_RX_Q_SIZE=10
+# CONFIG_ESP_SDIO_TX_Q_SIZE=5
+
+# CONFIG_ESP_HOST_DEV_BOARD_P4_C5_CORE=y
+
+# ============================================================================
+# meoave controller board V1.0 (ESP32-P4C5 module on a custom baseboard)
+# ============================================================================
+
+# Transport to the P4 is the module-internal SDIO bus. C5 silicon fixes the six
+# pins: CMD=10, CLK=9, D0=8, D1=7, D2=14, D3=13 (IDF sdio_slave_pins.h). The
+# module routes them to P4 GPIO19/18/14/15/16/17.
+CONFIG_ESP_SDIO_HOST_INTERFACE=y
+
+# Match the module vendor's board preset (only affects SPI defaults, which are
+# unused here, but keeps the config self-describing).
+CONFIG_ESP_HOST_DEV_BOARD_P4_C5_CORE=y
+
+# C5 GPIO2 is shared with P4 GPIO6 (ES8389 I2S DOUT). Keep it high-Z forever and
+# fail the build if any transport pin ever lands on it.
+CONFIG_C5_IO2_GUARD_ENABLE=y
+CONFIG_C5_IO2_GUARD_ASSERT_SDIO=y
+
+# No PSRAM on the ESP32C5HF4 die.
+CONFIG_SPIRAM=n
+
+# The P4 host drives C5 CHIP_PU on GPIO54, so the slave does not need a
+# self-reset pin of its own.
+CONFIG_ESP_SDIO_GPIO_RESET=-1

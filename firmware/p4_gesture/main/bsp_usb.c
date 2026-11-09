@@ -16,7 +16,7 @@
  *   2. 固件 tud_disconnect() 让主机看到设备断开，置
  *      LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT 后 esp_restart()
  *   3. ROM 以 0x303A:0x0012 重新枚举，主机用 --before no-reset 烧写
- *   4. esptool --after hard-reset（USB-OTG 下走 watchdog_reset）回到应用
+ *   4. flash_usb.py uses ROM-only write/no-reset, then guarded CPU-only reset.
  *
  * 关键实现点（都是踩过的坑）：
  *   - FORCE_DOWNLOAD_BOOT 必须在 esp_restart() 的 shutdown handler 里最后写，
@@ -27,9 +27,11 @@
  *   - HS 下 HID interrupt endpoint 的 bInterval 是指数语义，10 = 64ms（太慢），
  *     必须单独给 HS 描述符用 7（= 8ms）。
  *
- * 硬件前置条件：R13 需从 GND 改接 VBUS_ON，保证复位期间 PWR_HOLD 不掉电。
+ * GPIO29 pad hold must remain high. Do not rewire R13 to a divided VBUS
+ * sensing node; the host must not use the old watchdog hard-reset path.
  */
 #include "bsp_usb.h"
+#include "bsp_usb_tx.h"
 
 #include "sdkconfig.h"
 #include "esp_check.h"
@@ -44,6 +46,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include "esp_app_desc.h"
+#include "esp_timer.h"
+#include "esp_random.h"
 
 #include "soc/soc.h"
 #include "soc/lp_system_reg.h"
@@ -100,6 +106,8 @@ static const char *s_str_desc[6] = {
 };
 
 static volatile bool s_rebooting;
+static bool          s_download_requested;
+static uint32_t      s_boot_id;
 static volatile bool s_cdc_open;
 static volatile int  s_in_log;
 static bool          s_vprintf_hooked;
@@ -147,19 +155,27 @@ static inline void clear_force_download_boot(void)
    避免 esp_restart() 内部清理把标志抹掉。只有本次是下载请求时才写。 */
 static void usb_shutdown_handler(void)
 {
-    if (s_rebooting) set_force_download_boot();
+    if (s_download_requested) set_force_download_boot();
+    else clear_force_download_boot();
 }
 
-/* 应用在 main.c 里实现：复位前卸掉屏/音频/雷达等大电流负载，
-   让 3V3 电容在 GPIO29 变高阻的复位窗口内尽量撑得久一点。
-   R13 未改板时这是唯一能提高下载成功率的软件手段（不能根治）。 */
+/* Optional app cleanup; GPIO29 pad hold, not capacitance, protects power. */
 void __attribute__((weak)) bsp_platform_prepare_download(void) {}
 
 static void reboot_to_download_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(120));       /* 让 magic 发完、CDC 日志刷出 */
-    ESP_LOGW(TAG, "USB flash request -> reboot into ROM USB-OTG download mode");
+    ESP_LOGW(TAG, "USB request -> %s", s_download_requested ? "ROM download" : "program restart");
+
+    esp_err_t err = bsp_power_prepare_reset();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reset refused: power hold not ready (%s)", esp_err_to_name(err));
+        s_rebooting = false;
+        s_download_requested = false;
+        vTaskDelete(NULL);
+        return;
+    }
 
     bsp_platform_prepare_download();      /* 卸掉屏/音频/雷达等大电流负载 */
     /* 主机必须看到断开，ROM 才会以 PID 0x0012 重新枚举 */
@@ -168,19 +184,72 @@ static void reboot_to_download_task(void *arg)
 
     /* 在真正复位前把 PWR_HOLD 锁存到 always-on pad hold 寄存器，
        让 3V3 跨过复位窗口；同时写 RTC_NOINIT 标记做掉电体检。 */
-    bsp_power_prepare_download_reset();
-
-    set_force_download_boot();            /* 双保险；handler 里还会再写一次 */
+    if (s_download_requested) set_force_download_boot();
+    else clear_force_download_boot();
     esp_restart();
     vTaskDelete(NULL);
 }
 
+static esp_err_t request_reboot(const char *why, bool download)
+{
+    if (s_rebooting) return ESP_ERR_INVALID_STATE;
+    s_download_requested = download;
+    s_rebooting = true;
+    ESP_LOGW(TAG, "reboot requested via %s", why);
+    if (xTaskCreate(reboot_to_download_task, "usb_reset", 4096, NULL, 5, NULL) != pdPASS) {
+        s_rebooting = false;
+        s_download_requested = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static void request_download(const char *why)
 {
-    if (s_rebooting) return;
-    s_rebooting = true;
-    ESP_LOGW(TAG, "download requested via %s", why);
-    xTaskCreate(reboot_to_download_task, "usb_dl", 3072, NULL, 5, NULL);
+    (void)request_reboot(why, true);
+}
+
+/* Nonces prevent the host from accepting stale CDC replies after reboot.
+   Short independent replies fit the existing 512-byte CDC transmit queue. */
+static bool system_command(const char *line)
+{
+    if (strncmp(line, "SYS ", 4) != 0) return false;
+    char command[12], token[17], extra;
+    if (sscanf(line, "SYS %11s %16s %c", command, token, &extra) != 2) return true;
+    for (const char *p = token; *p; ++p) {
+        if (!isalnum((unsigned char)*p)) return true;
+    }
+    char reply[192];
+    if (strcmp(command, "INFO") == 0) {
+        char sha[65];
+        /* esp_app_get_elf_sha256() may return only CONFIG_APP_RETRIEVE_LEN_ELF_SHA
+           characters (9 in this profile). Identity verification needs all 32 bytes. */
+        const uint8_t *digest = esp_app_get_description()->app_elf_sha256;
+        static const char hex[] = "0123456789abcdef";
+        for (unsigned i = 0; i < 32; ++i) {
+            sha[i * 2] = hex[digest[i] >> 4];
+            sha[i * 2 + 1] = hex[digest[i] & 15];
+        }
+        sha[64] = '\0';
+        snprintf(reply, sizeof(reply), "SYS:INFO token=%s sha=%s reset=%d uptime_us=%lld boot=%08lx\n",
+                 token, sha, esp_reset_reason(), (long long)esp_timer_get_time(),
+                 (unsigned long)s_boot_id);
+    } else if (strcmp(command, "FAULT") == 0) {
+        char diagnostic[144];
+        bsp_power_reset_diagnostic(diagnostic, sizeof(diagnostic));
+        snprintf(reply, sizeof(reply), "SYS:FAULT token=%s %s\n", token, diagnostic);
+    } else if (strcmp(command, "POWER") == 0) {
+        snprintf(reply, sizeof(reply), "SYS:POWER token=%s hold=%d ready=%d key=%d marker=%d\n",
+                 token, bsp_power_pad_hold_active(), bsp_power_hold_ready(),
+                 bsp_power_key_pressed(), bsp_power_download_survived());
+    } else if (strcmp(command, "RESTART") == 0) {
+        esp_err_t err = request_reboot("SYS RESTART", false);
+        snprintf(reply, sizeof(reply), "SYS:RESTART token=%s accepted=%d\n", token, err == ESP_OK);
+    } else {
+        return true;
+    }
+    (void)bsp_usb_cdc_write(reply);
+    return true;
 }
 
 /* CDC 行分发：下载 magic 自己处理，其它整行交给应用回调。
@@ -188,6 +257,7 @@ static void request_download(const char *why)
    也顺带提供了一条无需额外 USB 端点的测试命令通道。 */
 static void dispatch_line(const char *line)
 {
+    if (system_command(line)) return;
     if (strcmp(line, DL_CMD) == 0 || strcmp(line, "DOWNLOAD") == 0) {
         request_download("CDC magic");
         return;
@@ -266,9 +336,11 @@ static int usb_log_vprintf(const char *fmt, va_list args)
         char buf[256];
         int len = vsnprintf(buf, sizeof(buf), fmt, b);
         if (len > 0) {
-            size_t n = ((size_t)len < sizeof(buf)) ? (size_t)len : sizeof(buf) - 1;
-            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)buf, n);
-            tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+            size_t n = ((size_t)len < sizeof(buf) - 1) ? (size_t)len : sizeof(buf) - 2;
+            /* Do not let truncated/non-newline log chunks consume the prefix
+             * of the next machine-readable response. UART keeps the original. */
+            if (buf[n - 1] != '\n') buf[n++] = '\n';
+            (void)bsp_usb_tx_record(buf, n, s_cdc_open);
         }
         __sync_lock_release(&s_in_log);
     }
@@ -278,8 +350,8 @@ static int usb_log_vprintf(const char *fmt, va_list args)
 
 esp_err_t bsp_usb_init(void)
 {
-    /* ROM 可能把 FORCE_DOWNLOAD_BOOT 留着；应用一启动就清，
-       否则烧完 hard-reset 会再次掉进下载模式形成死循环。 */
+    s_boot_id = esp_random();
+    /* Clear any inherited download flag; normal program restarts boot flash. */
     clear_force_download_boot();
     ESP_RETURN_ON_ERROR(esp_register_shutdown_handler(usb_shutdown_handler),
                         TAG, "register shutdown handler failed");
@@ -346,12 +418,9 @@ void bsp_usb_set_line_callback(bsp_usb_line_cb_t cb, void *ctx)
 
 esp_err_t bsp_usb_cdc_write(const char *text)
 {
-    if (!text || !tud_mounted()) return ESP_ERR_INVALID_STATE;
+    if (!text) return ESP_ERR_INVALID_ARG;
     size_t len = strlen(text);
-    if (tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, (const uint8_t *)text, len) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    return tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+    return bsp_usb_tx_record(text, len, s_cdc_open);
 }
 
 uint16_t bsp_usb_pid(void) { return USB_APP_PID; }

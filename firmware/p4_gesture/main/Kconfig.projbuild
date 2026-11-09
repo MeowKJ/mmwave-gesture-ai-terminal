@@ -4,18 +4,38 @@ config APP_FLS2_OFFICIAL_BASELINE
     bool "Build the FLS2 official widgets demo with custom-board power/USB only"
     default n
     help
-      Selects a separate main file derived from the downloaded OSPTEK IDF6
-      LVGL9 example. Keep the gesture application unchanged. Build with the
-      separately generated build_fls2_source/sdkconfig and build_fls2_official.
+      Selects the checked-in OSPTEK-derived display source. Keep the audited
+      panel and touch pipeline unchanged; the normal entry point is tools/meoave.py.
 
 config APP_FLS2_AUTOTEST
     bool "Repeat FLS2 widgets / solid colors / hardware bars after power-on"
-    depends on APP_FLS2_OFFICIAL_BASELINE
+    depends on APP_FLS2_OFFICIAL_BASELINE && !APP_MEOAVE_UI
     default n
     help
       Diagnostic-only loop, approximately 44 seconds per round. USB commands
       LOOP OFF / LOOP ON pause and resume it. No repeated DCS reads, power
       cycling, panel reset, timing changes or automatic damage verdict.
+
+config APP_MEOAVE_UI
+    bool "Meoave light companion UI on the proven FLS2 pipeline"
+    depends on APP_FLS2_OFFICIAL_BASELINE
+    select LV_FONT_MONTSERRAT_26
+    default n
+    help
+      Replaces only lv_demo_widgets with eyes, apps, settings and breathing.
+      Keeps the audited panel/touch init and native USB recovery path.
+      Use a separate build_meoave directory, never overwrite the baseline.
+
+config APP_MEOAVE_WIFI_HOSTED
+    bool "Enable ESP-Hosted Wi-Fi over the OSPTEK P4C5 SDIO bus"
+    depends on APP_MEOAVE_UI
+    default n
+    help
+      Links the pinned ESP-Hosted host component and exposes an explicit,
+      non-blocking USB bring-up command. The default product build keeps this
+      disabled until the C5 firmware and the shared GPIO54/radar startup
+      timing have been verified. GPIO6 is deliberately not used: it remains
+      available for the ES8389 I2S DOUT path.
 
 config APP_COLOR_CYCLE_SEC
     int "Seconds per solid color in display self test"

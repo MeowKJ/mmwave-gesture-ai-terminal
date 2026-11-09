@@ -29,8 +29,9 @@
  *      R10(470K) 上拉 Q1 栅极、R13(470K) 下拉 PWR_HOLD，因此：
  *        - 必须按住 SW1 直到 app_main 跑到 bsp_power_init()，不能点按即松手；
  *        - 插 USB 不会自动开机（VBUS 只到 U4 充电与 VBUS_ON 分压检测）；
- *        - 芯片复位时 GPIO29 变高阻 -> Q2 关断 -> 3V3 掉电，下载随之中断。
- *      硬件建议把 R13 改接 VBUS_ON 作为「无感下载」保险（详见 README）。
+ *        - 未保持时复位可使 GPIO29 高阻，被 R13 拉低后存在断供风险。
+ *      当前软件持续锁存 GPIO29；下载后仅复位 HP CPU，保留 LP 域。
+ *      VBUS_ON 是分压检测节点，不能直接照旧建议把 R13 改接该点。
  *      软件关机（拉低 PWR_HOLD）硬件可行，但本版本刻意不实现。
  */
 #pragma once
@@ -69,6 +70,10 @@
 #define TP_I2C_ADDR         0x15          /* CST820 7bit 地址 */
 
 /* ============ 音频：ES8389 + NS4150B ============ */
+/* P4C5 reference guide p10 also maps P4 GPIO6 to C5 GPIO2 and P4 GPIO54
+ * to C5 CHIP_PU. Both are externally reused below. Do not enable Hosted
+ * reset/extra-IO control alongside audio/radar without resolving ownership and
+ * confirming the actual module variant. See PROJECT_PLAN.md. */
 #define PIN_AUDIO_PWR_EN    GPIO_NUM_26   /* U1.53  U5(HE9073) CE -> CODEC_3V3 */
 #define PIN_PA_CTRL         GPIO_NUM_24   /* U1.50  NS4150B CTRL，高有效 */
 #define PIN_ES_I2C_SDA      GPIO_NUM_1    /* U1.16  经 BSS138 电平转换到 CODEC_3V3 */
@@ -80,6 +85,19 @@
 #define PIN_I2S_LRCK        GPIO_NUM_5
 #define PIN_I2S_DOUT        GPIO_NUM_6    /* P4 -> ES8389 */
 #define PIN_I2S_DIN         GPIO_NUM_7    /* ES8389 -> P4 */
+
+/* ============ OSPTEK P4C5 内部 SDIO（仅在明确接入 Hosted 时使用） ============
+ * p4c5_core_guide.pdf p10 / ESP-Hosted example logs:
+ * D0..D3 = 14..17, CLK = 18, CMD = 19, C5 reset = 54.
+ * GPIO54 同时接自制板雷达 SOP0；本项目的 Wi-Fi 诊断不触碰 reset。
+ */
+#define PIN_C5_SDIO_D0       GPIO_NUM_14
+#define PIN_C5_SDIO_D1       GPIO_NUM_15
+#define PIN_C5_SDIO_D2       GPIO_NUM_16
+#define PIN_C5_SDIO_D3       GPIO_NUM_17
+#define PIN_C5_SDIO_CLK      GPIO_NUM_18
+#define PIN_C5_SDIO_CMD      GPIO_NUM_19
+#define PIN_C5_RESET         GPIO_NUM_54
 
 /* ============ 毫米波雷达（H1 排针） ============ */
 #define PIN_RADAR_PWR_EN    GPIO_NUM_27   /* U1.54  RADAR_3V3 使能 */

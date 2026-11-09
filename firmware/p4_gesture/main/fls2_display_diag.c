@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "fls2_display_diag.h"
+#include "fls2_display_startup.h"
 #include "bsp_usb.h"
 #include "esp_lcd_co5300.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -27,6 +28,7 @@ static int s_request; /* 0 none, 1 hardware bars, 2 restore normal */
 static bool s_bars;
 static int64_t s_restore_at_us;
 static bool s_hardware_request, s_probe_request, s_colors_request;
+static bool s_frame_request, s_redraw_request;
 static lv_obj_t *s_test_screen, *s_previous_screen;
 static int s_color_step;
 static int64_t s_next_color_us;
@@ -35,6 +37,15 @@ static bool s_probe_attempted, s_probe_needs_restart;
 
 bool fls2_display_diag_colors_active(void) { return s_test_screen != NULL; }
 bool fls2_display_diag_needs_restart(void) { return s_probe_needs_restart; }
+
+esp_err_t fls2_display_set_brightness(uint8_t percent)
+{
+    if (percent < 15 || percent > 100) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_lock);
+    esp_lcd_panel_handle_t panel = s_panel;
+    portEXIT_CRITICAL(&s_lock);
+    return panel ? esp_lcd_panel_co5300_set_brightness(panel, percent) : ESP_ERR_INVALID_STATE;
+}
 
 void fls2_display_diag_cancel_colors(void)
 {
@@ -56,6 +67,67 @@ void fls2_display_diag_request_hardware(void)
     portEXIT_CRITICAL(&s_lock);
 }
 
+void fls2_display_diag_request_frame(void)
+{
+    portENTER_CRITICAL(&s_lock); s_frame_request=true; portEXIT_CRITICAL(&s_lock);
+}
+
+void fls2_display_diag_request_redraw(void)
+{
+    portENTER_CRITICAL(&s_lock); s_redraw_request=true; portEXIT_CRITICAL(&s_lock);
+}
+
+static void report_framebuffer(esp_lcd_panel_handle_t panel)
+{
+    if (!panel || !lvgl_port_lock(200)) {
+        diagnostic_line("FLS2:FRAME result=UNAVAILABLE reason=PANEL_OR_GUI_BUSY\n");
+        return;
+    }
+    lv_display_t *display=lv_display_get_default();
+    void *buffer=NULL;
+    esp_err_t err=esp_lcd_dpi_panel_get_frame_buffer(panel,1,&buffer);
+    if (err!=ESP_OK || !buffer || !display || lv_display_get_color_format(display)!=LV_COLOR_FORMAT_RGB888) {
+        lvgl_port_unlock();
+        diagnostic_line("FLS2:FRAME result=UNAVAILABLE reason=NO_RGB888_BUFFER\n");
+        return;
+    }
+    /* This profile has exactly one 460x460 RGB888 DPI framebuffer. Read the
+       scanout backing store, not a newly-rendered offscreen screenshot. The
+       GUI lock excludes CPU flush/copy writes; DMA is a reader only. Do not
+       invalidate CPU caches or write pixels here: diagnostics must be passive. */
+    const uint8_t *pixels=buffer;
+    uint32_t black=0,white=0,colored=0,yellow=0,hash=2166136261u;
+    int x0=460,y0=460,x1=-1,y1=-1;
+    for (int y=0;y<460;++y) for (int x=0;x<460;++x) {
+        const uint8_t *p=pixels+((size_t)y*460+x)*3;
+        unsigned b=p[0],g=p[1],r=p[2];
+        for (unsigned i=0;i<3;++i) hash=(hash^p[i])*16777619u;
+        if (r<8 && g<8 && b<8) black++;
+        else { if (x<x0) x0=x; if (x>x1) x1=x; if (y<y0) y0=y; if (y>y1) y1=y; }
+        if (r>247 && g>247 && b>247) white++;
+        if (r!=g || g!=b) colored++;
+        if (r>64 && g>64 && b<64) yellow++;
+    }
+    uint32_t bytes=460*460*3;
+    lvgl_port_unlock();
+    char line[224];
+    snprintf(line,sizeof(line),"FLS2:FRAME result=OK bytes=%lu hash=%08lX black=%lu white=%lu colored=%lu yellow=%lu bounds=%d,%d,%d,%d panel_reception=NOT_VERIFIED\n",
+        (unsigned long)bytes,(unsigned long)hash,(unsigned long)black,(unsigned long)white,
+        (unsigned long)colored,(unsigned long)yellow,x0,y0,x1,y1);
+    diagnostic_line(line);
+}
+
+static void redraw_frame(void)
+{
+    if (!lvgl_port_lock(200)) {
+        diagnostic_line("FLS2:REDRAW result=BUSY\n"); return;
+    }
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(lv_display_get_default());
+    lvgl_port_unlock();
+    diagnostic_line("FLS2:REDRAW result=SUBMITTED panel_reception=NOT_VERIFIED\n");
+}
+
 void fls2_display_diag_request_probe(void)
 {
     portENTER_CRITICAL(&s_lock);
@@ -72,6 +144,15 @@ void fls2_display_diag_request_colors(void)
 
 static void report_hardware(void)
 {
+    const fls2_display_startup_state_t *startup = fls2_display_startup_state();
+    char startup_line[224];
+    snprintf(startup_line, sizeof(startup_line),
+             "FLS2:DISPLAY_START prepared=%d host_before=0x%08lX phy_before=0x%08lX "
+             "host_off=0x%08lX phy_off=0x%08lX panel_reception=NOT_VERIFIED\n",
+             startup->prepared, (unsigned long)startup->host_before,
+             (unsigned long)startup->phy_before, (unsigned long)startup->host_after,
+             (unsigned long)startup->phy_after);
+    diagnostic_line(startup_line);
     dsi_host_dev_t *host = MIPI_DSI_LL_GET_HOST(0);
     dsi_brg_dev_t *bridge = MIPI_DSI_LL_GET_BRG(0);
     uint32_t out = GPIO.out.val, enable = GPIO.enable.val;
@@ -334,9 +415,13 @@ void fls2_display_diag_service(void)
     esp_lcd_panel_handle_t panel = s_panel;
     bool expired = s_bars && now >= s_restore_at_us;
     bool hardware = s_hardware_request, probe = s_probe_request, colors = s_colors_request;
+    bool frame=s_frame_request, redraw=s_redraw_request;
+    s_frame_request=s_redraw_request=false;
     s_hardware_request = s_probe_request = s_colors_request = false;
     portEXIT_CRITICAL(&s_lock);
     if (hardware) report_hardware();
+    if (redraw) redraw_frame();
+    if (frame) report_framebuffer(panel);
     if (probe) probe_registers();
     service_colors(colors);
     if (!req && !expired) return;

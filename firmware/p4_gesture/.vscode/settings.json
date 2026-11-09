@@ -6,5 +6,9 @@
   "idf.customTerminalForMonitor": "",
   "files.associations": {
     "*.h": "c"
-  }
+  },
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**"
+  ]
 }

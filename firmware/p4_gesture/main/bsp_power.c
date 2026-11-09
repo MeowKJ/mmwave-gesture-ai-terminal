@@ -5,24 +5,64 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/soc.h"
 #include "soc/lp_system_reg.h"
+#include "soc/gpio_reg.h"
+#include <stdio.h>
+#include "esp_private/panic_internal.h"
+#include "riscv/rvruntime-frames.h"
 
 #include "bsp_common.h"
 #include "board_pins.h"
 
 static const char *TAG = "BSP_POWER";
 
-/* RTC_NOINIT 在 LP SRAM，软件复位不清、掉电才清。用它做「复位期间是否掉电」
-   的体检标记：下载复位前写，应用启动读；读到就说明 PWR_HOLD 撑住了。 */
+/* A retained marker is diagnostic evidence only, not a voltage measurement.
+   Reset domains also determine whether RTC_NOINIT survives. */
 #define DL_MARKER 0x4D454F31u            /* "MEO1" */
 RTC_NOINIT_ATTR static uint32_t s_dl_marker;
 static bool s_download_survived;
 static bool s_pad_hold_active;
 static bool s_key_at_boot;      /* 开机锁存瞬间电源键是否仍被按住 */
+
+/* Preserve a minimal panic frame for native-USB diagnostics after reboot.
+   No USB, allocation, logging, or reset-hint modification in panic context. */
+#define PANIC_MARKER 0x50414E31u
+typedef struct {
+    uint32_t valid, core, pc, ra, sp, cause, badaddr;
+} reset_panic_t;
+RTC_NOINIT_ATTR static volatile reset_panic_t s_reset_panic;
+void __real_esp_panic_handler(panic_info_t *info);
+void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
+{
+    s_reset_panic.valid = 0;
+    s_reset_panic.core = info->core;
+    s_reset_panic.pc = (uint32_t)info->addr;
+    if (info->frame) {
+        const RvExcFrame *frame = info->frame;
+        s_reset_panic.pc = frame->mepc;
+        s_reset_panic.ra = frame->ra;
+        s_reset_panic.sp = frame->sp;
+        s_reset_panic.cause = frame->mcause;
+        s_reset_panic.badaddr = frame->mtval;
+    }
+    s_reset_panic.valid = PANIC_MARKER;
+    __real_esp_panic_handler(info);
+}
+
+void bsp_power_reset_diagnostic(char *buffer, unsigned size)
+{
+    snprintf(buffer, size,
+             "valid=%d core=%lu pc=%08lx ra=%08lx sp=%08lx cause=%08lx bad=%08lx",
+             s_reset_panic.valid == PANIC_MARKER, (unsigned long)s_reset_panic.core,
+             (unsigned long)s_reset_panic.pc, (unsigned long)s_reset_panic.ra,
+             (unsigned long)s_reset_panic.sp, (unsigned long)s_reset_panic.cause,
+             (unsigned long)s_reset_panic.badaddr);
+}
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_channel_t s_adc_chan;
@@ -43,35 +83,57 @@ bool bsp_power_download_survived(void) { return s_download_survived; }
 
 void bsp_power_prepare_download_reset(void)
 {
-    s_dl_marker = DL_MARKER;
-
-    /* 关键：把 PWR_HOLD 当前的高电平锁存在 IO pad 上。P4 rev>=3 的
-       gpio_hold_en() 走 LP_SYS.pad_rtc_hold_ctrl0（always-on），TOP 域
-       esp_restart() 时管脚不会退回高阻，Q2/Q1 保持导通，3V3 不掉电。
-       复位前后的整个 ROM 下载过程都靠这个锁存撑着。 */
-    esp_err_t err = gpio_hold_en(PIN_PWR_HOLD);
+    esp_err_t err = bsp_power_prepare_reset();
     ESP_LOGW(TAG, "download reset: PWR_HOLD pad hold %s (reg=%d), marker set",
              err == ESP_OK ? "ENABLED" : esp_err_to_name(err),
              bsp_power_pad_hold_active());
 }
 
+bool bsp_power_hold_ready(void)
+{
+    const uint32_t mask = BIT(PIN_PWR_HOLD);
+    return bsp_power_pad_hold_active() && (REG_READ(GPIO_OUT_REG) & mask) &&
+           (REG_READ(GPIO_ENABLE_REG) & mask);
+}
+
+esp_err_t bsp_power_prepare_reset(void)
+{
+    esp_err_t err = gpio_set_level(PIN_PWR_HOLD, 1);
+    if (err != ESP_OK) return err;
+    err = gpio_hold_en(PIN_PWR_HOLD);
+    if (err != ESP_OK) return err;
+    if (!bsp_power_hold_ready()) return ESP_ERR_INVALID_STATE;
+    s_reset_panic.valid = 0;
+    s_dl_marker = DL_MARKER;
+    return ESP_OK;
+}
+
+static void power_shutdown_handler(void)
+{
+    /* Cover every normal esp_restart(), not only explicit download requests.
+       Keep an already-high pad latched; never release it during startup. */
+    (void)bsp_power_prepare_reset();
+}
+
 void bsp_power_init(void)
 {
     /* 按键开机的最后一步，也是 app_main 的第一件事：
-       SW1 按下时 D1/Q1 已把 VSYS 接到 SYS_PWR_EN（硬件上电），固件一上来
+       SW1 按下时 D1/Q1 已把 VSYS 接到 SYS_PWR_EN（U10 的 EN，不是 VIN），固件一上来
        把 PWR_HOLD 拉高，让 Q2 接管 Q1 栅极 —— 此后松手也不掉电。
        必须尽早：晚一毫秒，用户就得多按住一毫秒。 */
+    /* Preload the output latch before enabling output: no initial low pulse. */
+    ESP_ERROR_CHECK(gpio_set_level(PIN_PWR_HOLD, 1));
     bsp_gpio_out(PIN_PWR_HOLD, 1);
 
-    /* 先读诊断，再释放上一次复位遗留的 pad hold。顺序不能反：释放 hold
-       的瞬间管脚由 GPIO 输出寄存器接管，必须保证它已经是输出高。 */
+    /* Preserve any inherited high pad hold across the entire boot process. */
     s_download_survived = (s_dl_marker == DL_MARKER);
     s_dl_marker = 0;
     s_pad_hold_active = bsp_power_pad_hold_active();
-    esp_err_t hold_err = gpio_hold_dis(PIN_PWR_HOLD);
-    ESP_LOGI(TAG, "PWR_HOLD=1, download-reboot survived=%d, pad_hold_was=%d, release=%s",
-             s_download_survived, s_pad_hold_active,
-             hold_err == ESP_OK ? "OK" : esp_err_to_name(hold_err));
+    ESP_ERROR_CHECK(gpio_hold_en(PIN_PWR_HOLD));
+    ESP_ERROR_CHECK(bsp_power_hold_ready() ? ESP_OK : ESP_ERR_INVALID_STATE);
+    ESP_ERROR_CHECK(esp_register_shutdown_handler(power_shutdown_handler));
+    ESP_LOGI(TAG, "PWR_HOLD=1, reset-marker retained=%d, pad_hold_was=%d, hold=CONTINUOUS",
+             s_download_survived, s_pad_hold_active);
     if (s_dl_marker == DL_MARKER) ESP_LOGE(TAG, "marker clear failed");
 
     /* 电池分压使能：VBAT_AD_EN=1 -> Q5 导通 -> Q4(P-MOS) 导通 -> VBAT 进入

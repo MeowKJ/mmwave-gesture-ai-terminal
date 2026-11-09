@@ -4,7 +4,7 @@
  * 目标：一根 USB-C 线，验证「无感下载 + OLED/LVGL + 触摸」三件事。
  *
  * 顺序（刻意安排）：
- *   0. 电源键开机：PWR_HOLD 拉高锁存 VSYS，释放上次下载留下的 pad hold —— 必须最先做
+ *   0. 电源键开机：PWR_HOLD 拉高并持续保持 pad hold —— 必须最先做
  *   1. USB CDC+HID 尽早枚举 —— 即使后面显示初始化卡住，也能无感重新烧写
  *   2. 屏：官方 CO5300 组件 + 官方初始化表；纯色自检 -> LVGL
  *   3. 触摸：CST820 I2C 扫描 -> 注册成 LVGL indev -> DEMO UI

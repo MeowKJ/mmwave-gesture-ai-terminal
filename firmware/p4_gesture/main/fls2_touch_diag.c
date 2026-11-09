@@ -30,6 +30,7 @@ static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_io_lock;
 static esp_lcd_panel_io_handle_t s_io;
 static bool s_probe_enabled;
+static bool s_id_requested;
 static int64_t s_next_probe_us, s_next_id_us;
 
 esp_err_t __real_esp_lcd_panel_io_rx_param(esp_lcd_panel_io_handle_t io,
@@ -128,13 +129,34 @@ void fls2_touch_diag_enable(bool enabled)
     portEXIT_CRITICAL(&s_stats_lock);
 }
 
+void fls2_touch_diag_request_id(void)
+{
+    portENTER_CRITICAL(&s_stats_lock);
+    s_id_requested = true;
+    portEXIT_CRITICAL(&s_stats_lock);
+}
+
 void fls2_touch_diag_service(void)
 {
     portENTER_CRITICAL(&s_stats_lock);
     bool enabled = s_probe_enabled && s_stats.initialized;
+    bool id_requested = s_id_requested && s_stats.initialized;
+    if (id_requested) s_id_requested = false;
     esp_lcd_panel_io_handle_t io = s_io;
     portEXIT_CRITICAL(&s_stats_lock);
     int64_t now = esp_timer_get_time();
+    if (id_requested) {
+        /* A startup-only cached ID may be 0x00 during controller wake-up.
+           Refresh on explicit host request; never accept/substitute 0xB7. */
+        if (xSemaphoreTake(s_io_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+            uint8_t id = 0;
+            esp_err_t err = __real_esp_lcd_panel_io_rx_param(io, 0xA7, &id, 1);
+            record_read(0xA7, &id, 1, err, true);
+            xSemaphoreGive(s_io_lock);
+        } else {
+            record_read(0xA7, NULL, 1, ESP_ERR_TIMEOUT, true);
+        }
+    }
     if (!enabled || now < s_next_probe_us) return;
     s_next_probe_us = now + 100000;
     /* Never wait on an LVGL lock. Serialize only touch IO transactions. */

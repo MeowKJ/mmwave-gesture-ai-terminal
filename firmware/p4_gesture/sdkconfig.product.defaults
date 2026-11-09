@@ -1,0 +1,9 @@
+# Stable Meoave product profile. Keep this separate from the audited defaults.
+CONFIG_APP_FLS2_OFFICIAL_BASELINE=y
+CONFIG_APP_MEOAVE_UI=y
+# The C5 Hosted path is opt-in; the normal product image keeps the proven UI
+# and native USB path without touching the shared radar reset line.
+# CONFIG_APP_MEOAVE_WIFI_HOSTED is not set
+CONFIG_ESP_HOSTED_ENABLED=n
+CONFIG_APP_SELFTEST_COLORS=n
+CONFIG_APP_AUDIO_BEEP=n

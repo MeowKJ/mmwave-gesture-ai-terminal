@@ -6,7 +6,7 @@
  *   3) 触摸：CST820 注册成 LVGL indev，触点画点 + 坐标显示 + HID 上报；
  *      即使板上没焊触摸芯片，也能用 CDC "TOUCH x y" 注入合成触点测链路
  *
- * 所有机器可读结果都以 "DEMO:" 前缀写到 USB CDC，主机 demo_test.py 直接解析。
+ * 所有机器可读结果都以 "DEMO:" 前缀写到 USB CDC，主机工具统一从 tools/ 入口调用。
  */
 #include "demo_ui.h"
 
