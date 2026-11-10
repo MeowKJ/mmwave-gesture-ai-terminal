@@ -37,6 +37,17 @@ config APP_MEOAVE_WIFI_HOSTED
       timing have been verified. GPIO6 is deliberately not used: it remains
       available for the ES8389 I2S DOUT path.
 
+config APP_C5_SDIO_LOADER
+    bool "Manual-entry C5 SDIO programmer (embedded Hosted image)"
+    depends on APP_MEOAVE_UI && !APP_MEOAVE_WIFI_HOSTED
+    default n
+    help
+      Explicit USB commands only. Uses SDIO GPIO14-19; never drives GPIO6
+      or C5 boot straps. Normal CONNECT never resets C5; explicit
+      BOOTCONNECT resets shared GPIO54 once, with radar inactive and the
+      user holding download straps. No automatic reset/retry fallback.
+      Built separately using tools/meoave.py build --profile programmer.
+
 config APP_COLOR_CYCLE_SEC
     int "Seconds per solid color in display self test"
     default 1

@@ -139,6 +139,9 @@ def build_flash_command(build_dir, port, no_stub, baud="921600"):
     # uses ROM, avoiding the stub's FLASH_END/reset implementation as well.
     cmd.append("write-flash")
     cmd.append("--no-progress")
+    # esptool defaults to uncompressed transfer when --no-stub is used.
+    # ROM deflate keeps the same reset-safe path and bounds large payload time.
+    cmd.append("--compress")
     for key, flag in (("flash_mode", "--flash-mode"),
                       ("flash_size", "--flash-size"),
                       ("flash_freq", "--flash-freq")):
@@ -190,6 +193,7 @@ def image_identity(build_dir):
     if sha == "00" * 32:
         raise RuntimeError("Image has no ELF SHA; refusing unverifiable update")
     return {"path": str(path), "elf_sha": sha,
+            "app_size": len(data),
             "bin_sha256": hashlib.sha256(data).hexdigest(),
             "image_count": len(manifest["flash_files"])}
 
@@ -344,7 +348,19 @@ def flash_once(build_dir, port_hint=None, baud="921600", timeout=15.0,
     report["stage"] = "flash"
     command = build_flash_command(build_dir, rom.device, True, baud)
     print("  " + " ".join(command), flush=True)
-    written = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=180)
+    try:
+        flash_timeout = max(180, 60 + identity.get("app_size", 0) // 8192)
+        report["flash_timeout_seconds"] = flash_timeout
+        written = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=flash_timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Keep partial esptool evidence: a timeout is neither a verified write
+        # nor permission to reset/reflash. The caller can inspect/verify ROM.
+        def decoded(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+        report["flash_output"] = decoded(exc.stdout) + decoded(exc.stderr)
+        report["flash_timeout"] = True
+        print(report["flash_output"], flush=True)
+        raise
     output = written.stdout + written.stderr
     print(output, flush=True)
     report["flash_output"] = output

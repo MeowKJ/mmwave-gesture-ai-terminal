@@ -1,0 +1,4 @@
+config MEOAVE_C5_MAINT_HOST
+    bool "Headless C5 app-only SDIO maintenance host"
+    default n
+    depends on ESP_HOSTED_ENABLED

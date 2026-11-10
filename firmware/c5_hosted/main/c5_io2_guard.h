@@ -4,11 +4,12 @@
  * The ESP32-P4C5 module wires C5 GPIO2 to P4 GPIO6 (module user guide, figure
  * "Pin mapping between ESP32C5HF4 and ESP32P4"). On this board the P4 side of
  * that net is ES8389 I2S DOUT, a push-pull output running whenever audio plays.
- * Both pads sit on the same copper, so the C5 must never drive GPIO2.
+ * Both pads sit on the same copper, so they must never drive simultaneously.
  *
  * This module pins GPIO2 to a pure high-Z state - input mode, internal pull-up
- * and pull-down both disabled, no interrupt - and keeps it there for the whole
- * lifetime of the firmware. It never writes the output latch.
+ * and pull-down both disabled, no interrupt. The maintenance service alone may
+ * temporarily change this after the host releases audio; a bounded lease
+ * returns it to high-Z. This guard never writes the output latch.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -27,7 +28,7 @@ extern "C" {
 #define C5_IO2_SHARED_GPIO 2
 
 /**
- * @brief   Force C5 GPIO2 into high-Z and keep it there.
+ * @brief   Force C5 GPIO2 into high-Z (also used to end a maintenance lease).
  *
  * Idempotent. Call it as the first statement of app_main() - before NVS, before
  * Wi-Fi, before ESP-Hosted - so the pad is safe even if a later init step

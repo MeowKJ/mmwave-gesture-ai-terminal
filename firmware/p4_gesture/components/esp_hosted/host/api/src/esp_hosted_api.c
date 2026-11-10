@@ -181,8 +181,9 @@ static inline esp_err_t esp_hosted_reconfigure(void)
 		return ESP_FAIL;
 	}
 
-	ESP_ERROR_CHECK_WITHOUT_ABORT(transport_drv_reconfigure());
-	return ESP_OK;
+	/* Preserve a failed transport result: otherwise the caller starts Wi-Fi
+	 * and inadvertently runs another reset/connection sequence after failure. */
+	return transport_drv_reconfigure();
 }
 
 int esp_hosted_connect_to_slave(void)

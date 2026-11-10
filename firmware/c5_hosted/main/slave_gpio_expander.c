@@ -7,6 +7,7 @@
 #include "slave_gpio_expander.h"
 #include "slave_transport_gpio_pin_guard.h"
 #include "slave_control.h"
+#include "c5_io2_guard.h"
 #include "esp_log.h"
 
 #if H_GPIO_EXPANDER_SUPPORT
@@ -35,7 +36,7 @@ esp_err_t req_gpio_config(Rpc *req, Rpc *resp, void *priv_data)
 
 	for (int pin = 0; pin < GPIO_NUM_MAX; ++pin) {
 		if (config.pin_bit_mask & (1ULL << pin)) {
-			if (!transport_gpio_pin_guard_is_eligible((gpio_num_t)pin)) {
+			if (pin == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible((gpio_num_t)pin)) {
 				ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", pin);
 				resp_payload->resp = ESP_ERR_INVALID_ARG;
 				return ESP_OK;
@@ -57,7 +58,7 @@ esp_err_t req_gpio_reset(Rpc *req, Rpc *resp, void *priv_data)
 	gpio_num_t gpio_num;
 	gpio_num = req_payload->gpio_num;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;
@@ -80,7 +81,7 @@ esp_err_t req_gpio_set_level(Rpc *req, Rpc *resp, void *priv_data)
 	uint32_t level;
 	level = req_payload->level;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;
@@ -100,7 +101,7 @@ esp_err_t req_gpio_get_level(Rpc *req, Rpc *resp, void *priv_data)
 	gpio_num_t gpio_num;
 	gpio_num = req_payload->gpio_num;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;
@@ -125,7 +126,7 @@ esp_err_t req_gpio_set_direction(Rpc *req, Rpc *resp, void *priv_data)
 	gpio_mode_t mode;
 	mode = req_payload->mode;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;
@@ -145,7 +146,7 @@ esp_err_t req_gpio_input_enable(Rpc *req, Rpc *resp, void *priv_data)
 	gpio_num_t gpio_num;
 	gpio_num = req_payload->gpio_num;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;
@@ -168,7 +169,7 @@ esp_err_t req_gpio_set_pull_mode(Rpc *req, Rpc *resp, void *priv_data)
 	gpio_pull_mode_t pull_mode;
 	pull_mode = req_payload->pull;
 
-	if (!transport_gpio_pin_guard_is_eligible(gpio_num)) {
+	if (gpio_num == C5_IO2_SHARED_GPIO || !transport_gpio_pin_guard_is_eligible(gpio_num)) {
 		ESP_LOGE(TAG, "GPIO pin %d is not allowed to be configured", gpio_num);
 		resp_payload->resp = ESP_ERR_INVALID_ARG;
 		return ESP_OK;

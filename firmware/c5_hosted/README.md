@@ -6,16 +6,30 @@
 
 上游原始 README 保留为 `UPSTREAM_README.md`。
 
-## 与上游的差异（只有四处）
+## 当前边界（2026-11-11）
+
+- 原自制板和新接入、可切换 P4/C5 串口的开发板是不同硬件，不能混用烧录前提。
+- 新开发板已实测C5 v1.2/revision102、4MB，Hosted实时RPC和维护身份通过；P4维护UART为COM4/460800。
+- 正常维护固件已安装，10轮SDIO A/B更新、中断、未确认/启动失败回退、SDIO失联95秒后单次EN回退通过。
+- 当前正常应用ELF为b97127f15c5c60ab3a3981601b345a427c050eebc7ca09b709d5df0adaaff46f。
+- 目标是 Hosted 正常运行时经 SDIO 更新非运行 OTA 槽；这不等于固件失效时也能免引脚进入 ROM。
+- 最新链路、证据与限制以`../../docs/C5_MAINTENANCE.md`为准，早期bringup文档只作历史记录。
+- 开发板维护P4不含自制板电源保持/原生USB/UI/音频仲裁，不能直接迁回；产品集成仍待验收。
+
+## 与上游的差异
 
 | 位置 | 改动 | 原因 |
 |---|---|---|
-| `main/c5_io2_guard.c/.h` | **新增**：把 C5 `GPIO2` 钉成高阻（输入、无上下拉、无中断、永不写输出锁存） | 模组内部 C5 GPIO2 ↔ P4 GPIO6，而本板 P4 GPIO6 是 ES8389 的 I2S DOUT，两者共用一根铜线 |
+| `main/c5_io2_guard.c/.h` | **新增**：C5 `GPIO2` 默认高阻（输入、无上下拉、无中断）；仅专用维护租约可暂时切换 | 模组内部 C5 GPIO2 ↔ P4 GPIO6，共享 ES8389 I2S DOUT，不能争用 |
 | `main/esp_hosted_coprocessor.c` | `app_main()` 第一行调用 `c5_io2_guard_apply()`，ESP-Hosted 起来后再调一次 | 保证在任何初始化之前、以及之后都不会被抢走 |
 | `main/CMakeLists.txt` | `common/` 相对路径由 `../../common` 改为 `../common`；加入 `c5_io2_guard.c` | 本工程把 `common/` 放在上一级，不再与 `slave/` 平级 |
 | `CMakeLists.txt` | `COMPONENTS` 增加 `esp_driver_gpio` | 守卫模块直接使用 GPIO 驱动 |
+| `main/slave_control.c` | OTA 会话检查、失败释放句柄、边界检查、激活错误码及定时器失败处理 | 重复升级和异常不能被当作成功 |
+| `main/esp_hosted_coprocessor.c` | UART 启动身份/阶段日志，检查 Hosted 初始化返回值 | 区分 Flash 启动、局部初始化和真实 SDIO 通信 |
+| `main/c5_maintenance.c`、共享协议 | 实时完整ELF/boot nonce/槽身份、显式确认、90秒回退、高阻租约；独立reset/hang故障注入构建 | 免下载三脚维护与可审计失败恢复，不靠假健康确认 |
+| `main/slave_gpio_expander.c` | 通用GPIO RPC拒绝GPIO2，必须走租约接口 | 防止旁路夺走音频共享网 |
 
-除此之外没有任何逻辑改动，方便以后整体升级到新的 esp-hosted-mcu 版本。
+本地修改需在升级上游时重放；软件故障注入测试位于 P4 工程 `tests/test_c5_ota.py`。
 
 ## 引脚（硅片固定，三处证据一致）
 
@@ -54,8 +68,8 @@ ninja -C firmware/c5_hosted/build_c5
 
 | 文件 | 用途 |
 |---|---|
-| `build_c5/c5_hosted_slave_merged.bin` | 单文件镜像，从 **0x0** 一次写入（推荐） |
-| `build_c5/network_adapter.bin` | 仅 app，偏移 0x20000 |
+| `build_c5/c5_hosted_slave_merged.bin` | 上游兼容合并产物；本项目已安装板禁止直接使用，会覆盖分区/应用等。首次维护安装走备份+有限写入工具，不能用于OTA |
+| `build_c5/network_adapter.bin` | 运行时 OTA 仅传这个 app；首次按当前分区表烧录时偏移 0x20000，OTA 时由从机选择非运行槽 |
 | `build_c5/bootloader/bootloader.bin` | 偏移 0x2000 |
 | `build_c5/partition_table/partition-table.bin` | 偏移 0xc000 |
 | `build_c5/ota_data_initial.bin` | 偏移 0x16000 |
@@ -76,13 +90,12 @@ ninja -C firmware/c5_hosted/build_c5
 
 ## 烧录前提（重要）
 
-本板 **没有引出 C5 的 UART0/BOOT/USB**（模组 4/5/6 脚全部悬空），P4 也无法控制 C5 的
-strap（26/27/28 只在模组 6/7/8 脚上）。所以只能：
-
-1. 模组 **6/7/8 三脚连片接 GND**（进 Joint Download Boot 1，含 SDIO 下载）；
-2. 整板断电再上电；
-3. P4 侧用 esp-serial-flasher 的 SDIO 端口烧写，或按 `test-results/c5_programming_path.md` 走飞线 UART；
-4. 烧完撤掉接地，**再断一次电**（strap 有锁存），C5 才会从新固件启动。
+先确认是哪块板、串口连到哪颗芯片、Flash 容量/修订号及备份要求，再明确告知用户烧 P4 还是 C5。
+原自制板未接出 C5 UART，P4 也不能控制 C5 的三根下载 strap；其历史 SDIO ROM 下载操作见
+工具文档和测试记录。三根 strap 已由用户拆开，**不要再次把它们长期并联**。
+新开发板首次UART安装与P4控制C5 EN已实测；后续应用维护固定UART在P4即可，不要求用户切C5或拉下载脚。
+原自制板的GPIO54/雷达SOP0共享及GPIO29电源保持仍需产品固件专门集成，不能套开发板维护镜像。
+需要重采样 strap 时必须复位 C5，但不必一概整板断电；何时操作由对应硬件流程决定。
 
 ## 验证烧录结果
 
@@ -92,16 +105,15 @@ P4 侧一条命令：
 python tools/meoave.py wifi --no-reset
 ```
 
-- `result=SDIO_R4` → C5 已在跑 SDIO 从机（进入 Hosted 握手阶段）；
-- 仍是 `NO_RESPONSE` → 固件没跑起来或没进下载模式。
-
-GPIO2 是否真的高阻，用 P4 的引脚诊断读三态：
-
-```
-# P4 侧 USB 命令：WIFI PINS <token>
-# 期望 io2np/io2pu/io2pd = 0/1/0（高阻悬空）
-```
+- `result=SDIO_R4` 只表示收到 SDIO 基础响应，不证明 Hosted 应用已运行；
+- `NO_RESPONSE` 不能单独定位启动模式、供电或引脚问题；
+- 真实验收必须有 C5 启动身份、Hosted INIT/版本 RPC，以及重复升级后新身份/健康检查；
+- 原板 `WIFI PINS` 旧命令不适用于 Hosted owner，不能靠并行接管引脚证明高阻。
 
 ## 版本与来源
 
-见 `UPSTREAM.md`。升级上游时按该文件里的 diff 清单重放三处改动即可（第四处是路径）。
+2026-11-10 新开发板UART已确认出厂C5v1.2/4MB正在运行Hosted2.12.9（IDF6.0.2），
+不是本目录2.12.13候选，尚未给新C5烧录。本候选修订号/Flash范围匹配，但互通/SDIO OTA待实测；
+优先保留出厂启动区，通过P4独立Hosted握手确认后再决定是否更新。详见根目录docs/C5_SDIO_OTA_BRINGUP.md。
+
+见 `UPSTREAM.md`。升级上游时重放其清单并执行回归测试。

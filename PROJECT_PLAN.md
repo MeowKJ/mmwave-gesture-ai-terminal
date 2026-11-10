@@ -1,6 +1,24 @@
 # Meoave P4 目标计划
 
-更新时间：2026-11-09
+更新时间：2026-11-11
+
+## 最新：免引脚维护（开发板10轮升级及故障恢复验收通过）
+
+- 当前进度以`docs/C5_MAINTENANCE.md`为准。P4/C5正常及故障注入镜像已编译，173项离线回归通过。
+- 新增`tools/c5_provision.py`（首次UART备份+有限区域安装）、`tools/c5_maintenance.py`（后续SDIO A/B升级/健康确认/失败回退/引脚租约测试）。
+- C5默认GPIO2高阻，维护模式经SDIO限时切换；P4先释放共享GPIO6。正常OTA不依赖GPIO6。
+- 用户确认切C5后，已用460800安装维护基线：整片4MB备份、三段写入hash/读回、完整4MB非目标区域保持比对通过。
+  原厂ota_0/分区表/NVS/证书/标定在首次UART安装重启前读回中未改变；新应用实时RPC通过。
+  之后已完成首轮SDIO升级，正常改写原厂ota_0应用槽；完整原厂备份仍留本地。
+- 已修订Windows接收途中重配串口导致首包截短的问题：读命令前固定timeout、1KB停等校验，实测备份/烧录/整片读回通过。
+- 用户已切回P4并安装单核维护固件。首轮+连续9轮1316640B SDIO升级/PENDING/确认VALID通过。
+- 4096B中断、90秒未确认回退、启动前失败回退、SDIO失联95秒后单次EN回退、GPIO租约及最终正常VALID身份均实测通过。
+- P4单独暖重连仍有累计计数不同步迹象，第96/47轮失败报告保留；上传前显式一次EN恢复旧VALID基线规避，
+  新候选待确认阶段不复位C5，不宣称双核启动根因/任意暖重连已修复。
+- 当前无屏开发板profile不能直接迁回自制板；产品电源保持/nativeUSB/音频仲裁集成仍待完成。
+- Wi-Fi专项：P4已加入RAM凭据、真实扫描/DHCP/DNS/严格HTTPS测试入口，C5固件不变；187项离线测试通过。
+  手机热点实测已通过DHCP/DNS及3轮完整HTTPS 200/证书校验；另一目标返回302，严格判据未通过。
+  家用AP此前RSSI -92dBm/reason4失败仍保留，未定位根因；不代表长期稳定性或产品集成已完成。
 
 ## 1. 当前唯一工程
 
@@ -210,6 +228,13 @@ firmware/p4_gesture/tests/desktop/build/meoave_visual_test.exe firmware/p4_gestu
 
 ## 3. 硬件与 Wi-Fi 方案
 
+2026-11-09 更新：用户手动切换 C5 boot 后，CMD5 实测已从 NO_RESPONSE 变为 SDIO_R4，
+OCR=0x2100ff00，2 functions，探测前后 P4 boot_id 一致、无 fault。新增独立 programmer
+profile 和 `tools/meoave.py c5-program`，用于不操作 GPIO6/54 的首次 SDIO 烧录。
+后续升级采用 Hosted 双槽 OTA；GPIO6/C5 GPIO2 可以考虑带所有权确认的分时，
+首次镜像继续保持 C5 GPIO2 高阻。执行方式、边界与验收状态见
+`docs/C5_UPDATES_AND_GPIO6.md`；下列 2026-11-08 的 NO_RESPONSE 是历史记录。
+
 - 主控：鱼鹰光电 OSPTEK P4C5。
 - Wi-Fi 控制/数据：ESP-Hosted over 4-bit SDIO。
 - P4 SDIO：D0/D1/D2/D3 = GPIO14/15/16/17，CLK = GPIO18，CMD = GPIO19。
@@ -282,3 +307,363 @@ python tools/meoave.py hardware --build --cycles 1 --restarts 3
 3. GPIO6 音频不受 Wi-Fi 初始化影响，GPIO54 共享时序经过实机验证。
 4. C5 Hosted SDIO 实际握手、扫描、连接、IP 和断线恢复完成。
 5. 一键工具在干净环境中能够完成 doctor、build、test，并能明确区分软件通过和实机未验收。
+
+## 7. 2026-11-09 进展记录（C5 首次烧录）
+
+- 已写入 C5 四个区域共 1 341 488 B 并逐段 MD5 通过（`state=DONE`、`verified=1`、
+  `chip=6`、4 MB Flash、`ota_0/ota_1` 各 1.875 MB）。
+- 修掉 `tools/c5_program.py` 解析 `VERIFY_MD5` 失败、`esp_hosted` 低有效复位序列
+  把 C5 按在复位里两个缺陷；`sdkconfig.defaults*` 内容已纳入构建签名。
+- C5 与 P4 源码两侧均已开启 `CONFIG_ESP_HOSTED_ENABLE_GPIO_EXPANDER`；但已成功烧录的
+  C5 payload 早于该选项，后续 GPIO 版烧录失败，不能宣称远端 GPIO RPC 已部署/验收。
+- 未完成：C5 Hosted 应用运行与握手。此前 CMD3/CCCR 失败不能直接证明从机复位，
+  后续独立实测见下一节。Wi-Fi 扫描/连接仍未验收。
+
+## 8. 2026-11-09 C5 自动化测试
+
+入口：`python tools/meoave.py c5-test --build --install`。
+只增量编译、安装 P4 一次；每组独立程序复位，配置 SDIO 位宽/速率，不重复编译，
+不写 C5 Flash、不驱动 GPIO6。每组显式复位 C5 一次（共享 GPIO54，要求雷达未运行），
+卡初始化一次，最多等待 4 秒 Hosted INIT；超时不自动再复位。
+
+本轮完成六组：
+
+| 配置 | 卡初始化 | Hosted INIT |
+| --- | --- | --- |
+| 1-bit / 400 kHz | 通过，无 CRC 错误记录 | 4 秒窗口内未收到 |
+| 1-bit / 5 MHz | 通过，无 CRC 错误记录 | 4 秒窗口内未收到 |
+| 4-bit / 400 kHz | 通过，无 CRC 错误记录 | 4 秒窗口内未收到 |
+| 4-bit / 5 MHz | 通过，无 CRC 错误记录 | 4 秒窗口内未收到 |
+| 4-bit / 20 MHz | 通过，无 CRC 错误记录 | 4 秒窗口内未收到 |
+| 4-bit / 40 MHz | CRC 错误 0x109，未通过 | 未进入等待阶段 |
+
+结论：降速不能单独解决 Hosted 握手问题；40 MHz 本轮还存在卡初始化 CRC 错误。
+卡/功能初始化不等于 Hosted 应用运行，更不等于已联网或可 OTA，不能据此判定 C5 损坏。
+首次下载用的模组 6/7/8 脚接地在当时待确认；2026-11-10 用户已确认全部解除。
+不能继续把外部短接未拆作为已知原因，也不从上述日志猜测实际启动模式。
+
+已部署保护：Hosted 占有 SDMMC 时拒绝旧 PINS/PROBE/PIN54 命令；连接失败正确返回，
+不再继续 Wi-Fi 初始化引发第二轮重连；型号/版本 RPC 必须成功才能设置 READY。
+P4 每组 USB/供电保持/触摸进度/故障记录检查通过，完成后已复位到默认 IDLE；实屏未目视复验。
+Python 回归 69 项通过，Hosted 增量编译通过。报告：
+`firmware/p4_gesture/test-results/c5_automated_20261109.json`（本地忽略，不入 Git）。
+
+## 9. 2026-11-10 解除下载接地后的对照测试
+
+- 用户明确确认模组 6/7/8 脚外部接地已全部断开。先以 1-bit/400 kHz 复测，
+  卡初始化通过、无 CRC/SDIO 命令超时记录，仍未收到 Hosted INIT。
+- 增量构建并仅更新 P4 诊断固件一次；不写 C5 Flash、不配置 GPIO6、不依赖 COM3。
+  当前 P4 ELF SHA：`dbceed16431cf148db35f02ca5fc5d6474db13cb782b39ebd8a708f40a50255c`。
+- 在同一固件上分别比较正常中断与 100 ms 接收轮询；均为 1-bit/400 kHz，
+  INIT 名义观察窗口延长至 20 秒。每组一次 C5 复位/卡初始化，未追加握手重试。
+- 两组卡/功能初始化通过，打开数据通路的 CMD52 写返回成功，无 CRC/SDIO 命令超时记录。
+  每组 20 次只读 CMD52 快照全部成功；pending/token/raw/st/len 始终为 0，
+  ien=0x03、ena=0x00800040。两组都未收到 INIT、未取得真实从机型号/版本，Wi-Fi 未启动。
+- 结论：单纯延长等待或绕过 DAT1 中断等待未解决；尚不能确认 C5 Hosted 应用已运行，
+  不能仅凭这些寄存器判定 ROM 模式、复位循环或芯片损坏。已核对本地官方 C5 IDF
+  寄存器偏移、从机缓冲装载和 OPEN_DATA_PATH 通知代码，未据此发现可直接归因的新缺陷。
+  下一步需要独立的 C5 启动证据（优先从机 UART 启动日志），而不是继续盲扫速率或反复刷写。
+- 两组测试后均经程序复位恢复 P4 默认 IDLE/diag=0；USB、电源保持、触摸读取进度和
+  FAULT valid=0 检查通过，无需手按开机键。本轮未重新目视验收显示，也未验收联网/OTA/GPIO 分时。
+
+原始报告（本地忽略）：`firmware/p4_gesture/test-results/c5_unstrapped_20261110.json`、
+`c5_irq_20s_20261110.json`、`c5_poll_20s_20261110.json`；汇总 `c5_irq_poll_comparison_20261110.json`。
+新增快照证据完整性、20 秒超时分类、参数边界与入口转发回归，Python 共 73 项通过。
+汇总时再次只读检查 P4：同一 boot_id、默认 IDLE/diag=0、电源保持正常、FAULT valid=0、
+触摸读取继续推进；未追加复位或刷写。
+
+## 10. 2026-11-10 下载模式下的实际取证
+
+- 用户重新进入下载模式后，经 P4 原生 USB → SDIO 成功识别 C5，实测 Flash 为 4 MB。
+  使用官方 RAM flasher stub 读出完整 4 MB；块内与 USB 缓存 MD5、磁盘 SHA-256 通过，
+  前 128 KB 独立重复读取一致。此阶段未复位 C5，全程没有写/擦除 C5 Flash。
+- 分区表、bootloader 和 ota_0 校验通过；重建的历史四区域 payload SHA 与 11 月 9 日
+  成功烧录记录完全一致。当前存储的应用为 network_adapter 2.12.13 / IDF v6.1。
+  otadata 两份擦除、ota_1 空白，离线预测回退 ota_0，不代表实际应用已经启动。
+- 为补取芯片版本，仅更新 P4 诊断固件并在 radar=0 时显式复位 C5 一次；
+  下载连接成功、FACTS 有效，实际 C5 v1.2，符合镜像的 v1.0–v1.99 限制。
+  不写 eFuse、不操作 GPIO6、不用 COM3，无失败触发的自动复位/刷写。
+- P4 当前 ELF SHA：`079ea4ac0f00779b31ff2105848827e9283d3c5657cad0fff613a4e2ac17bea2`。
+  收尾只读检查同一 boot_id、电源保持、USB、触摸读取进度及 FAULT valid=0 通过；
+  屏幕未目视复验。Python 回归 91 项通过，programmer 增量构建通过。
+- 当前 P4 保留 programmer profile、C5 保留下载/stub 会话。以上排查未发现镜像内容
+  损坏或芯片修订号不兼容；仍不能证明 Flash 启动链/Hosted 应用正常或认定硬件损坏。
+  自定义 RAM 程序、最小 Flash 诊断、分阶段 Hosted、联网、免引脚 OTA 和 GPIO 分时未验收。
+
+方案：`docs/C5_NO_UART_TEST_PLAN.md`。证据位于本地忽略目录
+`firmware/p4_gesture/test-results/`：`c5_read_backup_20261110.json`、
+`c5_flash_inspection_20261110.json`、`c5_revision_facts_20261110.json`、
+`c5_download_final_health_20261110.json`。整片备份可能含凭据/工厂数据，仅本地保存，不入 Git。
+
+## 11. 2026-11-10 最小 SDIO 应用阶段（已写入，运行待验收）
+
+- 自定义 RAM 安全加载未实现（官方 SDIO loader 的 stub 重叠/重新进 bootloader 限制），
+  明确跳过 RAM 阶段；基于完整备份转入最小 Flash 应用，不冒充 RAM 执行成功。
+- 新增独立诊断子工程 `firmware/c5_hosted/diagnostic` 和一键 `c5-minimal` 工具。
+  prepare 同时核验备份、构建诊断、生成与备份逐字节一致的 ota_0 完整恢复包；
+  恢复包仍未实际写回验收。诊断只初始化 SDIO，C5 GPIO2 保持高阻。
+- 03:07 已完成实际烧写：仅 C5 ota_0 的 0x20000/150688 B，MD5 验证通过。
+  不改 C5 启动程序、分区、otadata、NVS 或工厂区，没有整片擦除、失败后重刷或 COM3。
+- P4 已安装配套 programmer，原生 USB 程序复位、镜像、供电保持及 FAULT 检查通过；
+  当前 P4 ELF SHA：`c805c4b8100f643ae2e73e0acd76b346dbb4145b99ffea63bce1218986e673ec`。
+  Python 99 项通过，编译通过，实屏未目视复验。
+- 当前 C5 仍为下载/stub 会话；已请求用户解除三脚，等待明确确认后才单次复位启动。
+  实际诊断 ELF 身份、20 次心跳、16 个随机 CMD53 回显均尚未验收，不能宣称应用已运行。
+  Hosted/联网/免引脚 OTA/GPIO 分时仍未验收。
+
+证据：`firmware/p4_gesture/test-results/c5_minimal_flash_20261110.json`、
+`c5_minimal_flash_health_20261110.json`。操作与恢复入口见 `tools/README.md`。
+
+## 12. 2026-11-10 解除三脚后的最小应用实测（未通过）
+
+- 用户确认三脚全部解除后，只执行一次 DIAGRUN。C5 复位命令完成、
+  1-bit/400 kHz 卡初始化通过，但 APP_SIGNATURE 等待超时（0x107），
+  有效身份/心跳样本 0、回显包 0；未进入后续回显阶段，不能称作双向数据测试通过。
+- 未追加 C5 复位/重刷。为补齐原始证据，仅增量构建/更新 P4，新增被动 DIAGOBSERVE；
+  该模式不复位 C5、不写 Flash、不访问 FIFO，SDIO 卡初始化一次后读取共享诊断字节。
+  20 次采样均成功、每次 12 B，全为零；OBSERVED 仅表示采样完成，不是应用验收成功。
+- 已核对本地官方 C5 共享寄存器映射，未发现偏移错误，但这不能独立证明实际硬件读通路。
+  仍无 Flash 应用执行证据，不能区分启动模式、复位/启动链、早期 SDIO 初始化或观测问题。
+  不据此认定芯片损坏，不再用单纯加长 Hosted 等待/扫频代替启动证据。
+- 当前 P4 ELF SHA：`075eab726c249b96c089fb3d1f4798a2a6a4f610acf860bf0ee15c35b97d7fc2`。
+  被动采样前后同一 boot_id，USB、电源保持、FAULT valid=0、触摸读取进度检查通过，
+  driver_err=0；实屏未目视复验。Python 回归 104 项通过，P4 增量构建通过。
+- 当前 C5 Flash 是最小诊断应用，原 Hosted 尚未恢复；原应用恢复包和整片备份仍在本地。
+  C5 实际启动模式、应用运行、Hosted、Wi-Fi、OTA、GPIO 分时均未验收；三脚保持解除即可。
+
+证据：`firmware/p4_gesture/test-results/c5_minimal_run_20261110.json`、
+`c5_passive_observe_20261110.json`、`c5_minimal_conclusion_20261110.json`（均本地忽略）。
+
+## 13. 2026-11-10 启动脚低电平的新增实证（当前结论）
+
+- 官方 ESP32-C5 Datasheet v1.5 第 35 页表 3-3 已核对：GPIO28=1 为 SPI Flash
+  启动；GPIO26/27/28=000 为支持 SDIO 的 Joint Download Boot 1。
+  esptool 串口说明只覆盖另一下载组合，不能据此把 000 判为无效组合。
+- 增加 P4 只读 RESETTRACE 缓存：GPIO54 配置、稳定后的高/低采样、低段间隔。
+  写后留 1 ms 稳定时间；SIG_GPIO_OUT_IDX=256 时不能仅凭 peripheral OE 位
+  否定正常 GPIO 输出。前两版探针报告保留：第一版在脉冲前误拒默认 OE 标记，
+  未拉低；第二版有脉冲但立即读数未稳定而停止，均不构成 C5 硬件复位失败的证据。
+- 修正后单次 DIAGRUN：P4 pad 初始=1、低段两点=0、释放两点=1，低段间隔
+  10911 us；仅证明 P4 pad，不是 C5 EN 侧波形。卡初始化通过，APP_SIGNATURE
+  仍超时，有效应用样本/回显=0。本轮未写 C5 Flash、未操作 GPIO6。
+- 随后仅程序复位 P4 以释放 owner，不发 C5 复位命令，单次 CONNECT 成功并执行
+  官方 RAM flasher stub，得到新的 C5 FACTS：strap=0x22（锁存 GPIO27=0、GPIO28=0）；
+  GPIO_IN=0x0015fd94、GPIO_ENABLE=0；MUX26=0x1a00、MUX27/28=0x1b00。
+  三脚输入均开启且当前全为低；GPIO27/28 内部上拉已开、下拉未开。不是输入
+  buffer 禁用的零或软件 GPIO 输出拉低。当前可确认仍为下载/stub 状态，不是 Flash 应用。
+- 用户已明确解除三脚接地；不否认用户操作，但电气读数仍低。现在优先查模组
+  6 脚 GPIO28 及 7/8 脚的残留接地、焊桥、接线或板载下载电路，不继续盲刷。
+  不直接强接 3.3V、不驱动 GPIO6；具体下拉来源和 C5 EN 侧波形仍未知，不宣告芯片损坏。
+- 当前 P4 ELF SHA：`fa8de08d5c8cabb83391ba2f6436276d90f52d09c0a6a977db3c7bc49ebeadcd`。
+  C5 Flash 仍为最小诊断应用，RAM 为官方下载 stub，原 Hosted 未恢复。
+  同一 stub 会话跨 P4 重启 CONNECT 曾失败一次，原报告保留，没有自动重试掩盖。
+  Python 110 项及增量构建通过；最后同一 boot_id 的 USB/供电保持/FAULT=0/触摸进度
+  检查通过，实屏未目视复验。Hosted、联网、OTA、GPIO 分时仍未验收。
+
+本地报告：`firmware/p4_gesture/test-results/c5_settled_run_20261110.json`、
+`c5_settled_boot_facts_20261110.json`、`c5_boot_pins_final_health_20261110.json`；
+汇总 `c5_boot_pin_conclusion_20261110.json`。下一步核对三脚及接地的局部照片/连接；
+当前不需要再次接地、无依据复位或重刷。
+
+### 用户补充：三根下载脚互相并联
+
+用户说明模组6/7/8脚一直互相连接，便于整组接地下载；此前“解除接地”不代表解除三脚互联。
+因此三路当前低电平是同一公共节点的读数，不能当作三个独立下拉故障。
+仅互联且不接地并不必然导致下载；仍需定位公共节点被拉低的来源。
+下一步先确认互联是可拆临时线还是焊接/PCB连接；优先隔离模组6脚GPIO28做对照，
+其正常启动电平必须为高，GPIO26/27的启动电平任意。保持不强接3.3V、不操作GPIO6，
+未收到接线变更确认前，不追加复位/刷写，也不宣称并联本身已证实是根因。
+
+### 补充约束与代码核查
+
+用户目前无法分离三脚，不能再把拆分互联作为必需操作。静态核查结果：当前最小 C5
+诊断应用没有将 GPIO26/27/28 同时输出高，也没有统一设置三脚弱上拉；只显式配置
+GPIO2 为输入无上下拉，以及固定 SDIO 脚7/8/9/10/13/14。P4 下载器只控制其自身54复位
+和14..19 SDIO，C5 FACTS 路径只读，不写启动脚。P4同号GPIO26/27/28不是C5这三脚。
+上次快照：C5 26输入无上下拉，27/28输入弱上拉，GPIO_ENABLE=0，三路均低；
+26无上拉不等于主动拉低，不可将读数直接归因为残留接地。未发现当前项目路径中有
+三脚一高一低互相对打的配置，但未据此证明外部下拉来源。
+本轮仅查代码并保存 `c5_parallel_pin_code_audit_20261110.json`，没有硬件命令、复位或烧写。
+若继续软件对照，应在已运行RAM stub中先查外设输出路由，再显式将三脚统一设为
+输入+弱上拉并读回；不推挽强拉高。该对照尚未实现/执行，且不能保证EN复位后保持，
+把上拉代码放在未运行的Flash应用中不能解决应用之前的启动采样。
+
+## 14. 2026-11-10 04:26 用户接入 3.3V 后的单次启动验证（当前状态）
+
+- 用户确认三脚公共节点接到 3.3V，授权一次 C5 复位、心跳和 SDIO 回显检查。
+  实时 UI 确认 radar=0 后，仅发出一次 DIAGRUN；不编译/烧录，不操作 GPIO6。
+- P4 GPIO54 pad 读回 1→0→0→1→1，低段 10890 us；仅为 P4 pad 证据，
+  未独立测得 C5 CHIP_PU 波形或三脚电压。SDIO 1-bit/400 kHz 卡初始化通过。
+- APP_SIGNATURE 超时（263 / 0x107），12 次共享诊断字节读取成功且全零，
+  有效身份/心跳样本 0；未进入回显阶段，不将 echoes=0 当作回显链路已测试。
+- 当前 FACTS USB 接口只返回 CONNECT 时缓存，不能验证用户刚拉高后的电平；
+  旧 GPIO_IN=0 和旧 strap 不能当作本次新结果。当前三脚电平、启动模式、RAM 内容
+  均未确认；C5 Flash 仍为最小诊断应用，原 Hosted 未恢复。
+- 失败即停，未追加 C5/P4 复位、CONNECT 或重刷。P4 boot_id 保持 bf958202，
+  USB/电源保持/FAULT valid=0/触摸读取进度通过，driver_err=0；实屏未复验。
+  不据此认定拉高失败或芯片损坏。下一步优先建立实时采样/独立启动证据，
+  不重复同样的复位测试，Hosted/Wi-Fi/OTA/GPIO 分时仍未验收。
+
+本地报告：`firmware/p4_gesture/test-results/c5_manual_3v3_run_20261110.json`。
+
+## 15. 2026-11-10 04:34 持续测试收尾：需要核对真实接线（当前结论）
+
+- 后续未重刷/再复位 C5。仅程序重启 P4 释放 SDIO owner；新 boot_id=eee879ea，
+  从新 IDLE 单次 CONNECT 成功并执行官方 RAM stub。P4重启期间的C5 EN侧波形未测。
+- 04:31:58–04:31:59 的新连接采样仍读 GPIO26/27/28=000，输入均开启，
+  GPIO27/28弱上拉已开，GPIO_ENABLE=0，strap=0x22。已重新核对本地官方 C5
+  寄存器地址与位定义；不是复用03:43缓存，不是万用表测得0V，也未排除全部外设输出路由。
+- 同一stub会话只读回281760 B启动区与诊断应用，逐块目标/USB MD5通过；
+  与原备份+诊断应用逐字节一致，bootloader/应用 checksum/SHA-256通过。
+  下载链路、官方RAM代码执行与Flash读取可用；正常Flash启动/应用心跳仍未验证，
+  不足以认定芯片损坏。C5仍为最小诊断Flash+官方RAM stub，原Hosted未恢复。
+- 到达人工边界：用户所述接3.3V与芯片新采样为低不一致，需要核对模组6/7/8公共节点、
+  3.3V实际取电点/公共GND与连接。优先请求清晰接线近照；不要求拆分互联、COM3或
+  用户没有的测量设备。不继续盲刷/重复复位，不把未知下拉来源写成定论。
+- 修正PC端`c5-program --facts`：已有CONNECTED/DONE时拒绝把缓存冒充新测量，
+  只有本轮IDLE→新CONNECT才接收为本轮采样；底层read_facts明确标注CONNECT_CACHE，
+  nonce只验证USB回复，不证明硬件新采样。112项Python测试通过，未重编/烧录固件。
+- P4 USB/供电保持/FAULT valid=0/触摸读取进度通过，GPIO6未操作，实屏未复验。
+
+本地证据：`firmware/p4_gesture/test-results/c5_3v3_fresh_connection_20261110.json`、
+`c5_3v3_startup_readback_20261110.json`、`c5_continuous_conclusion_20261110.json`。
+
+## 16. 2026-11-10 05:05 全局只读复查（当前状态）
+
+- 设备已在两次检查之间重启：当前P4 boot_id=b68a43de，不再是先前eee879ea。
+  本轮未发P4/C5复位、未烧录/上传RAM助手，未动GPIO6，未用COM3。
+- P4固件身份匹配，USB/供电保持/UI帧计数/180°状态/触摸读取正常，FAULT valid=0；
+  首页eyes，亮度100%，radar=0，wifi=UNAVAILABLE；实屏和真实触摸手势未复验。
+- **P4 reset_reason=7（官方IDF ESP_RST_WDT），marker_retained=false。**
+  上次看门狗类复位触发原因未知，不将当前运行检查通过或FAULT无有效记录当成复位正常。
+  已追加约30秒只读稳定性采样，结果见最终JSON，不作为长期稳定性结论。
+- C5初始加载器IDLE，FACTS valid=0，旧下载/stub会话状态不再沿用，当前三脚电平未知。
+  单次DIAGOBSERVE卡初始化及20次CMD52读取通过，但诊断字节全零，有效心跳/身份0；
+  未测CMD53回显，Flash应用/Hosted/Wi-Fi仍未验收，本轮未新读Flash或建立下载连接。
+- 112项Python回归通过。全局仅部分通过：P4当前运行可用，上次WDT需排查，
+  C5仅基础SDIO应答成立，正常应用执行与三脚接线问题尚未解决。
+
+本地报告：`firmware/p4_gesture/test-results/global_status_final_20261110_0505.json`、
+`global_c5_observe_20261110_0505.json`。
+
+## 17. 2026-11-10 16:14 三脚互联解除后的实测（当前状态）
+
+- 用户现已解除模组6/7/8脚之间的互联；不再沿用“无法分离”的旧约束，也不把旧000
+  快照当成三脚分离后的电平。此前USB消失，本轮已恢复原生USB COM10和匹配P4身份。
+- P4电源保持/触摸读取/FAULT valid=0通过。复位前实时UI确认radar=0，执行一次DIAGRUN：
+  P4 GPIO54 pad读回1→0→0→1→1，低段10922us；仅为P4侧证据，不证明C5 EN侧波形。
+  SDIO卡初始化成功，12次诊断读取完整且全零，APP_SIGNATURE超时263/0x107，
+  有效应用身份/心跳0，未进入回显阶段。没有追加C5复位或写Flash。
+- 为获取新寄存器样本，仅程序重启P4一次释放owner，然后单次无C5复位命令CONNECT。
+  本次在CONNECT阶段返回ESP_LOADER_ERROR_INVALID_TARGET=6，未取得新FACTS。
+  这不是三脚仍低的证据，也不能直接认定芯片型号错误、已正常启动或芯片损坏。
+  当前C5执行模式/三脚电平均未知，不能沿用之前官方下载stub运行的结论。
+- 当前P4 boot_id=b1b91e91，软件重启原因3，marker保留、USB/电源/FAULT/触摸读取通过，
+  无需SW1；此前上电boot的WDT=7记录仍保留，不能因本轮软件复位而判定已修复。
+  本轮未编译/烧录、未操作GPIO6、未用COM3；实屏未重新验收。
+- 下一步需采集SDIO CIS原始身份/诊断初始化证据，区分下载身份与应用SDIO身份及读取路径；
+  不盲重刷、不重复C5复位，也不继续让用户拆已分离的三脚。诊断Flash仍为上次写入的
+  最小应用，原Hosted未恢复（本轮未重新读Flash核对），Wi-Fi/OTA仍未验收。
+
+本地证据：`firmware/p4_gesture/test-results/c5_separated_run_20261110_1612.json`、
+`c5_separated_fresh_facts_20261110_1613.json`、`c5_separated_conclusion_20261110.json`。
+
+## 18. 2026-11-10 新开发板：C5 SDIO 免按键升级准备
+
+- 用户新接入可切换 P4/C5 UART 的开发板；它和原自制板分开管理，后续烧哪颗芯片必须明确告知。
+- 当前 COM4/CH343 接收的双核 WDT 日志疑似 P4，路由/板型尚未确认，没有 C5 启动身份；未烧录新板。
+- 已修复 C5 OTA 会话/首包/边界/激活错误处理，加入启动身份与阶段日志；构建、镜像离线验证通过。
+- 113 项 unittest 通过，包含真实 C handler 的 35 场景 × 2 配置故障注入；不是实机 SDIO 升级验收。
+- 需先切至 C5 UART，确认板型/修订号/Flash/启动日志，再决定首次 C5 下载和新板 P4 测试 profile。
+- 宿主 SDIO OTA 上传工具、重连身份验证、连续 A/B 升级、掉电/回滚/ROM 恢复仍未完成；不宣称稳定免操作已实现。
+- 当前候选、烧录边界与后续验收见 `docs/C5_SDIO_OTA_BRINGUP.md`；保留 GPIO6，不套用旧板共享 GPIO54 的控制逻辑。
+
+## 19. 新开发板 P4 已烧录，等待 C5 UART
+
+- 用户确认同型核心板、手动切换 UART；要求 C5 应用失效时也能自动恢复，最终迁焊回自制板。
+- COM4 ROM识别 P4v3.2/16MB。原厂 CO5300演示并非空白；已替换为独立无屏 SDIO诊断，
+  ROM `--no-stub` 三段写入hash通过，NVS/storage保留。C5 Flash未写。
+- 诊断P4 ELF=`526f21d8381fa09767b409baaa59ef2acb880b2a9412b2239e3aff9292763046`，
+  INFO和连续心跳验证；首捕获GBK异常已修复，未据工具异常重刷。启动原因7仍记录，来源未排除。
+- 基线及一次 GPIO54复位请求后，两轮SDIO卡初始化/CIS/5次12字节读取/owner释放均通过，
+  CIS0092:6666、共享数据全零。未运行Hosted RPC，不能当作C5固件运行或损坏结论。
+- 118项回归通过。已请求切C5 UART；读日志/芯片版本后才决定首次C5下载。
+- 自动恢复不能止于运行时OTA，需后续受保护恢复固件/bootloader/失败回退设计和实机验收；尚未实现。
+- `tools/p4_bringup.py`使用本机config统一路径；该无屏程序不含GPIO29保持/产品USB，
+  迁回自制板前必须回归集成产品P4固件，不能直接用此诊断程序交付。
+
+## 20. 新开发板 C5 出厂 Hosted 启动已确认
+
+- 2026-11-10 17:49–17:52 的180秒UART接收已完成：C5v1.2/4MB，正常Flash启动，
+  network_adapter / ESP-Hosted2.12.9 / IDF6.0.2，SDIO stream初始化成功，统计持续至150529ms。
+  当前未有主机Hosted握手，流量0不是C5故障结论；出厂C5不需要盲刷。
+- 出厂槽ota_0=0x20000、ota_1=0x200000，各0x1e0000；仅取得ELF前缀830470ccd，
+  没有完整镜像/备份/完整SHA。窗口内前两个POWERON启动中断，不能排除用户操作而认定重启循环。
+- 新C5未写Flash/运行stub/同步ROM；本轮仅接收与一次help，不能用无CLI响应判RX故障。
+- 已请求UART切回P4。新增独立无屏Hosted握手profile，保留raw基线；单owner，一次显式CONNECT，
+  再以10轮实时版本/芯片RPC验证，不启用Wi-Fi、不用GPIO6、不提供Flash写命令。
+  构建与125项软件回归已通过；app605792B，ELF=e1bc3d02d6293f6019b38616bc64a8197af4ad3199871086d89d2c83971799f4，
+  镜像checksum/digest通过，分区表与raw一致。尚未烧录该profile，未宣称Hosted/OTA/失效恢复验收通过。
+- 本节新开发板结论不覆盖第17节旧自制板的Flash内容和失败证据。详见docs/C5_SDIO_OTA_BRINGUP.md。
+
+## 21. 新开发板 P4/C5 Hosted 实机通信通过（2026-11-10 18:37）
+
+- 用户确认UART切回P4后，COM4经ROM再次识别P4v3.2/16MB，只写P4三段并hash通过；
+  运行ELF=e1bc3d02d6293f6019b38616bc64a8197af4ad3199871086d89d2c83971799f4。
+- Hosted单次CONNECT请求一次C5复位，1-bit400kHz收到真实INIT并完成版本/芯片RPC；
+  C5为出厂esp32c5/chip_id23/fw2.12.9，不需要先用UART刷C5。
+- CONNECT一组+首轮10组+追加100组，共111组/222次实时RPC全部通过；
+  11轮VERIFY逐项核对sample0..9且终态成功。末端P4 uptime203298ms，采集间无重启或新panic/task_wdt。
+- 启动原因reset7仍未定位，不因通信通过宣称看门狗已修复；只验收低速RPC，
+  Wi-Fi业务、40MHz、运行时OTA、C5应用失效恢复、迁回自制板均未验收。
+- C5 Flash未写，GPIO6/三脚未操作；UART保持P4/COM4，所有采集已关闭。
+- 下一步实现app-only OTA+新镜像重连身份验证，写C5前明确通知；自动失败恢复独立实现，
+  不能把当前通信通过或双OTA槽当成完成免引脚升级/恢复。
+- 本地汇总：firmware/p4_gesture/test-results/new_devboard_hosted_acceptance_20261110.json。
+
+## 22. C5维护基线已安装，P4启动隔离与SDIO升级验收（2026-11-10）
+
+- C5首次UART安装已完成：460800下整片4MB备份、ota_1/回滚bootloader/otadata有限写入，
+  每段hash及独立读回通过；整片对比证明重启前其他扇区（含原厂ota_0/NVS/表/标定）保留。
+  备份含敏感数据仅留本地，不进Git；后续SDIO A/B升级将正常改写非运行应用槽，不再承诺保留原厂ota_0。
+- 用户已切回P4。实时SDIO维护身份esp32c5/chip_id23/fw2.12.13、完整ELF b97127f1…、ota_1 VALID通过；
+  共享GPIO2弱上/下拉两端数字读回、500ms租约到期高阻通过，未做强推挽或产品音频验收。
+- 原P4维护双核固件复位时偶发在app_main前ROM memset产生Store access fault；
+  延后Hosted初始化后20轮计划在第19轮仍失败（18轮通过），另一独立30轮通过不抵消失败。
+  底层根因未确定，失败报告保留，不重启掩盖、不关闭PMP/栈保护/看门狗。
+- 维护专用单核400MHz/UART0 TX37 RX38/460800已烧P4，未再见该启动panic；但两批100轮计划分别在
+  第96/47轮ATTACH/RPC失败，不能称100轮通过。暖重连计数不同步为证据支持的推断，尚未根治。
+- 上传前`--recover-baseline`一次EN复位建立旧VALID基线；ACTIVATE后仅P4复位/ATTACH保留新候选。
+  10轮完整1316640B SDIO升级、PENDING→确认VALID通过；中断/超时/启动失败/SDIO失联恢复全部实测通过。
+- 工具增加reset-soak、短ACK读取、实际UART baud、panic尾部保留及挂起注入保护；173项离线回归通过。
+- 本轮专用配置不代表产品双核已修复，也不含自制板电源保持/nativeUSB/UI/音频仲裁集成。
+  SDIO连续升级、中断、未确认超时和故障镜像回滚的实际结果见docs/C5_MAINTENANCE.md，不以离线测试替代。
+
+## 23. 开发板免引脚维护验收完成（2026-11-11，限定故障模型）
+
+- 正常应用ELF b97127f1…；10轮A/B更新全部完整ACK/新槽PENDING/确认VALID，无失败补救。
+- 中断只写4096B未激活，旧VALID保留；未确认候选90秒自回退；启动前自行失败的候选由bootloader回退。
+- 新增独立build_c5_hang：候选不启动Hosted、不运行90秒维护任务；超过95秒仍SDIO失联，
+  P4响应正常，电脑工具单次EN使bootloader回退旧VALID。该测试不模拟EN/电源/Flash硬件损坏。
+- 最终实时检查回到ota_1 0x200000、正常完整ELF、VALID、GPIO2 HIZ/lease0；串口已关闭。
+- 实测报告c5_sdio_update_first/nine、interrupted、unconfirmed、fault、hung、pins、check_20261111.json，
+  详见docs/C5_MAINTENANCE.md。173项离线回归通过，和实机证据分开记录。
+- 下一阶段：把维护服务接入产品P4现有原生USB；保留GPIO29供电保持、显示暖启动、触摸/180°旋转，
+  完成音频静音/I2S停止/共享GPIO6释放与恢复，再在自制板回归后决定迁回焊接。
+- 不把开发板专用单核隔离镜像直接烧回自制板；双核Store fault根因及任意P4暖重连仍未根治。
+
+## 24. Wi-Fi专项验证（2026-11-11，手机热点基础联网通过）
+
+- 只更新P4维护profile（当前ELF 5261a506…），旧e8b5f673…镜像留存；C5维持b97127f1…正常固件，未重刷。
+- 密码不入代码/Git/报告，仅UART临时下发，NVS禁用、RAM存储，结束清空配置并停Wi-Fi。
+- 新增NET_SCAN/JOIN/PROBE/STOP与tools/c5_wifi.py；HTTPS要求CA/域名/有效期，PC UTC提供诊断时钟，不等于SNTP验证。
+- 初次在启动前设置双频返回0x3002，已修正P4调用顺序；旧失败报告保留。
+- 修订后成功扫描目标：channel8/auth7/RSSI -92dBm，关联reason4断开，未得到IP，故DNS/HTTPS尚未执行。
+  失败报告c5_wifi_acceptance_20261111_r2.json保留；清理、原boot/ELF/VALID/HIZ保持通过。
+- 187项离线回归通过；后续依用户要求查找热点，电脑扫描得到完整SSID后，由C5真实扫描/连接验证。
+- 手机热点实测报告`c5_wifi_hotspot_20261111.json`为true：扫描RSSI -71dBm/channel8/auth3，
+  DHCP IP 172.20.10.3，连接RSSI -67dBm；example目标连续3轮DNS及HTTPS 200、577B完整响应、证书校验通过。
+  espressif目标3轮DNS/TLS成功但HTTP 302/0B，未计为严格通过，`all_targets_ok=false`，不隐藏该差异。
+- 本轮未编译/刷P4或C5、未操作下载脚；测试前显式基线EN复位一次，联网期间C5 boot 5a2fda8c/正常完整ELF/ota_1 VALID/HIZ保持。
+  测试结束清空RAM凭据并断开/停止/反初始化Wi-Fi，串口已释放；不是持久在线配置，也不是多小时/反复关联验收。
+- 手机热点通过说明当前P4→SDIO→C5链路具备真实联网能力；家用AP失败根因、天线状态、BLE和产品UI集成仍未验收。

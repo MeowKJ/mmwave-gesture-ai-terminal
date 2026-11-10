@@ -11,10 +11,23 @@
 
 static const char *TAG = "BSP_RADAR";
 
+/* 雷达是 IWRL6432（SWRS298 Table 9-3，AOP 版 SWRS323 Table 8-3）：
+ *   SOP1=0 SOP0=1 -> Functional（从 QSPI flash 加载应用）
+ *   SOP1=0 SOP0=0 -> Flashing（bootloader 停在循环里等 UniFlash 写 QSPI）
+ *   SOP1=1 SOP0=1 -> Debug（绕过 bootloader，M4F 停住）
+ * 参考设计默认 SOP0 上拉、SOP1 下拉，即默认功能模式；把 SOP0 接地才进刷写模式。
+ *
+ * 但这块板的 SOP0 与 C5 的 CHIP_PU 是同一根线（GPIO54），而 CHIP_PU 低有效：
+ * 拉低 SOP0 等于在让雷达进刷写模式的同时把 C5 按在复位里。所以正常运行必须
+ * 保持 SOP0 高——这既是雷达的功能模式，也是 C5 的 CHIP_PU 释放。只有要刷雷达
+ * 固件时才允许拉低，代价是 C5 同时被复位、必须重新走一次连接流程。 */
+_Static_assert(PIN_RADAR_SOP0 == PIN_C5_RESET,
+               "SOP0 is shared with C5 CHIP_PU; keep both definitions in sync");
+
 esp_err_t bsp_radar_init(void)
 {
     /* 上电前先固定 SOP 启动模式，再释放复位 */
-    bsp_gpio_out(PIN_RADAR_SOP0, 0);
+    bsp_gpio_out(PIN_RADAR_SOP0, 1);
     bsp_gpio_out(PIN_RADAR_SOP1, 0);
     bsp_gpio_out(PIN_HOST_REQ, 0);
     bsp_gpio_out(PIN_RADAR_NRST, 0);

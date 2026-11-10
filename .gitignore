@@ -17,6 +17,7 @@
 **/sdkconfig.c5
 **/sdkconfig.product
 **/sdkconfig.hosted
+**/sdkconfig.programmer
 **/compile_commands.json
 **/.clangd
 **/.cache/

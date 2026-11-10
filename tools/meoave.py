@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -48,6 +49,15 @@ def resolve(value: str | Path, base: Path = ROOT) -> Path:
 
 def project_dir(config: dict) -> Path:
     return resolve(cfg(config, "project", "p4_dir", "firmware/p4_gesture"))
+
+
+def console_uart_baud(build: Path) -> int:
+    """Use the selected build's actual UART configuration, never a guessed baud."""
+    config = json.loads((build / "config/sdkconfig.json").read_text(encoding="utf-8"))
+    baud = int(config["ESP_CONSOLE_UART_BAUDRATE"])
+    if baud not in (115200, 230400, 460800, 921600):
+        raise ValueError(f"Unsupported maintenance UART baud: {baud}")
+    return baud
 
 
 def tool_path(config: dict, key: str, command: str) -> str:
@@ -112,6 +122,13 @@ def run(command: list[str], cwd: Path, env: dict, title: str) -> None:
 
 
 def build_signature(config: dict, profile: str, build_dir: Path, sdkconfig: Path, defaults: str, env: dict) -> str:
+    # Hash the defaults content: editing a CONFIG_* line must re-run configure,
+    # otherwise the new symbol never reaches sdkconfig.<profile>.
+    digest = hashlib.sha256()
+    for name in defaults.split(";"):
+        path = sdkconfig.parent / name.strip()
+        if path.is_file():
+            digest.update(path.read_bytes())
     sig = {
         "python": python_command(config),
         "cmake": tool_path(config, "cmake", "cmake"),
@@ -119,6 +136,7 @@ def build_signature(config: dict, profile: str, build_dir: Path, sdkconfig: Path
         "esp_target": cfg(config, "toolchain", "esp_target", "esp32p4"),
         "sdkconfig": str(sdkconfig),
         "defaults": defaults,
+        "defaults_sha": digest.hexdigest(),
         "profile": profile,
         "idf_path": env.get("IDF_PATH", ""),
         "idf_tools_path": env.get("IDF_TOOLS_PATH", ""),
@@ -127,7 +145,42 @@ def build_signature(config: dict, profile: str, build_dir: Path, sdkconfig: Path
     return json.dumps(sig, sort_keys=True)
 
 
-def build(config: dict, profile: str, reconfigure: bool = False) -> Path:
+def programmer_payload_layout(payload: Path) -> str:
+    """Validate every embedded byte; allow either normal provisioning or app-only diagnosis."""
+    manifest = json.loads((payload.parent / "flasher_args.json").read_text(encoding="utf-8"))
+    merged = payload.read_bytes()
+    regions = []
+    previous_end = 0
+    entries = sorted(manifest["flash_files"].items(), key=lambda item: int(item[0], 0))
+    if manifest.get("extra_esptool_args", {}).get("chip") != "esp32c5":
+        raise RuntimeError("Expected ESP32-C5 payload")
+    app_only = manifest.get("meoave_app_only")
+    if app_only:
+        if (len(entries) != 1 or int(entries[0][0], 0) != 0x20000 or
+                app_only.get("mode") not in ("diagnostic", "restore") or
+                app_only.get("partition_size") != 0x1e0000 or
+                len(app_only.get("backup_sha256", "")) != 64):
+            raise RuntimeError("Invalid app-only diagnostic/restore manifest")
+    elif len(entries) != 4:
+        raise RuntimeError("Expected exactly four ESP32-C5 provisioning regions")
+    for raw_offset, filename in entries:
+        offset = int(raw_offset, 0)
+        data = (payload.parent / filename).read_bytes()
+        size = len(data)
+        if (offset < previous_end or size <= 0 or offset + size > len(merged) or
+                offset % 4096 or size % 4 or merged[offset:offset+size] != data):
+            raise RuntimeError("Invalid or stale C5 flash region layout/content")
+        if app_only and size > 0x1e0000:
+            raise RuntimeError("Application exceeds backed-up ota_0 partition")
+        regions.append(f"    {{{offset}u, {size}u}},")
+        previous_end = offset + size
+    return ('#define C5_PAYLOAD_SHA "' + hashlib.sha256(merged).hexdigest() + '"\n'
+            + f'#define C5_PAYLOAD_IS_DIAG {int(bool(app_only and app_only["mode"] == "diagnostic"))}\n'
+            + 'static const struct { uint32_t offset, size; } c5_regions[] = {\n'
+            + '\n'.join(regions) + '\n};\n')
+
+
+def build(config: dict, profile: str, reconfigure: bool = False, c5_payload: Path | None = None) -> Path:
     p4 = project_dir(config)
     env = environment(config)
     if not env.get("ESP_ROM_ELF_DIR"):
@@ -142,14 +195,31 @@ def build(config: dict, profile: str, reconfigure: bool = False) -> Path:
     if profile == "hosted":
         build_name = cfg(config, "build", "hosted_dir", "build_meoave_hosted")
         defaults = cfg(config, "build", "hosted_defaults", "sdkconfig.defaults;sdkconfig.hosted.defaults")
+    elif profile == "programmer":
+        build_name = cfg(config, "build", "programmer_dir", "build_meoave_programmer")
+        defaults = "sdkconfig.defaults;sdkconfig.product.defaults;sdkconfig.programmer.defaults"
     else:
         build_name = cfg(config, "build", "product_dir", "build_meoave")
         defaults = cfg(config, "build", "product_defaults", "sdkconfig.defaults;sdkconfig.product.defaults")
     build_dir = p4 / build_name
-    sdkconfig = p4 / ("sdkconfig.hosted" if profile == "hosted" else "sdkconfig.product")
+    sdkconfig = p4 / ("sdkconfig." + profile)
+    extra_configure = []
+    if profile == "programmer":
+        payload = c5_payload or c5_dir(config) / cfg(config, "build", "c5_dir", "build_c5") / "c5_hosted_slave_merged.bin"
+        payload = payload.resolve()
+        if not payload.is_file():
+            raise RuntimeError("Build the C5 payload first: python tools/meoave.py c5")
+        header = programmer_payload_layout(payload)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        layout = build_dir / "c5_payload_layout.h"
+        if not layout.exists() or layout.read_text(encoding="utf-8") != header:
+            layout.write_text(header, encoding="utf-8")
+        extra_configure = [f"-DC5_PAYLOAD_FILE={payload}"]
 
     sig_file = build_dir / ".meoave_build_sig"
     expected_sig = build_signature(config, profile, build_dir, sdkconfig, defaults, env)
+    if profile == "programmer":
+        expected_sig += "\n" + str(payload)
     need_configure = (
         reconfigure
         or not (build_dir / "build.ninja").is_file()
@@ -169,7 +239,7 @@ def build(config: dict, profile: str, reconfigure: bool = False) -> Path:
              "-DESP_PLATFORM=1", "-DCCACHE_ENABLE=False",
              f"-DIDF_TARGET={cfg(config, 'toolchain', 'esp_target', 'esp32p4')}",
              f"-DSDKCONFIG={sdkconfig}",
-             f"-DSDKCONFIG_DEFAULTS={defaults}"], p4, env, f"configure {profile}")
+             f"-DSDKCONFIG_DEFAULTS={defaults}", *extra_configure], p4, env, f"configure {profile}")
         try:
             build_dir.mkdir(parents=True, exist_ok=True)
             sig_file.write_text(expected_sig, encoding="utf-8")
@@ -264,9 +334,8 @@ def merge_c5_image(config: dict, build_dir: Path) -> Path:
 def c5_build(config: dict, args: argparse.Namespace) -> None:
     """Build the ESP32-C5 ESP-Hosted slave firmware (firmware/c5_hosted).
 
-    The slave source is pinned to the esp-hosted-mcu release that matches the
-    P4-side host component, and carries one local change: C5 GPIO2 is held
-    high-Z because the module ties it to P4 GPIO6, the ES8389 I2S DOUT.
+    The pinned slave carries app-only maintenance/rollback support. C5 GPIO2
+    defaults high-Z; only the leased maintenance API may temporarily change it.
     """
     project = c5_dir(config)
     if not (project / "CMakeLists.txt").is_file():
@@ -277,23 +346,44 @@ def c5_build(config: dict, args: argparse.Namespace) -> None:
         if rom:
             env["ESP_ROM_ELF_DIR"] = rom
     build_name = cfg(config, "build", "c5_dir", "build_c5")
+    fault_test = getattr(args, "fault_test", False)
+    hang_test = getattr(args, "hang_test", False)
+    if fault_test and hang_test:
+        raise ValueError("Select only one C5 failure-injection image")
+    if fault_test:
+        build_name += "_fault"
+    elif hang_test:
+        build_name += "_hang"
     build_dir = project / build_name
     defaults = cfg(config, "build", "c5_defaults",
                    "sdkconfig.defaults;sdkconfig.defaults.esp32c5")
+    if fault_test:
+        defaults += ";sdkconfig.fault.defaults"
+    elif hang_test:
+        defaults += ";sdkconfig.hang.defaults"
+    sdkconfig_file = build_dir / "sdkconfig" if (fault_test or hang_test) else project / "sdkconfig.c5"
     configure = [tool_path(config, "cmake", "cmake"), "-S", str(project), "-B", str(build_dir),
                  "-G", "Ninja", f"-DPYTHON={python_command(config)}", "-DPYTHON_DEPS_CHECKED=1",
                  "-DESP_PLATFORM=1", "-DCCACHE_ENABLE=False",
                  f"-DIDF_TARGET={cfg(config, 'toolchain', 'c5_target', 'esp32c5')}",
-                 f"-DSDKCONFIG={project / 'sdkconfig.c5'}",
+                 f"-DSDKCONFIG={sdkconfig_file}",
                  f"-DSDKCONFIG_DEFAULTS={defaults}"]
     sig_file = build_dir / ".meoave_build_sig"
+    # Editing sdkconfig.defaults must invalidate the cached configure step,
+    # otherwise a newly added CONFIG_* never reaches sdkconfig.c5.
+    defaults_sha = hashlib.sha256()
+    for name in defaults.split(";"):
+        path = project / name.strip()
+        if path.is_file():
+            defaults_sha.update(path.read_bytes())
     c5_sig = json.dumps({
         "python": python_command(config),
         "cmake": tool_path(config, "cmake", "cmake"),
         "ninja": tool_path(config, "ninja", "ninja"),
         "c5_target": cfg(config, "toolchain", "c5_target", "esp32c5"),
-        "sdkconfig": str(project / "sdkconfig.c5"),
+        "sdkconfig": str(sdkconfig_file),
         "defaults": defaults,
+        "defaults_sha": defaults_sha.hexdigest(),
         "idf_path": env.get("IDF_PATH", ""),
         "idf_tools_path": env.get("IDF_TOOLS_PATH", ""),
         "esp_rom_elf_dir": env.get("ESP_ROM_ELF_DIR", ""),
@@ -315,7 +405,6 @@ def c5_build(config: dict, args: argparse.Namespace) -> None:
         if args.clean:
             # Re-apply sdkconfig.defaults from scratch. cmake --fresh keeps the object
             # cache but drops CMakeCache.txt, so no bulk delete of the build tree.
-            sdkconfig_file = project / "sdkconfig.c5"
             if sdkconfig_file.is_file():
                 print(f"remove {sdkconfig_file}")
                 sdkconfig_file.unlink()
@@ -328,7 +417,10 @@ def c5_build(config: dict, args: argparse.Namespace) -> None:
             pass
     else:
         print("\n== configure c5_hosted (cached, skipped) ==")
-    run([tool_path(config, "ninja", "ninja"), "-C", str(build_dir)], project, env,
+    jobs = int(cfg(config, "build", "jobs", 8))
+    if not 1 <= jobs <= 64:
+        raise ValueError("build.jobs must be between 1 and 64")
+    run([tool_path(config, "ninja", "ninja"), "-C", str(build_dir), "-j", str(jobs)], project, env,
         "build c5_hosted")
     if not args.no_merge:
         merge_c5_image(config, build_dir)
@@ -406,7 +498,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     build_parser = sub.add_parser("build")
-    build_parser.add_argument("--profile", choices=("product", "hosted"), default="product")
+    build_parser.add_argument("--profile", choices=("product", "hosted", "programmer"), default="product")
     build_parser.add_argument("--reconfigure", action="store_true",
                               help="force CMake reconfigure even if build configuration is unchanged")
     sub.add_parser("test")
@@ -429,6 +521,38 @@ def main() -> int:
     c5.add_argument("--clean", action="store_true",
                     help="drop sdkconfig.c5 and reconfigure with cmake --fresh")
     c5.add_argument("--no-merge", action="store_true", help="skip the merged single-file image")
+    c5_failure = c5.add_mutually_exclusive_group()
+    c5_failure.add_argument("--fault-test", action="store_true", help="separate build_c5_fault: deliberately reset a PENDING candidate before Hosted; never provision this as baseline")
+    c5_failure.add_argument("--hang-test", action="store_true", help="separate build_c5_hang: block a PENDING candidate before Hosted; requires external EN recovery, never provision as baseline")
+    program = sub.add_parser("c5-program", help="manual-entry C5 SDIO identify/provision via P4 native USB")
+    program.add_argument("--install", action="store_true", help="install the already-built P4 programmer profile")
+    program.add_argument("--flash", action="store_true", help="write/verify the four C5 image regions after identification")
+    program.add_argument("--reset-download", action="store_true", help="one explicit C5 reset with download straps held and radar inactive")
+    program.add_argument("--facts", action="store_true", help="require C5 revision/boot register evidence")
+    program.add_argument("--report", default="firmware/p4_gesture/test-results/c5_program.json")
+    read = sub.add_parser("c5-read", help="read-only C5 Flash backup through P4 USB + SDIO")
+    read.add_argument("--install", action="store_true", help="install P4 programmer only")
+    read.add_argument("--limit", default="0x400000", help="read from zero, at most 4 MB")
+    read.add_argument("--output", required=True, help="new backup path; never overwrite")
+    read.add_argument("--report", required=True)
+    minimal = sub.add_parser("c5-minimal", help="app-only C5 diagnosis with backup-based restore")
+    minimal_action = minimal.add_mutually_exclusive_group(required=True)
+    for name in ("prepare", "flash", "run", "observe", "build-restore", "restore"):
+        minimal_action.add_argument("--"+name, action="store_true")
+    minimal.add_argument("--straps-released", action="store_true")
+    minimal.add_argument("--install", action="store_true")
+    minimal.add_argument("--reset-download", action="store_true")
+    for name in ("backup-report", "facts-report", "work-dir", "report"):
+        minimal.add_argument("--"+name)
+    diagnostic = sub.add_parser("c5-test", help="bounded Hosted SDIO speed/width matrix; no C5 flash")
+    diagnostic.add_argument("--build", action="store_true")
+    diagnostic.add_argument("--install", action="store_true")
+    diagnostic.add_argument("--case", action="append", help="WIDTH:KHZ; repeat for a custom matrix")
+    diagnostic.add_argument("--timeout", type=float, default=45)
+    diagnostic.add_argument("--soak", type=float, default=3)
+    diagnostic.add_argument("--poll-ms", type=int, choices=(0, 100), default=0)
+    diagnostic.add_argument("--init-ms", type=int, default=4000)
+    diagnostic.add_argument("--report", default="firmware/p4_gesture/test-results/c5_automated.json")
     font_parser = sub.add_parser("fonts", help="regenerate the LVGL Chinese font set")
     font_parser.add_argument("--set", choices=("round", "round_bold", "chill", "wenkai", "yozai", "maiyuan"),
                              help="switch font set: round=资源圆体(默认) round_bold=资源圆体粗 chill=寒蝉圆黑体 wenkai=霞鹜文楷 yozai=悠哉 maiyuan=荆南麦圆")
@@ -457,6 +581,48 @@ def main() -> int:
         return wifi_status(config, args)
     elif args.command == "c5":
         c5_build(config, args)
+    elif args.command == "c5-program":
+        command = [python_command(config), str(TOOLS / "c5_program.py"),
+                   "--build-dir", str(project_dir(config) / cfg(config, "build", "programmer_dir", "build_meoave_programmer")),
+                   "--payload", str(c5_dir(config) / cfg(config, "build", "c5_dir", "build_c5") / "c5_hosted_slave_merged.bin"),
+                   "--report", str(resolve(args.report))]
+        if args.install:
+            command.append("--install")
+        if args.flash:
+            command.append("--flash")
+        if args.reset_download:
+            command.append("--reset-download")
+        if args.facts:
+            command.append("--facts")
+        return subprocess.run(command, cwd=ROOT, env=environment(config)).returncode
+    elif args.command == "c5-read":
+        command = [python_command(config), str(TOOLS / "c5_read.py"),
+                   "--limit", args.limit, "--output", str(resolve(args.output)),
+                   "--report", str(resolve(args.report))]
+        if args.install:
+            command.append("--install")
+        return subprocess.run(command, cwd=ROOT, env=environment(config)).returncode
+    elif args.command == "c5-minimal":
+        forwarded=[]
+        for name in ("prepare", "flash", "run", "observe", "build-restore", "restore", "straps-released", "reset-download", "install"):
+            if getattr(args,name.replace("-","_")): forwarded.append("--"+name)
+        for name in ("backup-report", "facts-report", "work-dir", "report"):
+            value=getattr(args,name.replace("-","_"))
+            if value: forwarded.extend(["--"+name, str(resolve(value))])
+        return subprocess.run([python_command(config), str(TOOLS / "c5_minimal.py"), *forwarded],
+                              cwd=ROOT, env=environment(config)).returncode
+    elif args.command == "c5-test":
+        command = [python_command(config), str(TOOLS / "c5_test.py"),
+                   "--timeout", str(args.timeout), "--soak", str(args.soak),
+                   "--poll-ms", str(args.poll_ms), "--init-ms", str(args.init_ms),
+                   "--report", str(resolve(args.report))]
+        if args.build:
+            command.append("--build")
+        if args.install:
+            command.append("--install")
+        for case in args.case or []:
+            command.extend(["--case", case])
+        return subprocess.run(command, cwd=ROOT, env=environment(config)).returncode
     elif args.command == "fonts":
         fonts(config, args)
     elif args.command == "clean":

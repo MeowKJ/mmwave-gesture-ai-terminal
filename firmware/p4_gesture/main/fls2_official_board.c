@@ -22,6 +22,9 @@
 #include "meoave_app.h"
 #include "bsp_wifi_probe.h"
 #include "bsp_c5_diag.h"
+#ifdef CONFIG_APP_C5_SDIO_LOADER
+#include "bsp_c5_loader.h"
+#endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
 #include "bsp_wifi_hosted.h"
 #endif
@@ -156,8 +159,23 @@ static void on_command(const char *line, void *ctx)
 {
     (void)ctx;
 #ifdef CONFIG_APP_MEOAVE_UI
+#ifdef CONFIG_APP_C5_SDIO_LOADER
+    if (bsp_c5_loader_command(line)) return;
+    /* Isolate legacy loader SDMMC ownership from handle-based probing/pin
+       surveys, even between commands or following a failed connection. */
+    if (strncmp(line, "WIFI ", 5) == 0) {
+        (void)bsp_usb_cdc_write("MEO:REJECTED reason=C5_PROGRAMMER_PROFILE\n");
+        return;
+    }
+#endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
     if (bsp_wifi_hosted_command(line)) return;
+    /* Hosted reserves SDMMC and routes its GPIOs in its constructor, even
+       while IDLE. Legacy PINS resets that mux; PROBE allocates a rival host. */
+    if (strncmp(line, "WIFI ", 5) == 0) {
+        (void)bsp_usb_cdc_write("MEO:REJECTED reason=HOSTED_OWNS_SDIO\n");
+        return;
+    }
 #endif
     if (bsp_c5_diag_command(line)) return;
     if (bsp_wifi_probe_command(line)) return;
@@ -258,7 +276,11 @@ void app_main(void)
         service_loop();
         if (s_demo_ready) fls2_display_diag_service();
 #ifdef CONFIG_APP_MEOAVE_UI
+#ifdef CONFIG_APP_C5_SDIO_LOADER
+        bsp_c5_loader_service();
+#else
         bsp_wifi_probe_service();
+#endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
         bsp_wifi_hosted_service();
 #endif

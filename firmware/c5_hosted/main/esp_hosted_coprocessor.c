@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "sys/queue.h"
 #include "soc/soc.h"
 #include "nvs_flash.h"
@@ -27,6 +30,7 @@
 
 #include "esp_hosted_coprocessor.h"
 #include "c5_io2_guard.h"
+#include "c5_maintenance.h"
 #include "driver/gpio.h"
 
 #include "freertos/FreeRTOS.h"
@@ -1291,10 +1295,19 @@ esp_err_t esp_hosted_coprocessor_init(void)
 #ifdef CONFIG_ESP_HOSTED_COPROCESSOR_APP_MAIN
 void app_main(void)
 {
+	const esp_app_desc_t *app = esp_app_get_description();
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	ESP_LOGI(TAG, "C5_BOOT project=%s version=%s idf=%s reset=%d slot=%s address=0x%x",
+			app->project_name, app->version, app->idf_ver, (int)esp_reset_reason(),
+			running ? running->label : "unknown", running ? (unsigned)running->address : 0);
+	ESP_LOG_BUFFER_HEX_LEVEL(TAG, app->app_elf_sha256, sizeof(app->app_elf_sha256), ESP_LOG_INFO);
+
 	/* meoave board V1.0: C5 GPIO2 is wired to P4 GPIO6, which the P4 drives as
 	 * the ES8389 I2S DOUT. Claim the pad as high-Z before NVS, Wi-Fi or the
 	 * transport driver can touch it. */
 	ESP_ERROR_CHECK(c5_io2_guard_apply());
+	ESP_LOGI(TAG, "C5_BOOT gpio_guard=ok nvs=starting");
+	c5_maintenance_pre_init();
 
 	/* Initialize NVS */
 	esp_err_t ret = nvs_flash_init();
@@ -1306,11 +1319,15 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK( ret );
 
-	esp_hosted_coprocessor_init();
+	ESP_LOGI(TAG, "C5_BOOT nvs=ok hosted=starting");
+	ESP_ERROR_CHECK(esp_hosted_coprocessor_init());
 
 	/* Re-assert after ESP-Hosted is up: no transport or feature init is allowed
 	 * to have taken C5 GPIO2 away from high-Z. */
 	ESP_ERROR_CHECK(c5_io2_guard_apply());
+	/* Local initialization only; a real host RPC is still needed to prove SDIO. */
+	ESP_LOGI(TAG, "C5_BOOT hosted_local_init=ok awaiting_host_rpc");
+	ESP_ERROR_CHECK(c5_maintenance_init());
 
 #ifdef CONFIG_ESP_HOSTED_NETWORK_SPLIT_ENABLED
 #ifdef ESP_HOSTED_COPROCESSOR_EXAMPLE_HTTP_CLIENT

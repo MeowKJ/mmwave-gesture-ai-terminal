@@ -32,5 +32,11 @@ CONFIG_ESP_HOSTED_SLAVE_RESET_ONLY_IF_NECESSARY=y
 # CONFIG_ESP_HOSTED_HOST_POWER_SAVE_ENABLED is not set
 # CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE is not set
 # CONFIG_ESP_HOSTED_WIFI_AUTO_CONNECT_ON_STA_START is not set
+# CP GPIO RPC: lets the P4 drive C5 GPIO2 (net shared with P4 GPIO6 /
+# ES8389 I2S DOUT) for the audio time-share. Requires the same option on the
+# C5 side, whose guard still blocks all six SDIO pins.
+CONFIG_ESP_HOSTED_ENABLE_GPIO_EXPANDER=y
+# C5 boot from CHIP_PU release to SDIO-slave-ready is slower than 1.5 s on this module.
+CONFIG_ESP_HOSTED_SDIO_RESET_DELAY_MS=5000
 CONFIG_APP_SELFTEST_COLORS=n
 CONFIG_APP_AUDIO_BEEP=n

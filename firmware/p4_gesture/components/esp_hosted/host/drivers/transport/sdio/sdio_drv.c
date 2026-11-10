@@ -85,6 +85,7 @@
 #include "power_save_drv.h"
 #include "esp_hosted_power_save.h"
 #include "esp_hosted_transport_config.h"
+#include "esp_hosted_sdio_diagnostic.h"
 #include "esp_hosted_bt.h"
 #include "port_esp_hosted_host_config.h"
 #include "esp_hosted_event.h"
@@ -1179,11 +1180,20 @@ static void sdio_read_task(void const* pvParameters)
 	ESP_LOGI(TAG, "Open data path at slave");
 
 
-	sdio_generate_slave_intr(ESP_OPEN_DATA_PATH);
+	res = sdio_generate_slave_intr(ESP_OPEN_DATA_PATH);
+	if (esp_hosted_sdio_diagnostic_active()) {
+		ESP_LOGI(TAG, "MEO_SDIO_TEST: open_path error=0x%x poll_ms=%u",
+		         (unsigned)res, esp_hosted_sdio_diagnostic_poll_ms());
+	}
 
 	for (;;) {
 
 		if (!pending) {
+			if (esp_hosted_sdio_diagnostic_active() && esp_hosted_sdio_diagnostic_poll_ms()) {
+				/* Diagnostic A/B only: reuse the normal register/FIFO path,
+				 * but don't rely on DAT1 to wake the receiver. */
+				g_h.funcs->_h_msleep(esp_hosted_sdio_diagnostic_poll_ms());
+			} else {
 			// wait for sdio interrupt from slave
 			/* Always blocks: a finite wait is unusable here, as
 			 * sdmmc_host_io_int_wait() logs any non-OK at ERROR. */
@@ -1194,6 +1204,7 @@ static void sdio_read_task(void const* pvParameters)
 			if (res != ESP_OK) {
 				ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
 				continue;
+			}
 			}
 		}
 		pending = false;
@@ -1648,12 +1659,16 @@ static esp_err_t transport_card_init(void *bus_handle, uint32_t timeout_ms)
 
 static esp_err_t transport_gpio_reset(void *bus_handle, gpio_pin_t reset_pin)
 {
+	/* meoave local fix (esp_hosted 2.12.13): upstream ends this sequence with
+	 * H_RESET_VAL_ACTIVE. With CONFIG_ESP_HOSTED_RESET_GPIO_ACTIVE_LOW=y (the
+	 * module ties C5 CHIP_PU active-low to P4 GPIO54) that leaves the slave
+	 * held in reset while transport_card_init() probes it, so every reset path
+	 * is guaranteed to fail and the C5 stays dead afterwards. End on INACTIVE
+	 * and give the coprocessor time to boot before the caller probes. */
 	g_h.funcs->_h_config_gpio(reset_pin.port, reset_pin.pin, H_GPIO_MODE_DEF_OUTPUT);
 	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_ACTIVE);
 	g_h.funcs->_h_msleep(10);
 	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_INACTIVE);
-	g_h.funcs->_h_msleep(10);
-	g_h.funcs->_h_write_gpio(reset_pin.port, reset_pin.pin, H_RESET_VAL_ACTIVE);
 	g_h.funcs->_h_msleep(H_HOST_SDIO_RESET_DELAY_MS);
 	return ESP_OK;
 }
@@ -1673,6 +1688,19 @@ int ensure_slave_bus_ready(void *bus_handle)
 	assert(reset_pin.pin != -1);
 
 	release_slave_reset_gpio_post_wakeup();
+	/* Explicit test mode: deterministic cold slave baseline, at most one
+	 * reset/card-init per boot. Never hide an unstable bus with retries. */
+	if (esp_hosted_sdio_diagnostic_active()) {
+		ESP_LOGW(TAG, "MEO_SDIO_TEST: reset=%u; one card initialization",
+		         esp_hosted_sdio_diagnostic_reset_enabled());
+		if (esp_hosted_sdio_diagnostic_reset_enabled()) transport_gpio_reset(bus_handle, reset_pin);
+		res = transport_card_init(bus_handle, 0);
+		if (res == ESP_OK) {
+			ESP_LOGI(TAG, "MEO_SDIO_TEST: card initialized");
+			set_transport_state(TRANSPORT_RX_ACTIVE);
+		}
+		return res;
+	}
 
 #if H_SLAVE_RESET_ONLY_IF_NECESSARY
 	{

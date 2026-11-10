@@ -12,6 +12,7 @@
 #include "esp_hosted_transport.h"
 #include "esp_hosted_transport_init.h"
 #include "esp_hosted_transport_config.h"
+#include "esp_hosted_sdio_diagnostic.h"
 #include "esp_hosted_host_fw_ver.h"
 #include "stats.h"
 #include "esp_hosted_log.h"
@@ -179,6 +180,10 @@ esp_err_t setup_transport(void(*esp_hosted_up_cb)(void))
 esp_err_t transport_drv_reconfigure(void)
 {
 	static int retry_slave_connection = 0;
+	bool diagnostic = false;
+#ifdef CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE
+	diagnostic = esp_hosted_sdio_diagnostic_active();
+#endif
 
 	ESP_LOGI(TAG, "Attempt connection with slave: retry[%u]", retry_slave_connection);
 
@@ -217,9 +222,18 @@ esp_err_t transport_drv_reconfigure(void)
 		transport_state = TRANSPORT_RX_ACTIVE;
 		ESP_LOGI(TAG, "Waiting for esp_hosted slave to be ready");
 		while (!is_transport_tx_ready()) {
+#ifdef CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE
+			if (diagnostic && retry_slave_connection >= esp_hosted_sdio_diagnostic_init_ms() / 200) {
+				ESP_LOGE(TAG, "MEO_SDIO_TEST: no Hosted init event within %u ms; no retry/reset",
+				         esp_hosted_sdio_diagnostic_init_ms());
+				return ESP_ERR_TIMEOUT;
+			}
+			if (diagnostic && retry_slave_connection % 5 == 0)
+				esp_hosted_sdio_diagnostic_snapshot();
+#endif
 			if (retry_slave_connection < MAX_RETRY_TRANSPORT_ACTIVE) {
 				retry_slave_connection++;
-				if (retry_slave_connection%50==0) {
+				if (!diagnostic && retry_slave_connection%50==0) {
 					ESP_LOGI(TAG, "Not able to connect with ESP-Hosted slave device");
 					if (ESP_OK != ensure_slave_bus_ready(bus_handle)) {
 						ESP_LOGE(TAG, "ensure_slave_bus_ready failed");

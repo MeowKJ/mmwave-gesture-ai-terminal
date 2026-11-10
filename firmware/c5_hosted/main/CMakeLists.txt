@@ -20,6 +20,7 @@ set(COMPONENT_SRCS
 	"slave_control.c"
 	"slave_util.c"
 	"c5_io2_guard.c"
+	"c5_maintenance.c"
 )
 
 if(CONFIG_ESP_HOSTED_USE_MEMPOOL)

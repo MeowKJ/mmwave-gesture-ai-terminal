@@ -1778,6 +1778,23 @@ endmenu
 # ----------------------------------------------------------------------------
 menu "meoave board (V1.0)"
 
+	config C5_MAINT_TEST_HANG_PENDING
+		bool "HANG TEST ONLY: block pending image before Hosted init"
+		default n
+		depends on BOOTLOADER_APP_ROLLBACK_ENABLE && !C5_MAINT_TEST_FAIL_PENDING
+		help
+			Separate acceptance-test candidate only. Leaves scheduler alive but
+			never starts SDIO or the 90-second self-reset service. Requires P4
+			EN recovery. Never provision or confirm this image as a baseline.
+
+	config C5_MAINT_TEST_FAIL_PENDING
+		bool "FAULT TEST ONLY: reset pending image before Hosted init"
+		default n
+		depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+		help
+			Build only into a separate acceptance-test candidate. Never use as
+			provisioning/recovery image. Tests bootloader rollback, not normal OTA.
+
 	config C5_IO2_GUARD_ENABLE
 		bool "Keep C5 GPIO2 high-Z (shared with P4 I2S DOUT)"
 		default y

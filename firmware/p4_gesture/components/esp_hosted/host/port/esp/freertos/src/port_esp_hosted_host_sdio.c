@@ -12,6 +12,7 @@
 #include "sdio_reg.h"
 #include "port_esp_hosted_host_sdio.h"
 #include "esp_hosted_transport_config.h"
+#include "esp_hosted_sdio_diagnostic.h"
 #include "port_esp_hosted_host_config.h"
 #include "port_esp_hosted_host_log.h"
 
@@ -47,8 +48,79 @@ typedef struct  {
 } sdmmc_context_t;
 
 static sdmmc_context_t context = { 0 };
+static bool diagnostic_active;
+static bool card_init_started;
+static unsigned diagnostic_poll_ms;
+static unsigned diagnostic_init_ms = 4000;
+static bool card_initialized;
+static bool diagnostic_reset_enabled = true;
+
+esp_err_t esp_hosted_sdio_diagnostic_set_reset(bool enabled)
+{
+	if (!diagnostic_active || card_init_started) return ESP_ERR_INVALID_STATE;
+	diagnostic_reset_enabled = enabled;
+	return ESP_OK;
+}
+
+bool esp_hosted_sdio_diagnostic_reset_enabled(void) { return diagnostic_reset_enabled; }
+
+esp_err_t esp_hosted_sdio_diagnostic_configure(unsigned width, unsigned khz)
+{
+	return esp_hosted_sdio_diagnostic_configure_ex(width, khz, 0, 4000);
+}
+
+esp_err_t esp_hosted_sdio_diagnostic_configure_ex(unsigned width, unsigned khz,
+                                                unsigned poll_ms, unsigned init_ms)
+{
+	if ((width != 1 && width != 4) ||
+	    (khz != 400 && khz != 1000 && khz != 5000 && khz != 10000 &&
+	     khz != 20000 && khz != 40000)) return ESP_ERR_INVALID_ARG;
+	if ((poll_ms != 0 && poll_ms != 100) || init_ms < 4000 || init_ms > 20000 || init_ms % 200)
+		return ESP_ERR_INVALID_ARG;
+	if (!context.card || card_init_started || diagnostic_active) return ESP_ERR_INVALID_STATE;
+	context.config.bus_width = width;
+	context.config.clock_freq_khz = khz;
+	diagnostic_poll_ms = poll_ms;
+	diagnostic_init_ms = init_ms;
+	diagnostic_active = true;
+	return ESP_OK;
+}
+
+bool esp_hosted_sdio_diagnostic_active(void)
+{
+	return diagnostic_active;
+}
+
+unsigned esp_hosted_sdio_diagnostic_poll_ms(void) { return diagnostic_poll_ms; }
+unsigned esp_hosted_sdio_diagnostic_init_ms(void) { return diagnostic_init_ms; }
 
 static void * sdio_bus_lock;
+
+/* Non-destructive CMD52 register samples through the existing SDIO owner.
+ * No pin survey, FIFO read, interrupt clear, reset or competing controller. */
+void esp_hosted_sdio_diagnostic_snapshot(void)
+{
+	if (!diagnostic_active || !card_initialized) return;
+	const uint32_t offsets[] = {0x44, 0x50, 0x58, 0x60, 0xdc};
+	uint32_t regs[5] = {0};
+	uint8_t ien = 0, pending = 0;
+	esp_err_t err;
+	SDIO_LOCK(true);
+	err = sdmmc_io_read_byte(context.card, 0, 0x04, &ien);
+	if (err == ESP_OK) err = sdmmc_io_read_byte(context.card, 0, 0x05, &pending);
+	for (unsigned i = 0; i < 5 && err == ESP_OK; ++i) {
+		for (unsigned j = 0; j < 4 && err == ESP_OK; ++j) {
+			uint8_t byte = 0;
+			err = sdmmc_io_read_byte(context.card, 1, offsets[i] + j, &byte);
+			regs[i] |= (uint32_t)byte << (j * 8);
+		}
+	}
+	SDIO_UNLOCK(true);
+	ESP_LOGI(TAG, "MEO_SDIO_SNAPSHOT error=0x%x ocr=0x%08lx funcs=%u ien=0x%02x pending=0x%02x token=0x%08lx raw=0x%08lx st=0x%08lx len=0x%08lx ena=0x%08lx",
+	         (unsigned)err, (unsigned long)context.card->ocr, context.card->num_io_functions,
+	         ien, pending, (unsigned long)regs[0], (unsigned long)regs[1],
+	         (unsigned long)regs[2], (unsigned long)regs[3], (unsigned long)regs[4]);
+}
 
 // workarounds for known ESP-IDF SDMMC issues
 static void hosted_sdio_workaround(int slot, sdmmc_slot_config_t *slot_config)
@@ -401,6 +473,7 @@ void * hosted_sdio_init(void)
 int hosted_sdio_card_init(void *ctx, bool show_config)
 {
 	SDIO_FAIL_IF_NULL(ctx);
+	card_init_started = true;
 
 	sdmmc_context_t *context = (sdmmc_context_t *)ctx;
 
@@ -416,6 +489,12 @@ int hosted_sdio_card_init(void *ctx, bool show_config)
 	}
 
 	config.max_freq_khz = sdio_config->clock_freq_khz;
+	/* The physical slot is provisioned for four lines, but a diagnostic can
+	 * negotiate just D0. Changing max_freq alone does not select 1-bit mode. */
+	if (diagnostic_active) {
+		config.flags &= ~(SDMMC_HOST_FLAG_1BIT | SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_8BIT);
+		config.flags |= sdio_config->bus_width == 1 ? SDMMC_HOST_FLAG_1BIT : SDMMC_HOST_FLAG_4BIT;
+	}
 	if (show_config) {
 		ESP_LOGI(TAG, "SDIO master: Slot %d, Data-Lines: %d-bit Freq(KHz)[%u KHz]",
 				config.slot,
@@ -464,6 +543,7 @@ int hosted_sdio_card_init(void *ctx, bool show_config)
 		ESP_LOGE(TAG, "sdio_card_fn_init failed");
 		goto fail;
 	}
+	card_initialized = true;
 	return ESP_OK;
 
 fail:

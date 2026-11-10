@@ -3,6 +3,8 @@ dependencies:
   ## Required IDF version
   idf:
     version: ">=4.1.0"
+  espressif/esp-serial-flasher:
+    version: "2.0.0"
   espressif/esp_lvgl_port:
     version: 2.7.*
     public: true

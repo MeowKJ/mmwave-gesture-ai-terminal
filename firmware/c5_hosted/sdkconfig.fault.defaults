@@ -1,0 +1,2 @@
+# Hardware rollback acceptance only. NEVER install this as initial baseline.
+CONFIG_C5_MAINT_TEST_FAIL_PENDING=y

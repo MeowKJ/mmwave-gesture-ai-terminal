@@ -28,6 +28,19 @@
    - 本项目自有文件，直接保留
 7. `README.md`
    - 上游同名文件已改名为 `UPSTREAM_README.md`
+8. `main/slave_control.c`
+   - OTA 重复 BEGIN 释放旧会话；WRITE/END/ACTIVATE 状态检查；失败终止、容量保护
+   - 首包失败不得绕过校验；无有效会话时 ACTIVATE 返回错误，而不是 SUCCESS
+   - 定时器先分配，选槽后启动失败尝试恢复旧启动槽；恢复失败封锁新写入并返回错误
+   - END/已排队 ACTIVATE 幂等；WRITE 没有序号，宿主不得盲重发
+9. `main/esp_hosted_coprocessor.c`
+   - C5_BOOT 身份、ELF SHA、阶段日志；Hosted 初始化失败不再忽略
+10. `../p4_gesture/tests/test_c5_ota.py` / `tests/fixtures/c5_ota_harness.c`
+   - 提取真实 OTA handler，用 native gcc/clang 和 IDF mock 做错误注入；不访问硬件
+11. `main/c5_maintenance.c/.h` / `../shared/c5_maintenance_protocol.h`
+   - 显式健康确认/90秒回退、实时ELF与boot nonce、GPIO2 break-before-make租约；通用GPIO RPC拒绝GPIO2
+   - `app_main`在GPIO2高阻后调用pre_init，正常Hosted初始化后启动维护服务
+   - `sdkconfig.fault.defaults`与`sdkconfig.hang.defaults`仅独立故障候选；正常/首次基线禁止注入固件
 
 ## 上游默认值核对结果（v2.12.13）
 

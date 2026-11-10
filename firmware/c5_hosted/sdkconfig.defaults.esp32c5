@@ -144,9 +144,26 @@ CONFIG_ESP_HOST_DEV_BOARD_P4_C5_CORE=y
 CONFIG_C5_IO2_GUARD_ENABLE=y
 CONFIG_C5_IO2_GUARD_ASSERT_SDIO=y
 
+# Let the P4 configure/read C5 GPIO2 over SDIO (RPC). This is what makes the
+# GPIO6 time-share possible without touching straps: the host can switch C5
+# GPIO2 between input (high-Z while audio drives the net) and output.
+# Transport pins stay blocked by slave_transport_gpio_pin_guard.
+CONFIG_ESP_HOSTED_ENABLE_GPIO_EXPANDER=y
+
+# Runtime upgrades: the slave answers the OTA RPC set and writes the inactive
+# inactive OTA slot. This only works while Hosted/SDIO is operational; it is
+# not firmware-independent ROM recovery. End-to-end acceptance is still pending.
+# (OTA RPC handlers are always built; this note only records the intent.)
+
 # No PSRAM on the ESP32C5HF4 die.
 CONFIG_SPIRAM=n
 
 # The P4 host drives C5 CHIP_PU on GPIO54, so the slave does not need a
 # self-reset pin of its own.
 CONFIG_ESP_SDIO_GPIO_RESET=-1
+
+# Bootloader and app must both use rollback; the initial UART provisioning
+# installs this bootloader once, preserving factory app/partition/NVS.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_ESP_HOSTED_ALLOW_FULL_APP_DESC=y
+CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y

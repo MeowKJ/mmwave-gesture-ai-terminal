@@ -1,0 +1,18 @@
+CONFIG_MEOAVE_C5_MAINT_HOST=y
+# Custom RPC supplies full image/slot identity and shared-pin leases.
+CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
+# Maintenance app + IDF logs use this baud; ROM flashing still uses 115200.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=37
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=38
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=460800
+# This dedicated UART/SDIO maintenance profile does not need a second CPU.
+# Isolate the reproduced dual-core pre-scheduler SRAM store fault; do not
+# disable memory protection, stack guards or watchdogs. Not a product fix.
+CONFIG_FREERTOS_UNICORE=y
+# Never persist Wi-Fi diagnostic credentials on the host or coprocessor.
+# CONFIG_ESP_WIFI_NVS_ENABLED is not set
+# CONFIG_WIFI_RMT_NVS_ENABLED is not set
+# HTTPS acceptance must verify validity dates as well as CA/hostname.
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y

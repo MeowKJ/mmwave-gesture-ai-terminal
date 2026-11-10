@@ -1,0 +1,3 @@
+# External EN recovery acceptance only. NEVER provision or confirm as baseline.
+# CONFIG_C5_MAINT_TEST_FAIL_PENDING is not set
+CONFIG_C5_MAINT_TEST_HANG_PENDING=y

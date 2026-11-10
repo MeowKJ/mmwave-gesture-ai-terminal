@@ -58,6 +58,7 @@ enum {
 	OTA_FAILED,
 	OTA_COMPLETED,
 	OTA_ACTIVATED,
+	OTA_BOOT_SELECTED,
 };
 
 #ifdef CONFIG_ESP_HOSTED_MEM_MONITOR
@@ -98,6 +99,8 @@ static uint32_t hb_num;
 static esp_ota_handle_t handle;
 const esp_partition_t* update_partition = NULL;
 static bool first_ota_write = false;
+static bool ota_handle_open;
+static size_t ota_bytes_written;
 
 #if H_OTA_CHECK_IMAGE_VALIDITY
 #define OTA_IMAGE_HEADER_SIZE (sizeof(esp_image_header_t) + \
@@ -133,6 +136,23 @@ static SemaphoreHandle_t custom_callbacks_mutex = NULL;
 
 #endif
 
+/* OTA session operations are serialized by the Hosted RPC receive task.
+ * WRITE has no offset/sequence in the upstream protocol: the host MUST NOT
+ * retry an unacknowledged WRITE; it must start a new BEGIN instead. */
+static void ota_fail_session(void)
+{
+	if (ota_handle_open) {
+		esp_err_t err = esp_ota_abort(handle);
+		if (err != ESP_OK) {
+			ESP_LOGW(TAG, "OTA abort: %s", esp_err_to_name(err));
+		}
+	}
+	ota_handle_open = false;
+	handle = 0;
+	first_ota_write = false;
+	ota_status = OTA_FAILED;
+}
+
 /* OTA end timer callback */
 void vTimerCallback( TimerHandle_t xTimer )
 {
@@ -167,11 +187,31 @@ static esp_err_t req_ota_begin_handler (Rpc *req,
 	resp->payload_case = RPC__PAYLOAD_RESP_OTA_BEGIN;
 	resp->resp_ota_begin = resp_payload;
 
+	/* Never erase the image already selected for the imminent reboot. */
+	if (ota_status == OTA_ACTIVATED || ota_status == OTA_BOOT_SELECTED) {
+		ret = ESP_ERR_INVALID_STATE;
+		goto err;
+	}
+	/* A new BEGIN explicitly abandons an interrupted upload. */
+	ota_fail_session();
+	update_partition = NULL;
+	ota_bytes_written = 0;
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	const esp_partition_t *boot = esp_ota_get_boot_partition();
+	if (!running || !boot || running->address != boot->address) {
+		ret = ESP_ERR_INVALID_STATE;
+		goto err;
+	}
+
 	/* Identify next OTA partition */
 	update_partition = esp_ota_get_next_update_partition(NULL);
 	if (update_partition == NULL) {
 		ESP_LOGE(TAG, "Failed to get next update partition");
-		ret = -1;
+		ret = ESP_ERR_NOT_FOUND;
+		goto err;
+	}
+	if (update_partition->address == running->address) {
+		ret = ESP_ERR_OTA_PARTITION_CONFLICT;
 		goto err;
 	}
 
@@ -182,7 +222,7 @@ static esp_err_t req_ota_begin_handler (Rpc *req,
 		goto err;
 	}
 	ota_status = OTA_IN_PROGRESS;
-
+	ota_handle_open = true;
 	first_ota_write = true;
 
 	resp_payload->resp = SUCCESS;
@@ -215,15 +255,32 @@ static esp_err_t req_ota_write_handler (Rpc *req,
 	resp->payload_case = RPC__PAYLOAD_RESP_OTA_WRITE;
 	resp->resp_ota_write = resp_payload;
 
+	if (ota_status != OTA_IN_PROGRESS || !ota_handle_open || !update_partition) {
+		resp_payload->resp = ESP_ERR_INVALID_STATE;
+		return ESP_OK;
+	}
+	if (!req->req_ota_write || !req->req_ota_write->ota_data.data ||
+			!req->req_ota_write->ota_data.len) {
+		ota_fail_session();
+		resp_payload->resp = ESP_ERR_INVALID_ARG;
+		return ESP_OK;
+	}
+	if (ota_bytes_written > update_partition->size ||
+			req->req_ota_write->ota_data.len > update_partition->size - ota_bytes_written) {
+		ota_fail_session();
+		resp_payload->resp = ESP_ERR_INVALID_SIZE;
+		return ESP_OK;
+	}
+
 	// Check image validity before writing if it's the first chunk
 	if (first_ota_write) {
 		ESP_LOGI(TAG, "Flashing image\n");
-		first_ota_write = false;
 
 #if H_OTA_CHECK_IMAGE_VALIDITY
 		// sanity check: first write should contain enough data to query app header
 		if (req->req_ota_write->ota_data.len < OTA_IMAGE_HEADER_SIZE) {
 			ESP_LOGE(TAG, "First OTA write is too small to contain app header");
+			ota_fail_session();
 			resp_payload->resp = ESP_ERR_INVALID_SIZE;
 			return ESP_OK;
 		}
@@ -235,6 +292,7 @@ static esp_err_t req_ota_write_handler (Rpc *req,
 		esp_err_t validity_ret = esp_ota_check_image_validity(update_partition->type, img_hdr, app_desc);
 		if (validity_ret != ESP_OK) {
 			ESP_LOGE(TAG, "OTA image validity check failed with error: %s", esp_err_to_name(validity_ret));
+			ota_fail_session();
 			resp_payload->resp = validity_ret;
 			return ESP_OK;
 		}
@@ -248,9 +306,12 @@ static esp_err_t req_ota_write_handler (Rpc *req,
 			req->req_ota_write->ota_data.len);
 	if (ret != ESP_OK) {
 		ESP_LOGE(TAG, "OTA write failed with return code 0x%x",ret);
+		ota_fail_session();
 		resp_payload->resp = ret;
 		return ESP_OK;
 	}
+	first_ota_write = false;
+	ota_bytes_written += req->req_ota_write->ota_data.len;
 	resp_payload->resp = SUCCESS;
 	return ESP_OK;
 }
@@ -276,7 +337,23 @@ static esp_err_t req_ota_end_handler (Rpc *req,
 	resp->payload_case = RPC__PAYLOAD_RESP_OTA_END;
 	resp->resp_ota_end = resp_payload;
 
+	if (ota_status == OTA_COMPLETED) {
+		resp_payload->resp = SUCCESS;
+		return ESP_OK;
+	}
+	if (ota_status != OTA_IN_PROGRESS || !ota_handle_open) {
+		resp_payload->resp = ESP_ERR_INVALID_STATE;
+		return ESP_OK;
+	}
+	if (!ota_bytes_written) {
+		ota_fail_session();
+		resp_payload->resp = ESP_ERR_INVALID_SIZE;
+		return ESP_OK;
+	}
 	ret = esp_ota_end(handle);
+	/* IDF consumes the handle even if image verification fails. */
+	ota_handle_open = false;
+	handle = 0;
 	if (ret != ESP_OK) {
 		if (ret == ESP_ERR_OTA_VALIDATE_FAILED) {
 			ESP_LOGE(TAG, "Image validation failed, image is corrupted");
@@ -287,7 +364,8 @@ static esp_err_t req_ota_end_handler (Rpc *req,
 		goto err;
 	}
 
-	ESP_LOGI(TAG, "**** OTA updated successful, ready for activation ****");
+	ESP_LOGI(TAG, "OTA image verified: slot=%s bytes=%u; not activated",
+			update_partition->label, (unsigned)ota_bytes_written);
 	ota_status = OTA_COMPLETED;
 	resp_payload->resp = SUCCESS;
 	return ESP_OK;
@@ -303,6 +381,7 @@ static esp_err_t req_ota_activate_handler (Rpc *req,
 	esp_err_t ret = ESP_OK;
 	RpcRespOTAActivate *resp_payload = NULL;
 	TimerHandle_t xTimer = NULL;
+	const esp_partition_t *previous_boot = NULL;
 
 	if (!req || !resp) {
 		ESP_LOGE(TAG, "Invalid parameters");
@@ -318,49 +397,60 @@ static esp_err_t req_ota_activate_handler (Rpc *req,
 	resp->payload_case = RPC__PAYLOAD_RESP_OTA_ACTIVATE;
 	resp->resp_ota_activate = resp_payload;
 
-	ret = ESP_OK;
-	switch (ota_status) {
-		case OTA_COMPLETED:
-			break;
-		case OTA_IN_PROGRESS:
-			ESP_LOGW(TAG, "OTA in progress");
-			goto err;
-			break;
-		case OTA_NOT_STARTED:
-			ESP_LOGW(TAG, "OTA not started");
-			goto err;
-			break;
-		case OTA_FAILED:
-			ESP_LOGW(TAG, "OTA failed");
-			goto err;
-			break;
-		default:
-			ESP_LOGW(TAG, "OTA status unknown");
-			goto err;
-			break;
+	/* A lost ACTIVATE reply must not allocate a second restart timer. */
+	if (ota_status == OTA_ACTIVATED) {
+		resp_payload->resp = SUCCESS;
+		return ESP_OK;
+	}
+	if (ota_status != OTA_COMPLETED || !update_partition) {
+		ret = ESP_ERR_INVALID_STATE;
+		goto err;
+	}
+	previous_boot = esp_ota_get_boot_partition();
+	if (!previous_boot) {
+		ret = ESP_ERR_NOT_FOUND;
+		goto err;
+	}
+	/* Allocate before changing otadata: OOM must not select an unscheduled boot. */
+	xTimer = xTimerCreate("OTAActivateTimer", RESTART_TIMEOUT, pdFALSE, 0, vTimerCallback);
+	if (!xTimer) {
+		ret = ESP_ERR_NO_MEM;
+		goto err;
 	}
 
 	/* set OTA partition for next boot */
 	ret = esp_ota_set_boot_partition(update_partition);
 	if (ret != ESP_OK) {
 		ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(ret));
+		xTimerDelete(xTimer, 0);
+		goto err;
+	}
+	ota_status = OTA_BOOT_SELECTED;
+	if (xTimerStart(xTimer, 0) != pdPASS) {
+		ESP_LOGE(TAG, "Failed to start timer to restart system");
+		xTimerDelete(xTimer, 0);
+		esp_err_t restore = esp_ota_set_boot_partition(previous_boot);
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+		/* set_boot_partition writes NEW even when restoring the running slot.
+		 * Restore its VALID state too, otherwise a later reset can mark the
+		 * known-good baseline ABORTED. Keep the session blocked on failure. */
+		if (restore == ESP_OK) {
+			const esp_partition_t *running = esp_ota_get_running_partition();
+			restore = running && running->address == previous_boot->address ?
+				esp_ota_mark_app_valid_cancel_rollback() : ESP_ERR_INVALID_STATE;
+		}
+#endif
+		if (restore == ESP_OK) {
+			ota_status = OTA_COMPLETED;
+		} else {
+			/* Fail closed: block BEGIN from erasing the newly selected slot. */
+			ESP_LOGE(TAG, "OTA boot selection restore failed: %s", esp_err_to_name(restore));
+		}
+		ret = ESP_FAIL;
 		goto err;
 	}
 	ota_status = OTA_ACTIVATED;
-	/* Create timer to reboot system and activate OTA */
-	xTimer = xTimerCreate("OTAActivateTimer", RESTART_TIMEOUT , pdFALSE, 0, vTimerCallback);
-	if (xTimer == NULL) {
-		ESP_LOGE(TAG, "Failed to create timer to restart system");
-		ret = -1;
-		goto err;
-	}
-	ret = xTimerStart(xTimer, 0);
-	if (ret != pdPASS) {
-		ESP_LOGE(TAG, "Failed to start timer to restart system");
-		ret = -2;
-		goto err;
-	}
-	ESP_LOGE(TAG, "**** OTA activation initiated, ESP32 will reboot in 2 sec ****");
+	ESP_LOGI(TAG, "OTA activation queued; C5 will reboot in 2 sec");
 	resp_payload->resp = SUCCESS;
 	return ESP_OK;
 err:

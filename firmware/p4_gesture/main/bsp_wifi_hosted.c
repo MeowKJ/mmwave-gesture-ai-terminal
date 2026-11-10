@@ -4,6 +4,7 @@
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_hosted.h"
+#include "esp_hosted_sdio_diagnostic.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -31,6 +32,11 @@ typedef struct {
     bool fw_valid;
     bool wifi_started;
     char token[17];
+    unsigned width;
+    unsigned khz;
+    bool diagnostic;
+    unsigned poll_ms;
+    unsigned init_ms;
 } hosted_status_t;
 
 static const char *TAG = "meoave_hosted";
@@ -51,15 +57,16 @@ static void report(const char *token)
     portENTER_CRITICAL(&s_lock);
     s = s_status;
     portEXIT_CRITICAL(&s_lock);
-    char line[320];
+    char line[448];
     snprintf(line, sizeof(line),
              "MEO:WIFI_HOSTED token=%s state=%s error=0x%x chip_id=%lu chip=%s "
              "fw=%s%lu.%lu.%lu rev=%ld pre=%ld build=%ld wifi_started=%u "
-             "gpio6=UNUSED reset_gpio=54\n",
+             "gpio6=UNUSED reset_gpio=54 proto=2 operation=%s diag=%u width=%u khz=%u poll_ms=%u init_ms=%u\n",
              token, state_name(s.state), (unsigned)s.error, (unsigned long)s.chip_id,
              s.chip, s.fw_valid ? "" : "unknown:", (unsigned long)s.fw.major1,
              (unsigned long)s.fw.minor1, (unsigned long)s.fw.patch1, (long)s.fw.revision,
-             (long)s.fw.prerelease, (long)s.fw.build, s.wifi_started);
+             (long)s.fw.prerelease, (long)s.fw.build, s.wifi_started,
+             s.token, s.diagnostic, s.width, s.khz, s.poll_ms, s.init_ms);
     (void)bsp_usb_cdc_write(line);
 }
 
@@ -86,7 +93,17 @@ static void hosted_worker(void *arg)
     char chip[16] = {0};
     esp_hosted_coprocessor_fwver_t fw = {0};
     int fw_ret = esp_hosted_get_coprocessor_fwversion(&fw);
+    if (fw_ret != ESP_OK) {
+        mark_failed(fw_ret);
+        vTaskDelete(NULL);
+        return;
+    }
     int chip_ret = esp_hosted_get_cp_info(&chip_id, chip, sizeof(chip));
+    if (chip_ret != ESP_OK || strcmp(chip, "esp32c5") != 0) {
+        mark_failed(chip_ret != ESP_OK ? chip_ret : ESP_ERR_INVALID_RESPONSE);
+        vTaskDelete(NULL);
+        return;
+    }
 
     err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -145,7 +162,9 @@ void bsp_wifi_hosted_init(void)
     /* The component's port constructor only allocates the transport. It does
      * not connect or toggle GPIO54; connection remains an explicit action. */
     portENTER_CRITICAL(&s_lock);
-    s_status = (hosted_status_t){.state = HOSTED_IDLE, .chip = "unknown", .token = "none"};
+    s_status = (hosted_status_t){.state = HOSTED_IDLE, .chip = "unknown", .token = "none",
+        .width = CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH, .khz = CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ,
+        .init_ms = 4000};
     portEXIT_CRITICAL(&s_lock);
 }
 
@@ -153,6 +172,37 @@ bool bsp_wifi_hosted_command(const char *line)
 {
     if (!line || strncmp(line, "WIFI HOSTED ", 12) != 0) return false;
     char cmd[12], token[17], extra;
+    if (strncmp(line, "WIFI HOSTED CONFIG ", 19) == 0) {
+        unsigned width, khz, poll_ms = 0, init_ms = 4000;
+        int count = sscanf(line, "WIFI HOSTED CONFIG %16s %u %u %u %u %c",
+                           token, &width, &khz, &poll_ms, &init_ms, &extra);
+        if (count != 5) {
+            poll_ms = 0;
+            init_ms = 4000;
+            if (sscanf(line, "WIFI HOSTED CONFIG %16s %u %u %c", token, &width, &khz, &extra) != 3) return true;
+        }
+        for (const char *p = token; *p; ++p) if (!isalnum((unsigned char)*p)) return true;
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        /* USB commands and service run on the same app task. The port also
+         * refuses changes after any card-init, even if app state is stale. */
+        if (s_status.state == HOSTED_IDLE && !s_status.diagnostic) {
+            err = esp_hosted_sdio_diagnostic_configure_ex(width, khz, poll_ms, init_ms);
+            if (err == ESP_OK) {
+                portENTER_CRITICAL(&s_lock);
+                s_status.width = width;
+                s_status.khz = khz;
+                s_status.diagnostic = true;
+                s_status.poll_ms = poll_ms;
+                s_status.init_ms = init_ms;
+                portEXIT_CRITICAL(&s_lock);
+            }
+        }
+        char reply[160];
+        snprintf(reply, sizeof(reply), "MEO:WIFI_HOSTED_CONFIG token=%s accepted=%u error=0x%x width=%u khz=%u poll_ms=%u init_ms=%u\n",
+                 token, err == ESP_OK, (unsigned)err, width, khz, poll_ms, init_ms);
+        (void)bsp_usb_cdc_write(reply);
+        return true;
+    }
     if (sscanf(line, "WIFI HOSTED %11s %16s %c", cmd, token, &extra) != 2) return true;
     for (const char *p = token; *p; ++p) {
         if (!isalnum((unsigned char)*p)) return true;
@@ -162,7 +212,7 @@ bool bsp_wifi_hosted_command(const char *line)
     } else if (strcmp(cmd, "CONNECT") == 0) {
         bool accepted = false;
         portENTER_CRITICAL(&s_lock);
-        if (s_status.state == HOSTED_IDLE || s_status.state == HOSTED_FAILED) {
+        if (s_status.state == HOSTED_IDLE) {
             s_status.state = HOSTED_QUEUED;
             s_status.error = ESP_OK;
             snprintf(s_status.token, sizeof(s_status.token), "%s", token);
