@@ -1,0 +1,10 @@
+# Custom board: original display, touch, GPIO29 power hold and native USB.
+CONFIG_APP_C5_NATIVE_MAINTENANCE=y
+CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
+CONFIG_ESP_HOSTED_SDIO_1_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=400
+# Never use GPIO6 as a boot strap or maintenance output.
+# CONFIG_ESP_HOSTED_ENABLE_GPIO_EXPANDER is not set
+# CONFIG_ESP_WIFI_NVS_ENABLED is not set
+# CONFIG_WIFI_RMT_NVS_ENABLED is not set
+# Do not copy the headless single-core workaround: preserve product CPU/UI config.

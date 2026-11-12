@@ -22,7 +22,36 @@
 #include "freertos/task.h"
 #include "psa/crypto.h"
 #include "mbedtls/platform_util.h"
+#include "c5_host_service.h"
+#ifndef CONFIG_APP_C5_NATIVE_MAINTENANCE
 #include "wifi_diagnostic.h"
+#else
+#include <stdarg.h>
+/* Product transport emits complete bounded records, not printf fragments or
+ * UART output. Only the one maintenance worker may execute this module. */
+static meo_c5_host_output_t native_output;
+static char native_record[480];
+static size_t native_used;
+static int native_printf(const char *format, ...)
+{
+    va_list args;
+    va_start(args,format);
+    int n=vsnprintf(native_record+native_used,sizeof(native_record)-native_used,format,args);
+    va_end(args);
+    if (n<0 || (size_t)n>=sizeof(native_record)-native_used) {
+        native_used=0;
+        if (native_output) (void)native_output("MEO:MAINT_OUTPUT error=record_overflow\n");
+        return -1;
+    }
+    native_used+=(size_t)n;
+    if (native_used && native_record[native_used-1]=='\n') {
+        if (native_output) (void)native_output(native_record);
+        native_used=0;
+    }
+    return n;
+}
+#define printf native_printf
+#endif
 #include "../../../shared/c5_maintenance_protocol.h"
 
 enum { IDLE, READY, WRITING, SEALED, ACTIVATED, FAILED };
@@ -127,15 +156,25 @@ static void command(char *line)
     if (!strncmp(line,"NET_",4)) {
         char op[24]={0};
         (void)sscanf(line,"%23s",op);
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+        /* Product credentials/UI integration is a separate acceptance step. */
+        esp_err_t error=ESP_ERR_NOT_SUPPORTED;
+#else
         esp_err_t error=state==READY ? wifi_diagnostic_command(line) : ESP_ERR_INVALID_STATE;
+#endif
         reply(op,error);
         return;
     }
     if (!strcmp(line,"INFO")) { info(); return; }
     if (!strcmp(line,"STATUS")) { status(); return; }
     if (!strcmp(line,"P4RESET")) {
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+        /* Only SYS RESTART may reset the product: it preserves GPIO29/USB. */
+        reply("P4RESET",ESP_ERR_NOT_SUPPORTED); return;
+#else
         printf("MEO:P4RESET accepted=1 c5_reset=0\n"); fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(250)); esp_restart();
+#endif
     }
     if (!strcmp(line,"CONNECT") || !strcmp(line,"ATTACH")) {
         esp_err_t error=ESP_ERR_INVALID_STATE;
@@ -171,6 +210,10 @@ static void command(char *line)
         reply("CONFIRM",error); return;
     }
     if (sscanf(line,"PIN %128s %u %c",a,&number,&extra)==2) {
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+        /* No GPIO6 handover until product I2S/codec arbitration is integrated. */
+        reply("PIN",ESP_ERR_NOT_SUPPORTED); return;
+#else
         unsigned mode=!strcmp(a,"HIZ") ? MEO_C5_HIZ : !strcmp(a,"UP") ? MEO_C5_PULLUP :
             !strcmp(a,"DOWN") ? MEO_C5_PULLDOWN : !strcmp(a,"LOW") ? MEO_C5_DRIVE_LOW :
             !strcmp(a,"HIGH") ? MEO_C5_DRIVE_HIGH : UINT32_MAX;
@@ -186,6 +229,7 @@ static void command(char *line)
             printf("MEO:P4_PIN gpio=6 mode=INPUT level=%d c5_error=0x%x\n",gpio_get_level(6),(unsigned)error);
         }
         reply("PIN",error); return;
+#endif
     }
     if (sscanf(line,"OTA_BEGIN %128s %u %128s %128s %c",a,&number,b,c,&extra)==4) {
         esp_err_t error=ESP_ERR_INVALID_STATE;
@@ -249,6 +293,37 @@ static void command(char *line)
     reply("UNKNOWN",ESP_ERR_NOT_SUPPORTED);
 }
 
+esp_err_t meo_c5_host_init(void)
+{
+    esp_err_t error=esp_event_loop_create_default();
+    if (error!=ESP_OK && error!=ESP_ERR_INVALID_STATE) return error;
+    responses=xQueueCreate(1,sizeof(meo_c5_response_t));
+    rpc_events=xEventGroupCreate();
+    if (!responses || !rpc_events) return ESP_ERR_NO_MEM;
+    error=esp_event_handler_register(ESP_HOSTED_EVENT,ESP_HOSTED_EVENT_CP_INIT,hosted_event,NULL);
+    if (error==ESP_OK) error=esp_hosted_init();
+    if (error==ESP_OK) error=esp_hosted_register_custom_callback(MEO_C5_MAINT_MSG,receive,NULL);
+    if (error==ESP_OK && psa_crypto_init()!=PSA_SUCCESS) error=ESP_FAIL;
+    seq=esp_random();
+    return error;
+}
+
+void meo_c5_host_execute(char *line, meo_c5_host_output_t output)
+{
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+    native_output=output;
+    native_used=0;
+#else
+    (void)output;
+#endif
+    command(line);
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+    native_output=NULL;
+    native_used=0;
+#endif
+}
+
+#ifndef CONFIG_APP_C5_NATIVE_MAINTENANCE
 void app_main(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0,8192,0,0,NULL,0));
@@ -256,16 +331,7 @@ void app_main(void)
         .stop_bits=UART_STOP_BITS_1,.flow_ctrl=UART_HW_FLOWCTRL_DISABLE,.source_clk=UART_SCLK_DEFAULT};
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_0,&cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0,37,38,UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE));
-    esp_err_t error=esp_event_loop_create_default();
-    if (error!=ESP_OK && error!=ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(error);
-    responses=xQueueCreate(1,sizeof(meo_c5_response_t));
-    rpc_events=xEventGroupCreate();
-    if (!responses || !rpc_events) abort();
-    ESP_ERROR_CHECK(esp_event_handler_register(ESP_HOSTED_EVENT,ESP_HOSTED_EVENT_CP_INIT,hosted_event,NULL));
-    ESP_ERROR_CHECK(esp_hosted_init());
-    ESP_ERROR_CHECK(esp_hosted_register_custom_callback(MEO_C5_MAINT_MSG,receive,NULL));
-    if (psa_crypto_init()!=PSA_SUCCESS) abort();
-    seq=esp_random();
+    ESP_ERROR_CHECK(meo_c5_host_init());
     info();
     static char line[1400]; size_t len=0; bool overflow=false;
     int64_t heartbeat=esp_timer_get_time();
@@ -286,3 +352,4 @@ void app_main(void)
         }
     }
 }
+#endif

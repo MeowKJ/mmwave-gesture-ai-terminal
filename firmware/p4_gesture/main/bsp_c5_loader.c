@@ -99,6 +99,23 @@ static struct {
 } s_trace[MEO_C5_DIAG_SAMPLES];
 static unsigned s_trace_count;
 
+/* Bounded boot-window watcher. One shared-line EN pulse (20 ms) per attempt,
+ * then a short SDIO download probe. It exists because the module's strap pins
+ * are not routed to the P4: the only way to catch a hand-strapped download
+ * boot is to reset repeatedly and probe each window. It stops on the first
+ * hit or when attempts run out, never writes C5 Flash itself and is never
+ * started as recovery for a failed flash. */
+#define C5_WATCH_LOW_MS 20
+#define C5_WATCH_DEFAULT_ATTEMPTS 60
+#define C5_WATCH_MAX_ATTEMPTS 240
+static struct {
+    unsigned state; /* 0=idle, 1=queued, 2=watching, 3=hit, 4=exhausted, 5=failed */
+    char operation[17];
+    const char *stage;
+    esp_loader_error_t error;
+    unsigned attempt, max_attempts, lows;
+} s_watch = {.stage="IDLE"};
+
 static bool valid_token(const char *token)
 {
     if (!*token) return false;
@@ -537,6 +554,151 @@ static void diag_worker(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ESP32-C5 IDF 6.1/esptool register definitions. Read-only whitelist;
+ * no eFuse programming, force-download writes or GPIO2 access. */
+static esp_loader_error_t read_facts_registers(void)
+{
+    uint32_t values[9] = {0};
+    const uint32_t addresses[9] = {0x600b484c, 0x60091000, 0x600b1034, 0x600b0410,
+        0x60091064, 0x60091034, 0x60090068, 0x6009006c, 0x60090070};
+    /* Read only GPIO input/output-enable and IO MUX26..28. No pad
+     * configuration changes; an input-disabled zero is NOT a LOW. */
+    esp_loader_error_t err = ESP_LOADER_SUCCESS;
+    for (unsigned i=0; i<9 && err==ESP_LOADER_SUCCESS; ++i)
+        err = esp_loader_read_register(&s_loader, addresses[i], &values[i]);
+    portENTER_CRITICAL(&s_lock);
+    s_facts.revision=values[0]; s_facts.strap=values[1];
+    s_facts.lp_sys=values[2]; s_facts.reset_cause=values[3];
+    s_facts.gpio_in=values[4]; s_facts.gpio_enable=values[5];
+    s_facts.mux26=values[6]; s_facts.mux27=values[7]; s_facts.mux28=values[8];
+    s_facts.valid=err==ESP_LOADER_SUCCESS;
+    portEXIT_CRITICAL(&s_lock);
+    return err;
+}
+
+static void watch_report(const char *token)
+{
+    static const char *const names[]={"IDLE","QUEUED","WATCHING","HIT","EXHAUSTED","FAILED"};
+    char line[256];
+    portENTER_CRITICAL(&s_lock);
+    snprintf(line,sizeof(line),"MEO:C5_WATCH token=%s operation=%s state=%s stage=%s error=%u "
+        "attempt=%u max=%u lows=%u\n", token,*s_watch.operation?s_watch.operation:"none",
+        names[s_watch.state],s_watch.stage,(unsigned)s_watch.error,
+        s_watch.attempt,s_watch.max_attempts,s_watch.lows);
+    portEXIT_CRITICAL(&s_lock);
+    (void)bsp_usb_cdc_write(line);
+}
+
+/* The pad level right after the driver change is not a reliable sample, so the
+ * window is scored by how many 1 ms samples read low instead of the first one.
+ * A zero-low pulse is reported, not silently treated as a valid reset. */
+static esp_err_t reset_c5_watch_pulse(unsigned *lows)
+{
+    gpio_config_t cfg={.pin_bit_mask=1ULL << PIN_C5_RESET,
+        .mode=GPIO_MODE_INPUT_OUTPUT, .pull_up_en=GPIO_PULLUP_DISABLE,
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, .intr_type=GPIO_INTR_DISABLE};
+    esp_err_t err=gpio_set_level(PIN_C5_RESET,1);
+    if (err == ESP_OK) err=gpio_config(&cfg);
+    unsigned low=0;
+    if (err == ESP_OK) {
+        esp_rom_delay_us(1000);
+        err=gpio_set_level(PIN_C5_RESET,0);
+    }
+    if (err == ESP_OK) {
+        for (unsigned i=0; i<C5_WATCH_LOW_MS; ++i) {
+            esp_rom_delay_us(1000);
+            if (!gpio_get_level(PIN_C5_RESET)) ++low;
+        }
+    }
+    esp_err_t released=gpio_set_level(PIN_C5_RESET,1);
+    if (err == ESP_OK) err=released;
+    esp_rom_delay_us(2000);
+    if (err == ESP_OK && gpio_get_level(PIN_C5_RESET) != 1) err=ESP_FAIL;
+    *lows=low;
+    return err;
+}
+
+static void watch_worker(void *arg)
+{
+    (void)arg;
+    char token[17];
+    portENTER_CRITICAL(&s_lock);
+    memcpy(token,s_watch.operation,sizeof(token));
+    portEXIT_CRITICAL(&s_lock);
+    esp_loader_error_t last = ESP_LOADER_ERROR_TIMEOUT;
+    for (unsigned attempt=1; attempt<=s_watch.max_attempts; ++attempt) {
+        int64_t started=esp_timer_get_time();
+        portENTER_CRITICAL(&s_lock);
+        s_watch.attempt=attempt;
+        s_watch.stage="RESET_PULSE";
+        portEXIT_CRITICAL(&s_lock);
+        unsigned lows=0;
+        esp_err_t pulse=reset_c5_watch_pulse(&lows);
+        portENTER_CRITICAL(&s_lock);
+        s_watch.lows=lows;
+        s_watch.stage="PROBE";
+        portEXIT_CRITICAL(&s_lock);
+        watch_report(token);
+        esp_loader_error_t err=pulse == ESP_OK ? ESP_LOADER_SUCCESS : map_error(pulse);
+        if (err == ESP_LOADER_SUCCESS) {
+            /* ROM needs a few ms after EN release before the SDIO slave appears. */
+            vTaskDelay(pdMS_TO_TICKS(30));
+            s_port.base.ops=&s_ops;
+            err=esp_loader_init_sdio(&s_loader,&s_port.base);
+            if (err == ESP_LOADER_SUCCESS) {
+                esp_loader_connect_args_t args={.sync_timeout=500,.trials=1};
+                err=esp_loader_connect(&s_loader,&args);
+            }
+        }
+        if (err == ESP_LOADER_SUCCESS) {
+            unsigned chip=esp_loader_get_target(&s_loader);
+            if (chip != ESP32C5_CHIP) {
+                /* A wrong SDIO identity must not be flashed over. */
+                portENTER_CRITICAL(&s_lock);
+                s_watch.state=5; s_watch.stage="WRONG_TARGET"; s_watch.error=err=ESP_LOADER_ERROR_UNSUPPORTED_CHIP;
+                portEXIT_CRITICAL(&s_lock);
+                port_deinit(&s_port.base);
+                watch_report(token);
+                vTaskDelete(NULL);
+            }
+            uint32_t size=0;
+            esp_loader_error_t size_err=esp_loader_flash_detect_size(&s_loader,&size);
+            esp_loader_error_t facts_err=read_facts_registers();
+            portENTER_CRITICAL(&s_lock);
+            s_status.chip=chip;
+            s_status.flash_size=size;
+            s_status.error=ESP_LOADER_SUCCESS;
+            s_status.verified=false;
+            s_status.written=0; s_status.total=0;
+            s_status.state=CONNECTED;
+            s_status.stage="WATCH_HIT";
+            memcpy(s_status.operation,token,strlen(token)+1);
+            s_watch.state=size_err==ESP_LOADER_SUCCESS && facts_err==ESP_LOADER_SUCCESS ? 3 : 5;
+            s_watch.stage="HIT";
+            s_watch.error=size_err == ESP_LOADER_SUCCESS ? facts_err : size_err;
+            portEXIT_CRITICAL(&s_lock);
+            watch_report(token);
+            vTaskDelete(NULL);
+        }
+        last=err;
+        port_deinit(&s_port.base);
+        portENTER_CRITICAL(&s_lock);
+        s_watch.error=err;
+        portEXIT_CRITICAL(&s_lock);
+        watch_report(token);
+        int64_t elapsed=(esp_timer_get_time()-started)/1000;
+        int64_t period=1000;
+        if (elapsed < period) vTaskDelay(pdMS_TO_TICKS(period-elapsed));
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_watch.state=4;
+    s_watch.stage="EXHAUSTED";
+    s_watch.error=last;
+    portEXIT_CRITICAL(&s_lock);
+    watch_report(token);
+    vTaskDelete(NULL);
+}
+
 static void worker(void *arg)
 {
     bool flash = (uintptr_t)arg != 0;
@@ -578,23 +740,8 @@ static void worker(void *arg)
             if (err == ESP_LOADER_SUCCESS && size < 0x400000) err = ESP_LOADER_ERROR_IMAGE_SIZE;
         }
         if (err == ESP_LOADER_SUCCESS) {
-            /* ESP32-C5 IDF 6.1/esptool register definitions. Read-only whitelist;
-             * no eFuse programming, force-download writes or GPIO2 access. */
             stage("READ_FACTS");
-            uint32_t values[9] = {0};
-            const uint32_t addresses[9] = {0x600b484c, 0x60091000, 0x600b1034, 0x600b0410,
-                0x60091064, 0x60091034, 0x60090068, 0x6009006c, 0x60090070};
-            /* Read only GPIO input/output-enable and IO MUX26..28. No pad
-             * configuration changes; an input-disabled zero is NOT a LOW. */
-            for (unsigned i=0; i<9 && err==ESP_LOADER_SUCCESS; ++i)
-                err = esp_loader_read_register(&s_loader, addresses[i], &values[i]);
-            portENTER_CRITICAL(&s_lock);
-            s_facts.revision=values[0]; s_facts.strap=values[1];
-            s_facts.lp_sys=values[2]; s_facts.reset_cause=values[3];
-            s_facts.gpio_in=values[4]; s_facts.gpio_enable=values[5];
-            s_facts.mux26=values[6]; s_facts.mux27=values[7]; s_facts.mux28=values[8];
-            s_facts.valid=err==ESP_LOADER_SUCCESS;
-            portEXIT_CRITICAL(&s_lock);
+            err = read_facts_registers();
         }
     } else {
         /* Flash only the generated image regions. Keep NVS, PHY and
@@ -677,8 +824,37 @@ bool bsp_c5_loader_command(const char *line)
         (void)bsp_usb_cdc_write(reply);
         return true;
     }
+    if (!strncmp(line,"C5 WATCH",8) && line[8] == ' ') {
+        unsigned attempts=0;
+        int fields=sscanf(line,"C5 WATCH %16s %u %c",token,&attempts,&extra);
+        if ((fields != 1 && fields != 2) || !valid_token(token)) return true;
+        if (!attempts) attempts=C5_WATCH_DEFAULT_ATTEMPTS;
+        if (attempts>C5_WATCH_MAX_ATTEMPTS) attempts=C5_WATCH_MAX_ATTEMPTS;
+        bool accepted=false;
+        /* A finished (exhausted/failed) watch may be re-armed while the loader
+         * is idle; a hit keeps the session for FLASH and cannot be re-armed. */
+        bool reusable = !s_watch.state || s_watch.state==4 || s_watch.state==5;
+        portENTER_CRITICAL(&s_lock);
+        if (reusable && s_status.state==IDLE && !s_diag.state &&
+            s_read.state != 1 && s_read.state != 2) {
+            s_watch.state=1;
+            s_watch.attempt=0;
+            s_watch.lows=0;
+            s_watch.max_attempts=attempts;
+            s_watch.stage="QUEUED";
+            s_watch.error=ESP_LOADER_SUCCESS;
+            memcpy(s_watch.operation,token,strlen(token)+1);
+            accepted=true;
+        }
+        portEXIT_CRITICAL(&s_lock);
+        char reply[96];
+        snprintf(reply,sizeof(reply),"MEO:C5_WATCH_ACCEPT token=%s accepted=%u\n",token,accepted);
+        (void)bsp_usb_cdc_write(reply);
+        return true;
+    }
     if (sscanf(line,"C5 %11s %16s %c",cmd,token,&extra)==2 && valid_token(token)) {
         if (!strcmp(cmd,"RESETTRACE")) { reset_trace_report(token); return true; }
+        if (!strcmp(cmd,"WATCHSTATUS")) { watch_report(token); return true; }
         if (!strcmp(cmd,"DIAGSTATUS")) { diag_report(token); return true; }
         if (!strcmp(cmd,"DIAGRUN") || !strcmp(cmd,"DIAGOBSERVE")) {
             bool accepted=false;
@@ -792,8 +968,11 @@ void bsp_c5_loader_service(void)
     if (s_status.state == CONNECT_QUEUED) { s_status.state=CONNECTING; action=1; }
     if (s_status.state == FLASH_QUEUED) { s_status.state=WRITING; action=2; }
     if (s_diag.state == 1) { s_diag.state=2; action=4; }
+    if (s_watch.state == 1) { s_watch.state=2; action=5; }
     portEXIT_CRITICAL(&s_lock);
-    if (action && xTaskCreate(action==4 ? diag_worker : action==3 ? read_worker : worker, "c5_loader", 8192,
+    void (*task)(void *) = action==4 ? diag_worker : action==3 ? read_worker :
+                           action==5 ? watch_worker : worker;
+    if (action && xTaskCreate(task, "c5_loader", 8192,
                              (void *)(uintptr_t)(action==2), 2, NULL) != pdPASS) {
         portENTER_CRITICAL(&s_lock);
         s_status.state=FAILED;
@@ -801,6 +980,7 @@ void bsp_c5_loader_service(void)
         s_status.error=ESP_LOADER_ERROR_FAIL;
         if (action==3) { s_read.state=4; s_read.error=ESP_LOADER_ERROR_FAIL; }
         if (action==4) { s_diag.state=4; s_diag.stage="TASK_ERROR"; s_diag.error=ESP_ERR_NO_MEM; }
+        if (action==5) { s_watch.state=5; s_watch.stage="TASK_ERROR"; s_watch.error=ESP_LOADER_ERROR_FAIL; }
         portEXIT_CRITICAL(&s_lock);
     }
 }

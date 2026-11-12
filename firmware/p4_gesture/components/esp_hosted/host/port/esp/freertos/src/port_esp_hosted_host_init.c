@@ -16,7 +16,7 @@ DEFINE_LOG_TAG(host_init);
 //ESP_SYSTEM_INIT_FN(esp_hosted_host_init, BIT(0), 120)
 static void __attribute__((constructor)) esp_hosted_host_init(void)
 {
-#if CONFIG_MEOAVE_C5_MAINT_HOST
+#if CONFIG_MEOAVE_C5_MAINT_HOST || CONFIG_APP_C5_NATIVE_MAINTENANCE
 	/* The headless maintenance application initializes Hosted explicitly after
 	 * the scheduler/event loop are running. Keep pre-scheduler startup free of
 	 * SDMMC, transport and RPC task creation. Product profiles are unchanged. */
