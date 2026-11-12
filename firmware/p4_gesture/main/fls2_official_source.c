@@ -17,6 +17,7 @@
 #include "esp_lvgl_port.h"
 #include "lv_demos.h"
 #include "fls2_display_startup.h"
+#include "bsp_usb.h"
 #if CONFIG_APP_MEOAVE_UI
 #include "meoave_app.h"
 #endif
@@ -244,26 +245,45 @@ static esp_err_t app_lvgl_init(void)
     return ESP_OK;
 }
 
+/* Boot-stage breadcrumbs: the CDC line can be missed if the host is not
+ * attached yet, so the last stage also lives in g_boot_stage and is reported
+ * by FLS2:STATUS. 1=lcd 2=touch 3=lvgl 4=lock 5=ui 6=ui-done 7=unlock-done. */
+volatile int g_boot_stage;
+
+#define BOOT_STAGE(n, s) do { \
+    g_boot_stage = (n); \
+    (void)bsp_usb_cdc_write("MEO:BOOT stage=" s "\n"); \
+} while (0)
+
 void fls2_official_demo(void)
 {
     /* LCD HW initialization */
+    BOOT_STAGE(1, "lcd");
     ESP_ERROR_CHECK(app_lcd_init());
 
     /* Touch initialization */
+    BOOT_STAGE(2, "touch");
     ESP_ERROR_CHECK(app_touch_init());
 
     /* LVGL initialization */
+    BOOT_STAGE(3, "lvgl");
     ESP_ERROR_CHECK(app_lvgl_init());
 
-    /* Show LVGL objects */
-    lvgl_port_lock(0);
+    /* Show LVGL objects. A zero timeout can return false and still let the UI
+       run without the lock, which corrupts LVGL state; wait, then bail out
+       loudly instead of walking on. */
+    BOOT_STAGE(4, "lock");
+    if (!lvgl_port_lock(2000)) { BOOT_STAGE(40, "lock-timeout"); return; }
 
 #if CONFIG_APP_MEOAVE_UI
     /* Product startup must not depend on an optional LVGL demo being enabled. */
+    BOOT_STAGE(5, "ui");
     meoave_app_create();
+    BOOT_STAGE(6, "ui-done");
 #elif LV_USE_DEMO_WIDGETS
     lv_demo_widgets();
 #endif
 
     lvgl_port_unlock();
+    BOOT_STAGE(7, "unlock-done");
 }

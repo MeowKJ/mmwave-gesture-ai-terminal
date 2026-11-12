@@ -8,6 +8,7 @@
 
 #include "board_pins.h"
 #include "bsp_common.h"
+#include "bsp_audio.h"
 #include "bsp_power.h"
 #include "bsp_usb.h"
 #include "fls2_touch_diag.h"
@@ -26,7 +27,11 @@
 #include "bsp_c5_loader.h"
 #endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+#include "bsp_c5_maintenance.h"
+#else
 #include "bsp_wifi_hosted.h"
+#endif
 #endif
 #define APP_PROFILE "meoave_light"
 #else
@@ -41,6 +46,8 @@
 
 void fls2_official_demo(void);
 static volatile bool s_demo_ready;
+/* Set by fls2_official_demo(); reported in FLS2:STATUS to locate a stall. */
+extern volatile int g_boot_stage;
 static volatile bool s_touch_report_requested;
 static volatile bool s_display_report_requested;
 static volatile bool s_quiet;
@@ -147,8 +154,8 @@ static void report_status(void)
     char line[192];
     snprintf(line, sizeof(line),
              "FLS2:STATUS profile=" APP_PROFILE " ready=%d usb=%d "
-             "rgb888=1 lanes=1 mbps=500 dpi_mhz=16 vsync=NOT_MEASURED\n",
-             s_demo_ready, bsp_usb_ready());
+             "rgb888=1 lanes=1 mbps=500 dpi_mhz=16 vsync=NOT_MEASURED stage=%d\n",
+             s_demo_ready, bsp_usb_ready(), (int)g_boot_stage);
     (void)bsp_usb_cdc_write(line);
     (void)bsp_usb_cdc_write(
         "FLS2:DIFFERENCE dcs_id_read=SKIPPED_BY_EXISTING_LOCAL_PATCH "
@@ -169,7 +176,11 @@ static void on_command(const char *line, void *ctx)
     }
 #endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+    if (bsp_c5_maintenance_command(line)) return;
+#else
     if (bsp_wifi_hosted_command(line)) return;
+#endif
     /* Hosted reserves SDMMC and routes its GPIOs in its constructor, even
        while IDLE. Legacy PINS resets that mux; PROBE allocates a rival host. */
     if (strncmp(line, "WIFI ", 5) == 0) {
@@ -177,9 +188,16 @@ static void on_command(const char *line, void *ctx)
         return;
     }
 #endif
+    if (bsp_audio_command(line)) return;
     if (bsp_c5_diag_command(line)) return;
     if (bsp_wifi_probe_command(line)) return;
     if (strcmp(line, "UI") == 0) { meoave_app_request_status(); return; }
+    if (strncmp(line, "UI GO ", 6) == 0) { meoave_app_request_page(line + 6); return; }
+    if (strncmp(line, "UI FPS", 6) == 0) { meoave_app_request_fps(atoi(line + 6)); return; }
+    if (strncmp(line, "UI SHUTDOWN", 11) == 0) {
+        meoave_app_request_shutdown(atoi(line + 11));
+        return;
+    }
     if (strcmp(line, "LOOP ON") == 0 || strcmp(line, "DISPLAY BARS") == 0 ||
         strcmp(line, "DISPLAY COLORS") == 0 || strcmp(line, "DISPLAY PROBE") == 0) {
         (void)bsp_usb_cdc_write("MEO:REJECTED reason=PRODUCT_UI_ACTIVE\n");
@@ -250,9 +268,21 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_usb_init());
     bsp_usb_set_line_callback(on_command, NULL);
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+    bsp_c5_maintenance_init();
+#else
     bsp_wifi_hosted_init();
 #endif
+#endif
     fls2_touch_diag_init();
+
+    /* Product audio: ES8389 power, register tables and the full-duplex I2S
+       channel. Failure is not fatal - the mic app simply reports no device. */
+    /* Codec power (GPIO26 = AUDIO_PWR_EN) and register init only. Capture is
+       started by the settings switch, not at boot. */
+    if (bsp_audio_init() != ESP_OK) {
+        ESP_LOGW("FLS2", "audio codec not available");
+    }
 
     /* VCI_EN has a pull-up, as on the official adapter. Do not power-cycle it.
        Display startup holds GPIO12 low while normalizing DSI, then the
@@ -265,7 +295,10 @@ void app_main(void)
 
     ESP_LOGI("FLS2", "build=%s %s; profile=%s loop_at_boot=%d; audio/radar/scans disabled",
              __DATE__, __TIME__, APP_PROFILE, FLS2_AUTO_BOOT);
-    BaseType_t ok = xTaskCreate(official_demo_task, "fls2_official", 10240, NULL, 1, NULL);
+    /* 16 KiB: the product UI now builds five settings rows plus the speaker
+       page, and LVGL object creation is recursion-heavy. A silently exhausted
+       stack would leave fls2_official_demo() half way and s_demo_ready false. */
+    BaseType_t ok = xTaskCreate(official_demo_task, "fls2_official", 16384, NULL, 1, NULL);
     ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     /* No LVGL locks here: USB/heartbeat must not block on a stalled GUI task. */
     int64_t next_report_us = 0;
@@ -282,9 +315,12 @@ void app_main(void)
         bsp_wifi_probe_service();
 #endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
+#ifndef CONFIG_APP_C5_NATIVE_MAINTENANCE
         bsp_wifi_hosted_service();
 #endif
+#endif
         if (s_demo_ready) meoave_app_service();
+        if (s_demo_ready) meoave_app_key_tick();   /* 20 ms power-key sampling */
 #endif
         if (s_display_report_requested) {
             s_display_report_requested = false;

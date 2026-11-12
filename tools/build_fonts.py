@@ -39,6 +39,13 @@ MANIFEST = FONT_DIR / "manifest.json"
 # 已验证过的整套字体：圆润清晰（默认）、手写文楷、随性手写。
 # 三者都覆盖当前界面用到的全部汉字，切换后跑一遍桌面回归即可。
 SETS = {
+    "rhrbold": {
+        "family": "资源圆体 Resource Han Rounded SC Bold",
+        "file": "ResourceHanRoundedSC-Bold.ttf",
+        "sha256": "085a738ec5b4020607867b1dc9a65fd32b0465a74ac2a849ed4c579169e8bd28",
+        "source": "https://github.com/CyanoHao/Resource-Han-Rounded (v0.990 RHR-TTF)",
+        "note": "与默认同族的粗字重：同样圆润，但 28px 下横线更实，密字不再发虚",
+    },
     "chill": {
         "family": "寒蝉圆黑体 ChillRoundGothic Medium",
         "file": "ChillRoundGothic_Medium.ttf",

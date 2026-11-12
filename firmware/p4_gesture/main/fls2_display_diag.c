@@ -40,7 +40,10 @@ bool fls2_display_diag_needs_restart(void) { return s_probe_needs_restart; }
 
 esp_err_t fls2_display_set_brightness(uint8_t percent)
 {
-    if (percent < 15 || percent > 100) return ESP_ERR_INVALID_ARG;
+    /* 0 is legal: the boot warm-up blanks the backlight while it rasterises
+       every page, and the shutdown path turns the panel off. The UI slider
+       itself is clamped to 15..100 by meo_validate_settings(). */
+    if (percent > 100) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&s_lock);
     esp_lcd_panel_handle_t panel = s_panel;
     portEXIT_CRITICAL(&s_lock);

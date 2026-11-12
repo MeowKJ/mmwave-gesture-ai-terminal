@@ -66,7 +66,12 @@ static const char *TAG = "BSP_USB";
 /* 主机侧 flash_usb.py 发送的下载请求；可打印、不容易被普通日志误触发。
    CDC 按行解析，DL_CMD 之外的行交给应用回调（demo 测试指令）。 */
 #define DL_CMD              "MEOAVE-DOWNLOAD"
+#ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
+#define CDC_LINE_MAX        1400
+#else
 #define CDC_LINE_MAX        160
+#endif
+static bool s_line_overflow;
 
 #define REPORT_ID_MOUSE     HID_ITF_PROTOCOL_MOUSE
 #define REPORT_ID_KEYBOARD  HID_ITF_PROTOCOL_KEYBOARD
@@ -274,6 +279,14 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
         for (size_t i = 0; i < n && !s_rebooting; i++) {
             uint8_t c = buf[i];
             if (c == '\n' || c == '\r') {
+                /* Discard the WHOLE oversized line, never execute its tail as
+                 * a new DOWNLOAD/SYS/OTA command. No partial command dispatch. */
+                if (s_line_overflow) {
+                    s_line_overflow=false;
+                    s_line_len=0;
+                    memset(s_line,0,sizeof(s_line));
+                    continue;
+                }
                 if (s_line_len) {
                     s_line[s_line_len] = '\0';
                     size_t len = s_line_len;
@@ -283,12 +296,14 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
                         s_line[--len] = '\0';
                     }
                     if (len) dispatch_line(s_line);
+                    memset(s_line,0,sizeof(s_line));
                 }
-            } else if (c >= 0x20 && c < 0x7F) {
+            } else if (!s_line_overflow && c >= 0x20 && c < 0x7F) {
                 if (s_line_len < CDC_LINE_MAX - 1) {
                     s_line[s_line_len++] = (char)c;
                 } else {
-                    s_line_len = 0;       /* 超长行丢弃，避免粘死 */
+                    s_line_overflow=true;
+                    s_line_len=0;
                 }
             }
         }

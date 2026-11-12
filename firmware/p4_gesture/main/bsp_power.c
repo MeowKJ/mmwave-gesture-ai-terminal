@@ -28,6 +28,7 @@ RTC_NOINIT_ATTR static uint32_t s_dl_marker;
 static bool s_download_survived;
 static bool s_pad_hold_active;
 static bool s_key_at_boot;      /* 开机锁存瞬间电源键是否仍被按住 */
+static volatile bool s_poweroff; /* 用户已请求关机：复位钩子不得再锁存 */
 
 /* Preserve a minimal panic frame for native-USB diagnostics after reboot.
    No USB, allocation, logging, or reset-hint modification in panic context. */
@@ -111,7 +112,9 @@ esp_err_t bsp_power_prepare_reset(void)
 static void power_shutdown_handler(void)
 {
     /* Cover every normal esp_restart(), not only explicit download requests.
-       Keep an already-high pad latched; never release it during startup. */
+       Keep an already-high pad latched; never release it during startup.
+       An explicit user power-off must stay off: do not re-latch. */
+    if (s_poweroff) return;
     (void)bsp_power_prepare_reset();
 }
 
@@ -224,3 +227,46 @@ bool bsp_power_usb_attached(void) { return bsp_gpio_read(PIN_VBUS_ON) != 0; }
 bool bsp_power_key_pressed(void)  { return bsp_gpio_read(PIN_PWR_DET) == 0; }
 bool bsp_power_key_at_boot(void)  { return s_key_at_boot; }
 bool bsp_power_buck_ok(void)      { return bsp_gpio_read(PIN_BUCK_PG) != 0; }
+bool bsp_power_charging(void)     { return bsp_power_usb_attached(); }
+
+int bsp_power_battery_percent(void)
+{
+    /* 单体锂电开路电压近似值，不是库仑计：只在无大电流负载时可信。
+       Q4 打开分压后有几十微秒的建立过程，取 5 次平均，避免单次抖动。 */
+    int sum = 0, count = 0;
+    for (unsigned i = 0; i < 5; ++i) {
+        int mv = bsp_power_battery_mv();
+        if (mv > 0) { sum += mv; ++count; }
+        if (i < 4) vTaskDelay(pdMS_TO_TICKS(4));
+    }
+    if (!count) return -1;
+    int mv = sum / count;
+    static const struct { int mv, pct; } curve[] = {
+        {4200,100}, {4080,88}, {3980,74}, {3900,62}, {3820,48},
+        {3760,34}, {3700,20}, {3600,8}, {3450,3}, {3300,0},
+    };
+    if (mv >= curve[0].mv) return 100;
+    for (unsigned i = 1; i < sizeof(curve)/sizeof(curve[0]); ++i) {
+        if (mv >= curve[i].mv) {
+            int hi_v = curve[i-1].mv, lo_v = curve[i].mv;
+            int hi_c = curve[i-1].pct, lo_c = curve[i].pct;
+            return lo_c + (mv - lo_v) * (hi_c - lo_c) / (hi_v - lo_v);
+        }
+    }
+    return 0;
+}
+
+esp_err_t bsp_power_off(void)
+{
+    /* 唯一的关机入口：长按电源键倒计时结束。没有自动恢复、没有重试：
+       先把 pad hold 放开，再把 PWR_HOLD 拉低，Q2 关断后 Q1 栅极被 R10 拉高，
+       VSYS 与 SYS_PWR_EN 断开，3V3 掉电。 */
+    s_poweroff = true;
+    esp_err_t hold = gpio_hold_dis(PIN_PWR_HOLD);
+    esp_err_t level = gpio_set_level(PIN_PWR_HOLD, 0);
+    ESP_LOGW(TAG, "POWER OFF: PWR_HOLD=0 (hold_dis=%s, level=%s)",
+             esp_err_to_name(hold), esp_err_to_name(level));
+    return level;
+}
+
+bool bsp_power_off_requested(void) { return s_poweroff; }

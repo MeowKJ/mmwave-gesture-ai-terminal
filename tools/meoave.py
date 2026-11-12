@@ -192,7 +192,10 @@ def build(config: dict, profile: str, reconfigure: bool = False, c5_payload: Pat
         raise ValueError("build.jobs must be between 1 and 64")
     cmake = tool_path(config, "cmake", "cmake")
     ninja = tool_path(config, "ninja", "ninja")
-    if profile == "hosted":
+    if profile == "maintenance":
+        build_name = cfg(config, "build", "maintenance_dir", "build_meoave_maintenance")
+        defaults = "sdkconfig.defaults;sdkconfig.product.defaults;sdkconfig.hosted.defaults;sdkconfig.maintenance.defaults"
+    elif profile == "hosted":
         build_name = cfg(config, "build", "hosted_dir", "build_meoave_hosted")
         defaults = cfg(config, "build", "hosted_defaults", "sdkconfig.defaults;sdkconfig.hosted.defaults")
     elif profile == "programmer":
@@ -498,7 +501,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     build_parser = sub.add_parser("build")
-    build_parser.add_argument("--profile", choices=("product", "hosted", "programmer"), default="product")
+    build_parser.add_argument("--profile", choices=("product", "hosted", "programmer", "maintenance"), default="product")
     build_parser.add_argument("--reconfigure", action="store_true",
                               help="force CMake reconfigure even if build configuration is unchanged")
     sub.add_parser("test")

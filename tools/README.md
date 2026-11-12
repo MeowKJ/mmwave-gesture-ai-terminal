@@ -26,6 +26,15 @@
   SDIO失联95秒后单次EN回退、弱拉租约及最终正常VALID身份均通过；无需人工切C5串口或下载三脚。
   **这是电脑工具协调的开发板维护验收，不是产品原生USB/音频仲裁集成完成，也不承诺bootloader/两槽都坏可恢复。**
 
+## 自制板：原生 USB C5 维护（新增）
+
+- `python tools/meoave.py build --profile maintenance` 保留产品显示/触摸/电源/USB，复用已测 UART 维护状态机。
+- `python tools/c5_native.py check --port COM10 --report <新文件>` 默认只 ATTACH，不复位、不刷 C5。
+- 显式 `--reset-c5` 才请求一次 EN；产品音频/雷达必须保持停用。无隐藏复位/重试。
+- 已安装维护基线后才可 `c5_native.py update`；不能用它首次安装尚未运行的维护服务。
+- USB 随机事务边界、完整回复及真实 C5 身份联合验收；GPIO6/PIN、NET 暂拒绝，不宣称产品音频/联网已集成。
+- 详见 `docs/C5_NATIVE_MAINTENANCE.md`。不要把下一节开发板无屏 P4 固件用于自制板。
+
 ## 切换串口开发板：独立 P4 无屏测试
 
 ### Wi-Fi 实机验收入口

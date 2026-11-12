@@ -8,6 +8,9 @@
 /.docs/
 /.tmp_official_20261028/
 
+## 第三方芯片数据手册只留本机做选型/调试参考，索引 docs/datasheets/README.md 仍入库。
+/docs/datasheets/**/*.pdf
+
 ## ESP-IDF 生成物（sdkconfig 由 sdkconfig.defaults 重建）
 **/build/
 **/build_*/
@@ -18,6 +21,7 @@
 **/sdkconfig.product
 **/sdkconfig.hosted
 **/sdkconfig.programmer
+**/sdkconfig.maintenance
 **/compile_commands.json
 **/.clangd
 **/.cache/

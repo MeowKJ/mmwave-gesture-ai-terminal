@@ -32,10 +32,20 @@ bool bsp_power_hold_ready(void); /* Output latch, output enable and pad hold. */
 void bsp_power_reset_diagnostic(char *buffer, unsigned size);
 
 int  bsp_power_battery_mv(void);       /* 失败返回 -1 */
+int  bsp_power_battery_percent(void);  /* 单体锂电分段曲线，失败返回 -1 */
+bool bsp_power_charging(void);         /* VBUS 接入（不等于正在充电） */
 bool bsp_power_usb_attached(void);      /* VBUS 分压检测 */
 bool bsp_power_key_pressed(void);       /* 电源键当前是否按下（低有效） */
 bool bsp_power_key_at_boot(void);       /* 开机锁存瞬间 SW1 是否仍被按住 */
 bool bsp_power_buck_ok(void);
+
+/* ---------- 用户主动关机 ----------
+   只在长按电源键倒计时结束时调用，没有任何自动路径。先 gpio_hold_dis 再
+   把 PWR_HOLD 拉低：Q2 关断 -> Q1 栅极释放 -> 3V3 掉电。
+   若此时插着 USB（VBUS 供电），3V3 可能不掉电，调用方必须按「仍在运行」
+   处理：熄灭屏幕并保持 PWR_HOLD 为低，等用户拔线。 */
+esp_err_t bsp_power_off(void);
+bool bsp_power_off_requested(void);     /* 已请求关机：复位钩子不得再锁存 */
 
 /* ---------- 无感下载专用的电源保持 ----------
    HOLD 电路：PWR_HOLD(GPIO29) -> Q2 -> Q1 -> 3V3；R13 470K 把 Q2 栅极
