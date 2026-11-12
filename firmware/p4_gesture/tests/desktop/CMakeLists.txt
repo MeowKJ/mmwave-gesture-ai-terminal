@@ -13,3 +13,12 @@ target_link_libraries(meoave_visual_test PRIVATE lvgl::lvgl m)
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     target_compile_options(meoave_visual_test PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# Fast page-by-page smoke test: builds a few frames for home -> settings ->
+# speaker. Catches render-time aborts (bad arc angles, NULL labels) without
+# flashing the board. Build with --target meoave_steady.
+add_executable(meoave_steady EXCLUDE_FROM_ALL
+               visual_test.c ../../main/meoave_ui.c ../../main/meoave_model.c ${FONTS})
+target_include_directories(meoave_steady PRIVATE ../../main)
+target_compile_definitions(meoave_steady PRIVATE STEADY_ONLY)
+target_link_libraries(meoave_steady PRIVATE lvgl::lvgl m)

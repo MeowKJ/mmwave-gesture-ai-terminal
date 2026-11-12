@@ -196,7 +196,20 @@ void bsp_display_self_test(void)
 
 esp_err_t bsp_display_lvgl_start(void)
 {
-    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    /* Screen transitions recurse through the whole widget tree. With the
+       five-row settings page and the speaker page the default stack overflowed
+       and the chip panicked on navigation (Load access fault inside printf,
+       garbage format pointer): a smashed stack, not a UI bug. 16 KiB is
+       cheap next to a reboot. */
+    lvgl_cfg.task_stack = 16384;
+    /* Rendering must win over the 1 Hz Wi-Fi/power pollers and USB traffic.
+       At the port's default priority 4 (and even 6) isolated 40-90 ms frame
+       gaps showed up while rasterisation itself stayed under 25 ms. */
+    lvgl_cfg.task_priority = 10;
+    /* 2 ms LVGL tick: animation timing is fine-grained enough that a 12 ms
+       refresh pass never quantises into a visible 30+ ms gap. */
+    lvgl_cfg.timer_period_ms = 2;
     ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "lvgl port init failed");
 
     const lvgl_port_display_cfg_t disp_cfg = {
@@ -221,6 +234,13 @@ esp_err_t bsp_display_lvgl_start(void)
     const lvgl_port_display_dsi_cfg_t dpi_cfg = {.flags = {.avoid_tearing = false}};
     s_disp = lvgl_port_add_disp_dsi(&disp_cfg, &dpi_cfg);
     ESP_RETURN_ON_FALSE(s_disp != NULL, ESP_FAIL, TAG, "add DSI display failed");
+    /* A delivered frame costs "rasterise (~20 ms) + wait for the refresh
+       timer". With the Kconfig 12/15 ms period that lands on 32-35 ms - right
+       at the 30 fps budget, so a little scheduler jitter produces a 35 ms
+       frame. A 5 ms dirty-area check costs almost nothing on a static page
+       (LVGL renders nothing) and leaves ~8 ms of jitter headroom. */
+    lv_timer_t *refr = lv_display_get_refr_timer(s_disp);
+    if (refr) lv_timer_set_period(refr, 5);
 
     lvgl_port_lock(0);
     lv_obj_t *scr = lv_screen_active();

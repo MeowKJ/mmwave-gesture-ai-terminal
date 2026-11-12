@@ -1,9 +1,9 @@
 {
-  "family": "资源圆体 Resource Han Rounded SC Medium",
+  "family": "寒蝉圆黑体 ChillRoundGothic Medium",
   "license": "SIL Open Font License 1.1",
-  "source": "https://github.com/CyanoHao/Resource-Han-Rounded (v0.990 RHR-TTF)",
-  "file": "ResourceHanRoundedSC-Medium.ttf",
-  "source_sha256": "64376d56c4aeb39f345417860b9fee3cac52accf2d64dd7cab63c4528fcdc2f7",
+  "source": "https://github.com/Warren2060/ChillRoundGothic (ttf/ChillRoundGothic_Medium.ttf)",
+  "file": "ChillRoundGothic_Medium.ttf",
+  "source_sha256": "7aaf168681f168b9f550734d9e25058ffe73213db07d7a50152d5446dd9e7094",
   "bundle": {
     "tag": "fonts-v1",
     "asset": "meoave-fonts-v1.zip",
@@ -14,7 +14,7 @@
   },
   "converter": "lv_font_conv 1.5.3",
   "bpp": 4,
-  "symbols": "·—、一下不与两习了亮仍休估体你使保信值假停先入关再准减分切列到刻前功动助可右号后吗启吸呼和回图在备失奏好始存完实导小少尚己已常应度开引弱当待律态息成打扫拖换据接描提改效数无时显暂更有服未本机来果标模次正此每气测滑瓣生用画的眼睛示等线练组络继续网置能自舒节花虚行表要视触计让设证调败跟路轻辅达运返这连都里钟链闭陪随雷需非面页驱验，",
+  "symbols": "·—、一下不与两习了亮仍休估体你使保信值假停先入关再准减分切列到刻前功动助可右号后吗启吸呼和回图在备失奏好始存完实导小少尚己已常应度开引弱当待律态息成打扫拖换据接描提改效数无时显暂更有服未本机来果标模次正此每气测滑瓣生用画的眼睛示等线练组络继续网置能自舒节花虚行表要视触计让设证调败跟路轻辅达运返这连都里钟链闭陪随雷需非面页驱验，个中即取密将找按查消源点电码近选键附手松麦克风试扬声器音量播放",
   "sizes": [
     16,
     20,
@@ -22,5 +22,5 @@
     44
   ],
   "symbols_44": "—准备暂停完成吸气呼等待实测设置亮度辅助功能未接入",
-  "note": "思源黑体全圆角，笔画端头圆润，最“圆圆”的一版"
+  "note": "思源黑体圆角化，稳重的圆润感，最保守"
 }

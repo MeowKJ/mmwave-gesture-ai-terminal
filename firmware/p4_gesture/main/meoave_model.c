@@ -13,6 +13,8 @@ meo_page_t meo_page_parent(meo_page_t page)
        The launcher itself has no parent/back destination. */
     case MEO_HOME: case MEO_APPS: case MEO_SETTINGS: case MEO_BREATHE: return MEO_APPS;
     case MEO_WIFI: case MEO_DISPLAY: case MEO_ACCESSIBILITY: return MEO_SETTINGS;
+    case MEO_PASSWORD: return MEO_WIFI;
+    case MEO_MIC: case MEO_SPEAKER: return MEO_SETTINGS;
     default: return MEO_HOME;
     }
 }
@@ -95,12 +97,13 @@ static void reset_session(meo_model_t *m)
 }
 
 meo_settings_t meo_default_settings(void)
-{ return (meo_settings_t){.brightness=80, .guide_bpm=6, .reduced_motion=false}; }
+{ return (meo_settings_t){.brightness=80, .guide_bpm=6, .volume=50, .reduced_motion=false}; }
 
 void meo_validate_settings(meo_settings_t *s)
 {
     if (s->brightness < 15 || s->brightness > 100) s->brightness = 80;
     if (s->guide_bpm < 4 || s->guide_bpm > 12) s->guide_bpm = 6;
+    if (s->volume > 100) s->volume = 50;
 }
 
 void meo_model_init(meo_model_t *m, uint64_t now, const meo_settings_t *settings)

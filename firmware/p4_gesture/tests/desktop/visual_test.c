@@ -9,6 +9,7 @@ LV_FONT_DECLARE(meo_font_44);
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
@@ -18,9 +19,34 @@ LV_FONT_DECLARE(meo_font_44);
 static unsigned char framebuffer[460 * 460 * 3], drawbuffer[460 * 460 * 3];
 static lv_indev_data_t pointer_data;
 static unsigned saves;
+/* A modal overlay dims the page; colour counting is meaningless there. */
+static bool color_check_disabled;
 static bool save_pending;
 static uint32_t save_at;
 static unsigned flushes;
+static unsigned wifi_scan_calls, wifi_join_calls, wifi_connect_calls;
+static char wifi_connect_ssid[33], wifi_connect_pass[65];
+static char wifi_join_ssid[33];
+static bool wifi_join_result = true;
+
+/* The network page must actually dispatch taps: recording the callbacks is the
+ * only way to prove the wiring without a human finger. */
+static bool wifi_scan_cb(void) { wifi_scan_calls++; return true; }
+static bool wifi_connect_cb(const char *ssid, const char *pass)
+{
+    wifi_connect_calls++;
+    snprintf(wifi_connect_ssid, sizeof(wifi_connect_ssid), "%s", ssid ? ssid : "");
+    snprintf(wifi_connect_pass, sizeof(wifi_connect_pass), "%s", pass ? pass : "");
+    return true;
+}
+
+static bool wifi_join_cb(const char *ssid)
+{
+    wifi_join_calls++;
+    snprintf(wifi_join_ssid, sizeof(wifi_join_ssid), "%s", ssid ? ssid : "");
+    return wifi_join_result;
+}
+
 static void saved(const meo_settings_t *settings)
 { assert(settings->brightness >= 15); saves++; save_at=lv_tick_get()+600; save_pending=true; }
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
@@ -178,10 +204,16 @@ static void assert_icons(unsigned expected)
         meo_ui_page_name(meo_ui_model()->page),expected,actual);
     assert(actual==expected);
     if (meo_ui_model()->page==MEO_WIFI) {
-        /* Large Wi-Fi mark must include its bottom dot, not just its arcs.
-           A zero-length rounded line is discarded by the SW renderer. */
-        const unsigned char *dot=framebuffer+(184*460+230)*3;
-        assert(dot[0]==0xFF && dot[1]==0xB5 && dot[2]==0x78); /* BGR: accent blue */
+        /* The Wi-Fi mark must include its bottom dot, not just the arcs: a
+           zero-length rounded line is discarded by the SW renderer. Probe a
+           small window because the dot is antialiased at this size. */
+        bool found=false;
+        for (int y=164; y<=178 && !found; ++y)
+            for (int x=54; x<=74 && !found; ++x) {
+                const unsigned char *p=framebuffer+(y*460+x)*3;
+                if (p[0]==0xFF && p[1]==0xB5 && p[2]==0x78) found=true; /* BGR accent blue */
+            }
+        assert(found);
     }
 }
 
@@ -206,7 +238,8 @@ static void snapshot(const char *directory, const char *name)
         if (meo_ui_model()->page==MEO_HOME)
             assert(framebuffer[i]==framebuffer[i+1] && framebuffer[i+1]==framebuffer[i+2]);
     }
-    if (meo_ui_model()->page==MEO_HOME) assert(colored==0);
+    if (color_check_disabled) { /* modal overlay: dimmed pixels are not judged */ }
+    else if (meo_ui_model()->page==MEO_HOME) assert(colored==0);
     else if (meo_ui_model()->page!=MEO_ACCESSIBILITY || meo_ui_model()->settings.reduced_motion)
         assert(colored>200);
     snapshot_pixels(directory,name);
@@ -280,8 +313,9 @@ static void assert_monochrome_home(bool open)
 {
     assert(meo_ui_model()->page == MEO_HOME);
     lv_refr_now(NULL);
-    /* Home contains exactly two eye objects; pupils are their children. */
-    assert(lv_obj_get_child_count(lv_screen_active()) == 2);
+    /* Home starts with the two eye objects (pupils are their children); the
+       status strip (Wi-Fi, percentage, gauge) follows them. */
+    assert(lv_obj_get_child_count(lv_screen_active()) >= 2);
     unsigned whites[2] = {0, 0};
     for (int i = 0; i < 2; ++i) {
         lv_obj_t *eye = lv_obj_get_child(lv_screen_active(), i);
@@ -292,8 +326,11 @@ static void assert_monochrome_home(bool open)
     for (int y = 0; y < 460; ++y) for (int x = 0; x < 460; ++x) {
         const unsigned char *p = framebuffer + (y * 460 + x) * 3;
         assert(p[0] == p[1] && p[1] == p[2]);
+        /* The face area stays pure black apart from the eyes. The status band
+           at the top is the single place where UI ink may appear. */
         bool eye_region = x >= 65 && x <= 395 && y >= 125 && y <= 325;
-        if (!eye_region) assert(p[0] == 0);
+        bool status_band = y <= 120 && x >= 200;
+        if (!eye_region && !status_band) assert(p[0] == 0);
         if (p[0] == 255 && y < 275) whites[x >= 230]++;
     }
     assert(whites[0] > (open ? 450u : 100u) && whites[1] > (open ? 450u : 100u));
@@ -879,7 +916,40 @@ static void test_expression_visuals(const char *folder)
     meo_ui_auto_expression(); advance(1000);
 }
 
+static int real_main(int argc, char **argv);
+
 int main(int argc, char **argv)
+{
+#ifdef STEADY_ONLY
+    (void)argc; (void)argv;
+    lv_init();
+    lv_display_t *disp = lv_display_create(460, 460);
+    static uint32_t buf[460 * 460];
+    /* Without a flush callback LVGL never sees flush_ready and the first
+       lv_timer_handler() spins forever - this branch was unusable. */
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB888);
+    lv_display_set_buffers(disp, buf, NULL, sizeof(buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, flush);
+    meo_ui_config_t cfg = {.settings = meo_default_settings()};
+    fprintf(stderr, "STEADY cfg ready\n");
+    meo_ui_create(&cfg);
+    fprintf(stderr, "STEADY created\n");
+    for (int i = 0; i < 10; ++i) { lv_tick_inc(33); lv_timer_handler(); usleep(33000); }
+    fprintf(stderr, "STEADY home OK\n");
+    meo_ui_navigate(MEO_SETTINGS);
+    for (int i = 0; i < 10; ++i) { lv_tick_inc(33); lv_timer_handler(); usleep(33000); }
+    fprintf(stderr, "STEADY settings OK\n");
+    meo_ui_navigate(MEO_SPEAKER);
+    for (int i = 0; i < 20; ++i) { lv_tick_inc(33); lv_timer_handler(); usleep(33000); }
+    fprintf(stderr, "STEADY speaker OK\n");
+    fprintf(stderr, "STEADY DONE\n");
+    (void)real_main;
+    return 0;
+#else
+    return real_main(argc, argv);
+#endif
+}
+static int real_main(int argc, char **argv)
 {
     setbuf(stdout,NULL);
     assert(argc == 2);
@@ -892,7 +962,8 @@ int main(int argc, char **argv)
     lv_indev_set_type(pointer, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(pointer, read_pointer);
     lv_indev_set_display(pointer, display);
-    meo_ui_config_t config = {.settings=meo_default_settings(), .settings_changed=saved};
+    meo_ui_config_t config = {.settings=meo_default_settings(), .settings_changed=saved,
+                              .wifi_scan=wifi_scan_cb, .wifi_join=wifi_join_cb, .wifi_connect=wifi_connect_cb};
     meo_ui_create(&config);
     assert(lv_display_get_rotation(display) == LV_DISPLAY_ROTATION_180);
     advance(1000);
@@ -941,18 +1012,18 @@ int main(int argc, char **argv)
     launcher_open(0,MEO_SETTINGS);
     snapshot(argv[1], "03-settings");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     meo_ui_navigate(MEO_DISPLAY);
     meo_ui_navigate(MEO_WIFI); assert(meo_ui_model()->page==MEO_DISPLAY); /* transition guard */
     advance(230); meo_ui_navigate(MEO_SETTINGS); advance(230);
-    tap(230,290); assert(meo_ui_model()->page==MEO_DISPLAY);
+    tap(230,237); assert(meo_ui_model()->page==MEO_DISPLAY);
     snapshot(argv[1],"15-display-brightness");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(375,235); assert(meo_ui_model()->settings.brightness==90);
     tap(375,235); assert(meo_ui_model()->settings.brightness==100);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     snapshot(argv[1],"26-display-brightness-100");
     unsigned boundary_saves=saves;
     tap(375,235); assert(saves==boundary_saves);
@@ -963,10 +1034,10 @@ int main(int argc, char **argv)
     /* Return from the display subpage through the large header hit area before
        opening the accessibility row. */
     tap(230,50); assert(meo_ui_model()->page==MEO_SETTINGS);
-    tap(230,380); assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
+    tap(230,280); assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
     snapshot(argv[1],"16-accessibility");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(360,193); assert(meo_ui_model()->settings.reduced_motion); assert(saves > 0);
     advance(250); snapshot(argv[1],"30-accessibility-enabled");
     lv_obj_t *old_screen=lv_screen_active();
@@ -974,17 +1045,125 @@ int main(int argc, char **argv)
     meo_ui_navigate(MEO_ACCESSIBILITY); /* immediate next navigation remains usable */
     assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(94,86); assert(meo_ui_model()->page==MEO_SETTINGS);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     snapshot(argv[1],"27-settings-reduced");
-    tap(230,175); assert(meo_ui_model()->page == MEO_WIFI);
+    tap(230,151); assert(meo_ui_model()->page == MEO_WIFI);
     snapshot(argv[1], "04-wifi-unavailable");
+    {   /* Scan list + shutdown overlay are new surfaces: render them. */
+        const char aps[3][33] = {"MEOWPAS", "MEO-IoT", "TP-LINK_5G"};
+        const int rssi[3] = {-58, -71, -83};
+        meo_ui_set_wifi(MEO_WIFI_ONLINE, "MEOWPAS", -58);
+        meo_ui_set_power(93, true);
+        meo_ui_set_scan_list((const char (*)[33])aps, rssi, 3);
+        advance(50);
+        snapshot(argv[1], "04a-wifi-scan-list");
+        meo_ui_set_wifi(MEO_WIFI_CONNECTING, "MEOWPAS", 0);
+        advance(900);                    /* past the notice pulse valley */
+        snapshot(argv[1], "04i-wifi-connecting-state");
+        color_check_disabled = true;
+        meo_ui_set_shutdown(5);
+        advance(60);
+        snapshot(argv[1], "04b0-shutdown-fade-in");   /* mid fade: proves the entry */
+        advance(400);
+        snapshot(argv[1], "04b-shutdown-countdown");  /* settled: must be opaque */
+        meo_ui_set_shutdown(0);
+        advance(50);
+        snapshot(argv[1], "04c-shutdown-final");
+        meo_ui_set_shutdown(-1);
+        color_check_disabled = false;
+        meo_ui_set_wifi(MEO_WIFI_OFF, NULL, 0);
+        meo_ui_set_power(-1, false);
+        meo_ui_set_scan_list(aps, rssi, 0);
+        advance(50);
+    }
+    {   /* Taps must dispatch: entering the page scans, the button scans again,
+           and a row tap joins exactly the SSID that was rendered. */
+        unsigned scans = wifi_scan_calls, joins = wifi_join_calls;
+        meo_ui_navigate(MEO_HOME); advance(250);
+        meo_ui_navigate(MEO_WIFI); advance(300);
+        assert(meo_ui_model()->page == MEO_WIFI);
+        assert(wifi_scan_calls == scans + 1);          /* auto-scan on entry */
+        tap(230, 258);
+        assert(wifi_scan_calls == scans + 2);          /* explicit scan button */
+        advance(640);                                  /* pulse valley */
+        snapshot(argv[1], "04h-notice-dim");
+        const char one[3][33] = {"MEOWPAS", "", ""};
+        const int one_rssi[3] = {-58, 0, 0};
+        meo_ui_set_scan_list((const char (*)[33])one, one_rssi, 1);
+        advance(60);
+        tap(230, 331);
+        assert(wifi_join_calls == joins + 1);
+        assert(strcmp(wifi_join_ssid, "MEOWPAS") == 0);
+        advance(60);
+        snapshot(argv[1], "04d-wifi-tap-joined");
+        wifi_join_result = false;                      /* no saved password path */
+        tap(230, 331);
+        assert(wifi_join_calls == joins + 2);
+        advance(60);
+        snapshot(argv[1], "04e-wifi-tap-no-password");
+        wifi_join_result = true;
+        meo_ui_set_scan_list((const char (*)[33])one, one_rssi, 0);
+        meo_ui_navigate(MEO_WIFI); advance(300);  /* leave the flow where it was */
+    }
+    {   /* On-screen password entry: a row tap with no saved key must open it,
+           multi-tap must build "AB", 123 mode must append digits, and OK must
+           hand the exact SSID and password to the adapter. */
+        /* keys: 99x64 at (24,240), 10 px gaps -> row y 272/348/424,
+           col x 73/182/291/400; OK is the last key at (400,424). */
+        const char one[3][33] = {"MEOWPAS", "", ""};
+        const int one_rssi[3] = {-58, 0, 0};
+        meo_ui_set_scan_list((const char (*)[33])one, one_rssi, 1);
+        advance(60);
+        unsigned connects = wifi_connect_calls;
+        wifi_join_result = false;
+        tap(230, 331);
+        assert(meo_ui_model()->page == MEO_PASSWORD);
+        advance(200);
+        tap(380, 72);                      /* abc -> ABC */
+        tap(182, 272);                     /* 2 -> A */
+        advance(200);
+        snapshot(argv[1], "04g-password-letters");
+        advance(600);                      /* commit */
+        tap(182, 272);                     /* A again */
+        tap(182, 272);                     /* same key quickly -> B */
+        advance(800);
+        tap(380, 72);                      /* ABC -> 123 */
+        tap(73, 272);                      /* 1 */
+        tap(182, 272);                     /* 2 */
+        advance(200);
+        snapshot(argv[1], "04f-password-entry");
+        tap(400, 424);                     /* OK */
+        assert(wifi_connect_calls == connects + 1);
+        assert(strcmp(wifi_connect_ssid, "MEOWPAS") == 0);
+        assert(strcmp(wifi_connect_pass, "AB12") == 0);
+        wifi_join_result = true;
+        advance(250);
+        meo_ui_navigate(MEO_WIFI); advance(250);
+    }
+    {   /* Microphone meter: the level must actually drive the bars. */
+        meo_ui_navigate(MEO_MIC); advance(300);
+        assert(meo_ui_model()->page == MEO_MIC);
+        const float both[2] = {0.62f, 0.28f};
+        meo_ui_set_mic(both, true);
+        advance(500);
+        snapshot(argv[1], "04j-mic-level");
+        const float quiet[2] = {0.0f, 0.0f};
+        meo_ui_set_mic(quiet, true);
+        advance(700);
+        /* A silent meter is legitimately monochrome (dim segments, grey text):
+           the "every page carries accent ink" rule does not apply to it. */
+        color_check_disabled = true;
+        snapshot(argv[1], "04k-mic-silence");
+        color_check_disabled = false;
+        meo_ui_navigate(MEO_WIFI); advance(250);
+    }
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(94, 86); assert(meo_ui_model()->page == MEO_SETTINGS);
-    tap(230,380); tap(360,193); assert(!meo_ui_model()->settings.reduced_motion);
+    tap(230,280); tap(360,193); assert(!meo_ui_model()->settings.reduced_motion);
     tap(94,86); assert(meo_ui_model()->page==MEO_SETTINGS);
     swipe(24,230,38,230); assert(meo_ui_model()->page==MEO_SETTINGS); /* cancel */
     swipe(24,230,70,310); assert(meo_ui_model()->page==MEO_SETTINGS); /* vertical/diagonal */
@@ -1044,7 +1223,7 @@ int main(int argc, char **argv)
     swipe(100,230,260,230); advance(2100); launcher_open(2,MEO_BREATHE);
     assert(!meo_ui_model()->rate_live && lv_obj_has_flag(breath_rate(),LV_OBJ_FLAG_HIDDEN));
     swipe(100,230,260,230); launcher_open(0,MEO_SETTINGS);
-    tap(230,380); tap(348,188); assert(meo_ui_model()->settings.reduced_motion);
+    tap(230,280); tap(348,188); assert(meo_ui_model()->settings.reduced_motion);
     tap(94,86); tap(94,86); launcher_open(2,MEO_BREATHE);
     meo_ui_feed_respiration((meo_resp_t){.waveform=-1,.rate_bpm=12,.at_ms=lv_tick_get(),.valid=true,.rate_valid=true});
     advance(200); snapshot(argv[1],"12-reduced-motion");

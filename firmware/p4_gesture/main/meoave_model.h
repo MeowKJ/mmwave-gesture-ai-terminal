@@ -5,7 +5,8 @@
 /* Pure, platform-independent state. All timestamps are monotonic milliseconds.
  * Calls must be serialized by the UI thread (or its platform LVGL lock). */
 typedef enum { MEO_HOME, MEO_APPS, MEO_SETTINGS, MEO_WIFI, MEO_BREATHE,
-               MEO_DISPLAY, MEO_ACCESSIBILITY, MEO_PAGE_COUNT } meo_page_t;
+               MEO_DISPLAY, MEO_ACCESSIBILITY, MEO_PASSWORD, MEO_MIC, MEO_SPEAKER,
+               MEO_PAGE_COUNT } meo_page_t;
 typedef enum { MEO_GUIDED, MEO_RADAR } meo_breath_mode_t;
 typedef enum { MEO_EYE_CALM, MEO_EYE_HAPPY, MEO_EYE_CURIOUS, MEO_EYE_SLEEPY,
                MEO_EYE_SURPRISED, MEO_EYE_WINK, MEO_EYE_SAD, MEO_EYE_COUNT } meo_expression_t;
@@ -15,7 +16,13 @@ typedef enum { MEO_EYE_CALM, MEO_EYE_HAPPY, MEO_EYE_CURIOUS, MEO_EYE_SLEEPY,
 typedef struct { float half_x, half_y, arch, width, y; } meo_eye_shape_t;
 typedef struct {
     uint8_t brightness, guide_bpm;
+    /* Speaker output level 0..100 (0 = mute, 100 = 0 dB). Persisted so the
+       next boot restores the same loudness. */
+    uint8_t volume;
     bool reduced_motion, app_list_view;
+    /* Microphone test switch: capture only runs while this is on, so the radio
+       and the meter stay idle (and silent) until someone asks for them. */
+    bool mic_test;
 } meo_settings_t;
 typedef struct {
     float x, y;
