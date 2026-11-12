@@ -36,7 +36,14 @@ CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=y
 # (its generated sdkconfig selects LV_COLOR_DEPTH=24 and 500 Mbps DSI).
 CONFIG_LV_COLOR_DEPTH_24=y
 CONFIG_LV_OS_FREERTOS=y
-CONFIG_LV_DEF_REFR_PERIOD=15
+CONFIG_LV_DEF_REFR_PERIOD=12
+# 12 ms refresh check: a 15 ms period plus a ~20 ms rasterisation pass left
+# occasional 33-35 ms frame gaps, just over the 30 fps budget. Checking for
+# dirty areas more often costs nothing when a page is static.
+# P4 has a PPA (2D DMA). Let it do the 180-degree panel rotation instead of
+# lv_draw_sw_rotate on the CPU: the software copy of a full 460x460 RGB888
+# frame costs ~16 ms per refresh and was the dominant frame-time component.
+CONFIG_LVGL_PORT_ENABLE_PPA=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
 CONFIG_LV_USE_CLIB_SPRINTF=y

@@ -83,8 +83,14 @@
 #define PIN_I2S_MCLK        GPIO_NUM_3
 #define PIN_I2S_BCLK        GPIO_NUM_4
 #define PIN_I2S_LRCK        GPIO_NUM_5
-#define PIN_I2S_DOUT        GPIO_NUM_6    /* P4 -> ES8389 */
-#define PIN_I2S_DIN         GPIO_NUM_7    /* ES8389 -> P4 */
+/* Core-board pin table (ESP32-P4C5-Core, 3.2 pin description):
+ *   module pin 21 = GPIO6  -> net I2S_ASDOUT -> ES8389 ASDOUT (codec OUT)
+ *   module pin 22 = GPIO7  -> net I2S_DSDIN  -> ES8389 DSDIN  (codec IN)
+ * These were swapped here, which made the ADC path unusable: GPIO7 was driven
+ * into another input (both ends input -> floating 0xFFFF) and GPIO6 had the
+ * codec output fighting the P4 output. */
+#define PIN_I2S_DOUT        GPIO_NUM_7    /* P4 -> ES8389 DSDIN  (module pin 22) */
+#define PIN_I2S_DIN         GPIO_NUM_6    /* ES8389 ASDOUT -> P4 (module pin 21) */
 
 /* ============ OSPTEK P4C5 内部 SDIO（仅在明确接入 Hosted 时使用） ============
  * p4c5_core_guide.pdf p10 / ESP-Hosted example logs:

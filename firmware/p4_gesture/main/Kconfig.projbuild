@@ -37,6 +37,16 @@ config APP_MEOAVE_WIFI_HOSTED
       timing have been verified. GPIO6 is deliberately not used: it remains
       available for the ES8389 I2S DOUT path.
 
+config APP_C5_NATIVE_MAINTENANCE
+    bool "Native USB C5 maintenance on the custom board"
+    depends on APP_MEOAVE_WIFI_HOSTED
+    default n
+    help
+      Keeps the proven product UI/power/USB path. A dedicated worker reuses
+      the headless host's app-only OTA and identity state machine. ATTACH
+      never resets C5; CONNECT is explicit. GPIO6 modes and NET commands
+      are rejected pending product audio/Wi-Fi integration.
+
 config APP_C5_SDIO_LOADER
     bool "Manual-entry C5 SDIO programmer (embedded Hosted image)"
     depends on APP_MEOAVE_UI && !APP_MEOAVE_WIFI_HOSTED

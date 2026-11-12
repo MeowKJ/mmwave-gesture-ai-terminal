@@ -12,20 +12,30 @@ if(CONFIG_APP_FLS2_OFFICIAL_BASELINE)
             list(APPEND product_requires esp-serial-flasher)
         endif()
         if(CONFIG_APP_MEOAVE_WIFI_HOSTED)
-            list(APPEND product_sources "bsp_wifi_hosted.c")
+            if(CONFIG_APP_C5_NATIVE_MAINTENANCE)
+                list(APPEND product_sources "bsp_c5_maintenance.c" "../bringup/main/main_maintenance.c")
+                list(APPEND product_requires mbedtls esp_driver_uart)
+            else()
+                list(APPEND product_sources "bsp_wifi_hosted.c")
+            endif()
             list(APPEND product_requires esp_hosted esp_wifi esp_netif esp_event)
         endif()
     endif()
     idf_component_register(
         SRCS "fls2_official_source.c" "fls2_official_board.c" "fls2_touch_diag.c"
              "fls2_display_diag.c" "fls2_display_startup.c" "fls2_test_loop.c"
-             "bsp_common.c" "bsp_power.c" "bsp_usb.c" "bsp_usb_tx.c" ${product_sources}
+             "bsp_common.c" "bsp_power.c" "bsp_usb.c" "bsp_usb_tx.c" "bsp_audio.c"
+             "audio_selftest.c"
+             ${product_sources}
         INCLUDE_DIRS "."
-        REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio esp_adc esp_event
+        REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio esp_driver_i2s esp_adc esp_event
                  esp_hw_support esp_timer esp_app_format ${product_requires}
         # Dependencies are resolved before sdkconfig in IDF's early expansion.
-        PRIV_REQUIRES esp_lcd_touch_cst820 esp_lcd_touch nvs_flash esp_event
+        PRIV_REQUIRES esp_lcd_touch_cst820 esp_lcd_touch nvs_flash esp_event mbedtls esp_driver_uart
     )
+    if(CONFIG_APP_C5_NATIVE_MAINTENANCE)
+        idf_component_optional_requires(PRIVATE mbedtls esp_driver_uart esp_hosted)
+    endif()
     if(CONFIG_APP_MEOAVE_WIFI_HOSTED)
         # Keep the hosted adapter's public headers visible even when this
         # vendored component is not resolved through the normal dependency
@@ -37,6 +47,9 @@ if(CONFIG_APP_FLS2_OFFICIAL_BASELINE)
             "$ENV{IDF_PATH}/components/esp_netif/include"
             "$ENV{IDF_PATH}/components/esp_wifi/include"
         )
+        if(CONFIG_APP_C5_NATIVE_MAINTENANCE)
+            target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../bringup/main")
+        endif()
     endif()
     if(CONFIG_APP_MEOAVE_UI)
         target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)
@@ -66,6 +79,7 @@ idf_component_register(
          "bsp_display.c"
          "bsp_touch.c"
          "bsp_audio.c"
+         "audio_selftest.c"
          "bsp_radar.c"
          "bsp_usb.c"
          "bsp_usb_tx.c"
