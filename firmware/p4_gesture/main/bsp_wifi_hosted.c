@@ -4,9 +4,8 @@
  * Ordering rules learned from bring-up:
  *   - The Hosted transport is started from a worker, never from app_main, so a
  *     silent C5 cannot delay display/USB enumeration.
- *   - Nothing here resets the C5: SDIO GPIO54 is shared with radar SOP0 and is
- *     left to the Hosted port's "reset only if necessary" policy.
- *   - Requests are queued by the caller and executed from the app task; the
+ *   - Neither this layer nor Hosted ATTACH resets C5 (shared radar SOP0).
+ *   - Requests are queued by the caller and executed by one radio worker; the
  *     Wi-Fi event task only updates cached state.
  */
 #include "bsp_wifi_hosted.h"
@@ -16,6 +15,7 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_hosted.h"
+#include "esp_hosted_sdio_diagnostic.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -30,7 +30,7 @@
 #include <string.h>
 
 #define WIFI_NS        "wifi"
-#define WIFI_SCAN_MAX  16   /* one scan burst, filtered down before caching */
+#define WIFI_SCAN_MAX  32   /* bounded driver snapshot */
 #define WIFI_MAX_AP    6    /* what the UI can show */
 
 typedef enum { REQ_NONE = 0, REQ_SCAN, REQ_JOIN, REQ_SET } req_kind_t;
@@ -48,6 +48,9 @@ static struct {
     char ip[16];
     unsigned ap_count;
     unsigned scan_raw;    /* driver-reported count of the last scan */
+    bool scanning;
+    uint32_t scan_seq, scan_done_seq;
+    int scan_error, save_error;
     char ap_ssid[WIFI_MAX_AP][33];
     int ap_rssi[WIFI_MAX_AP];
 } s_wifi;
@@ -61,15 +64,37 @@ static struct {
 static esp_netif_t *s_netif;
 static bool s_events;
 static char s_saved_ssid[33];
+static char s_saved_pass[65];
+static char s_target_pass[65];
+static bool s_radio_ready, s_started, s_save_pending, s_link_up;
+static bool s_disconnect_wait, s_connect_pending;
+static int64_t s_scan_deadline, s_join_deadline, s_scan_cooldown;
+static uint32_t s_scan_status;
 /* The system event task only has CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE
  * (2304 bytes here). Fetching AP records there overflows the stack and
  * corrupts the event loop's handler lists, so the handler only raises a flag
- * and the app task does the RPC. */
-static volatile bool s_scan_ready;
-/* Bounded re-join after an unexpected drop: 3 attempts, 5 s apart, refilled on
- * every successful association. Never a tight retry loop. */
+ * and the radio worker does the RPC. */
+static bool s_scan_ready; /* protected by s_lock, like all event-shared flags */
+/* Bounded re-join: three retries, five seconds apart. Failed retries never
+ * refill their own budget. No C5 reset/transport recovery is hidden here. */
 static int s_rejoin_left;
 static int64_t s_rejoin_at_ms;
+
+static void wipe(void *data, size_t size)
+{
+    volatile unsigned char *p = data;
+    while (size--) *p++ = 0;
+}
+
+static bool valid_credentials(const char *ssid, const char *pass)
+{
+    if (!ssid || !*ssid || strnlen(ssid, 33) > 32) return false;
+    size_t n = pass ? strnlen(pass, 65) : 0;
+    if (!n || (n >= 8 && n <= 63)) return true;
+    if (n != 64) return false;
+    for (size_t i = 0; i < n; ++i) if (!isxdigit((unsigned char)pass[i])) return false;
+    return true;
+}
 
 static void set_state(bsp_wifi_state_t state, int error)
 {
@@ -93,22 +118,37 @@ static bool load_credentials(char *ssid, size_t ssid_size, char *pass, size_t pa
 {
     nvs_handle_t handle;
     if (nvs_open(WIFI_NS, NVS_READONLY, &handle) != ESP_OK) return false;
+    /* Single-blob format makes SSID/password one atomic NVS value. */
+    struct { char ssid[33], pass[65]; } key = {0};
+    size_t size = sizeof(key);
+    if (nvs_get_blob(handle, "profile", &key, &size) == ESP_OK && size == sizeof(key) &&
+        key.ssid[32] == 0 && key.pass[64] == 0 && valid_credentials(key.ssid, key.pass)) {
+        snprintf(ssid, ssid_size, "%s", key.ssid);
+        snprintf(pass, pass_size, "%s", key.pass);
+        wipe(&key, sizeof(key));
+        nvs_close(handle);
+        return true;
+    }
+    wipe(&key, sizeof(key));
     size_t ssid_len = ssid_size, pass_len = pass_size;
     bool ok = nvs_get_str(handle, "ssid", ssid, &ssid_len) == ESP_OK && ssid[0];
     if (ok) {
         if (nvs_get_str(handle, "pass", pass, &pass_len) != ESP_OK) pass[0] = 0;
     }
     nvs_close(handle);
-    return ok;
+    return ok && valid_credentials(ssid, pass);
 }
 
 static bool save_credentials(const char *ssid, const char *pass)
 {
     nvs_handle_t handle;
     if (nvs_open(WIFI_NS, NVS_READWRITE, &handle) != ESP_OK) return false;
-    esp_err_t err = nvs_set_str(handle, "ssid", ssid);
-    if (err == ESP_OK) err = nvs_set_str(handle, "pass", pass ? pass : "");
+    struct { char ssid[33], pass[65]; } key = {0};
+    snprintf(key.ssid, sizeof(key.ssid), "%s", ssid);
+    snprintf(key.pass, sizeof(key.pass), "%s", pass ? pass : "");
+    esp_err_t err = nvs_set_blob(handle, "profile", &key, sizeof(key));
     if (err == ESP_OK) err = nvs_commit(handle);
+    wipe(&key, sizeof(key));
     nvs_close(handle);
     return err == ESP_OK;
 }
@@ -121,125 +161,109 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (id == WIFI_EVENT_SCAN_DONE) {
         /* Do not touch the results here: see s_scan_ready. A scan must not
            demote a live association: only an unlinked radio becomes READY. */
-        s_scan_ready = true;
         portENTER_CRITICAL(&s_lock);
-        if (!s_wifi.ip[0] && s_wifi.state == BSP_WIFI_SCANNING) s_wifi.state = BSP_WIFI_READY;
+        if (s_wifi.scanning) {
+            const wifi_event_sta_scan_done_t *event = data;
+            s_scan_status = event ? event->status : 1;
+            s_scan_ready = true;
+        }
         portEXIT_CRITICAL(&s_lock);
     } else if (id == WIFI_EVENT_STA_CONNECTED) {
-        set_state(BSP_WIFI_JOINING, 0);
+        const wifi_event_sta_connected_t *d = data;
+        portENTER_CRITICAL(&s_lock);
+        if (!s_disconnect_wait && s_wifi.state == BSP_WIFI_JOINING && d &&
+            d->ssid_len == strlen(s_wifi.ssid) && !memcmp(d->ssid, s_wifi.ssid, d->ssid_len))
+            s_link_up = true;
+        portEXIT_CRITICAL(&s_lock);
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
         int reason = d ? d->reason : 0;
-        bsp_wifi_state_t state = get_state();
         portENTER_CRITICAL(&s_lock);
+        bsp_wifi_state_t state = s_wifi.state;
+        s_link_up = false;
         s_wifi.ip[0] = 0;
         s_wifi.rssi = 0;
-        portEXIT_CRITICAL(&s_lock);
-        /* A drop after being online is not an error the user asked for; a drop
-           during an explicit join is. Neither case retries automatically. */
+        if (s_disconnect_wait) {
+            s_disconnect_wait = false;
+            portEXIT_CRITICAL(&s_lock);
+            return;
+        }
+        /* Intentional disconnects were consumed above. Unexpected drops and
+         * failed joins share the remaining, bounded retry budget. */
         if (state == BSP_WIFI_JOINING) {
-            ESP_LOGW(TAG, "join failed, reason=%d", reason);
-            set_state(BSP_WIFI_ERROR, reason);
+            s_wifi.state = BSP_WIFI_ERROR;
+            s_wifi.error = reason;
             /* A boot-time join can fail once (AP still booting, channel busy).
                Three spaced retries keep the device usable without a tap;
                a manual SET/JOIN resets the budget through ONLINE. */
-            if (s_saved_ssid[0] && s_rejoin_left <= 0) {
-                s_rejoin_left = 3;
+            if (s_rejoin_left > 0) {
                 s_rejoin_at_ms = esp_timer_get_time() / 1000 + 5000;
             }
         } else {
-            ESP_LOGW(TAG, "disconnected, reason=%d", reason);
-            set_state(BSP_WIFI_READY, 0);
-            if (s_saved_ssid[0]) {
+            if (state == BSP_WIFI_ONLINE) {
+                s_wifi.state = BSP_WIFI_ERROR;
+                s_wifi.error = reason;
                 s_rejoin_left = 3;
                 s_rejoin_at_ms = esp_timer_get_time() / 1000 + 5000;
             }
         }
+        portEXIT_CRITICAL(&s_lock);
     }
 }
 
 static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base;
-    if (id != IP_EVENT_STA_GOT_IP) return;
+    if (id == IP_EVENT_STA_LOST_IP) {
+        portENTER_CRITICAL(&s_lock);
+        if (s_wifi.state == BSP_WIFI_ONLINE) {
+            s_wifi.ip[0] = 0;
+            s_wifi.state = BSP_WIFI_ERROR;
+            s_wifi.error = ESP_ERR_TIMEOUT;
+            s_rejoin_left = 3;
+            s_rejoin_at_ms = esp_timer_get_time() / 1000 + 5000;
+        }
+        portEXIT_CRITICAL(&s_lock);
+        return;
+    }
+    if (id != IP_EVENT_STA_GOT_IP || !data) return;
     const ip_event_got_ip_t *event = data;
     char ip[16];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
-    wifi_ap_record_t ap;
-    int rssi = 0;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
     portENTER_CRITICAL(&s_lock);
+    if (!s_link_up || s_disconnect_wait || s_wifi.state != BSP_WIFI_JOINING) {
+        portEXIT_CRITICAL(&s_lock); return;
+    }
     snprintf(s_wifi.ip, sizeof(s_wifi.ip), "%s", ip);
-    s_wifi.rssi = rssi;
     s_wifi.state = BSP_WIFI_ONLINE;
     s_wifi.error = 0;
-    portEXIT_CRITICAL(&s_lock);
     s_rejoin_left = 0;
+    s_rejoin_at_ms = 0;
+    s_save_pending = true;
+    portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "online: %s", ip);
 }
 
 /* ---------------- bring-up worker ---------------- */
 
-/* The C5 slave can be mid-boot or freshly reset by a P4 restart; a single
- * transport attempt then leaves the device offline until someone reboots it.
- * Six spaced attempts cover that window without hammering the SDIO bus. */
-#define WIFI_BRINGUP_ATTEMPTS 6
-#define WIFI_BRINGUP_GAP_MS   5000
-
-/* A failed connect leaves the port in a dead state; retrying the same port just
- * repeats the same error. Tear the transport down and rebuild it per attempt. */
-static esp_err_t transport_attempts(unsigned attempts, const char *stage)
+/* One bounded, no-reset ATTACH. This local Hosted API is also used by the
+ * audited maintenance path: do not pulse shared GPIO54 on a UI retry. */
+static esp_err_t attach_c5(void)
 {
-    esp_err_t err = ESP_FAIL;
-    for (unsigned attempt = 1; attempt <= attempts; ++attempt) {
-        s_stage = attempt == 1 ? stage : "TRANSPORT_RETRY";
-        err = (esp_err_t)esp_hosted_connect_to_slave();
-        if (err == ESP_OK) return ESP_OK;
-        ESP_LOGW(TAG, "Hosted transport attempt %u/%u: %s", attempt, attempts,
-                 esp_err_to_name(err));
-        if (attempt < attempts) {
-            vTaskDelay(pdMS_TO_TICKS(600));
-            s_stage = "TRANSPORT_REINIT";
-            (void)esp_hosted_deinit();
-            vTaskDelay(pdMS_TO_TICKS(400));
-            (void)esp_hosted_init();
-            vTaskDelay(pdMS_TO_TICKS(WIFI_BRINGUP_GAP_MS));
-        }
-    }
+    esp_err_t err = esp_hosted_sdio_diagnostic_configure_ex(4,
+        CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ, 0, 10000);
+    if (err == ESP_OK) err = esp_hosted_sdio_diagnostic_set_reset(false);
+    if (err == ESP_OK) err = (esp_err_t)esp_hosted_connect_to_slave();
     return err;
-}
-
-/* Last resort when the C5 slave stops answering: one shared-line EN pulse.
- * GPIO54 is also radar SOP0, so the radar is switched into flashing mode for
- * the duration of the pulse and returns to functional mode on release. This is
- * bounded to a single pulse per bring-up, never a loop. */
-static void pulse_c5_en(void)
-{
-    gpio_config_t cfg = {.pin_bit_mask = 1ULL << PIN_C5_RESET, .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
-    (void)gpio_set_level(PIN_C5_RESET, 1);
-    (void)gpio_config(&cfg);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    (void)gpio_set_level(PIN_C5_RESET, 0);
-    vTaskDelay(pdMS_TO_TICKS(30));
-    (void)gpio_set_level(PIN_C5_RESET, 1);
-    vTaskDelay(pdMS_TO_TICKS(6000));   /* C5 boot + slave transport ready */
 }
 
 static void bringup_worker(void *arg)
 {
     (void)arg;
     set_state(BSP_WIFI_STARTING, 0);
-    esp_err_t err = transport_attempts(WIFI_BRINGUP_ATTEMPTS, "TRANSPORT");
+    esp_err_t err = attach_c5();
     if (err != ESP_OK) {
-        s_stage = "RESET_C5";
-        ESP_LOGW(TAG, "transport dead, pulsing C5 EN once");
-        pulse_c5_en();
-        err = transport_attempts(3, "TRANSPORT_AFTER_RESET");
-    }
-    if (err != ESP_OK) {
-        s_stage = "TRANSPORT_FAILED";
+        s_stage = "TRANSPORT_FAILED_NO_RESET";
         set_state(BSP_WIFI_ERROR, err);
         vTaskDelete(NULL);
         return;
@@ -262,8 +286,13 @@ static void bringup_worker(void *arg)
         if (!s_netif) { set_state(BSP_WIFI_ERROR, ESP_ERR_NO_MEM); vTaskDelete(NULL); return; }
     }
     if (!s_events) {
-        if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL) != ESP_OK ||
-            esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip_event, NULL, NULL) != ESP_OK) {
+        esp_event_handler_instance_t wifi_handler;
+        err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, &wifi_handler);
+        if (err == ESP_OK) {
+            err = esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, on_ip_event, NULL, NULL);
+            if (err != ESP_OK) (void)esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler);
+        }
+        if (err != ESP_OK) {
             set_state(BSP_WIFI_ERROR, ESP_FAIL);
             vTaskDelete(NULL);
             return;
@@ -272,6 +301,7 @@ static void bringup_worker(void *arg)
     }
     s_stage = "WIFI_INIT";
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    cfg.nvs_enable = 0;
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK) { set_state(BSP_WIFI_ERROR, err); vTaskDelete(NULL); return; }
     /* Credentials are ours (NVS namespace "wifi"), not esp_wifi's own store. */
@@ -286,25 +316,45 @@ static void bringup_worker(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    s_stage = "READY";
-    ESP_LOGI(TAG, "Hosted Wi-Fi ready on C5 (%s), GPIO6 untouched", chip);
     /* ESP32-C5 is dual-band; a band-locked default can scan nothing at all. */
     esp_err_t band = esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
     if (band != ESP_OK) ESP_LOGW(TAG, "band mode auto: %s", esp_err_to_name(band));
-    set_state(BSP_WIFI_READY, 0);
-
+    if (band != ESP_OK) { set_state(BSP_WIFI_ERROR, band); vTaskDelete(NULL); return; }
+    s_stage = "READY";
+    ESP_LOGI(TAG, "Hosted Wi-Fi ready on C5 (%s), GPIO6 untouched", chip);
     /* Re-join the last known network without any key press. */
     char ssid[33], pass[65];
-    if (load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
-        snprintf(s_saved_ssid, sizeof(s_saved_ssid), "%s", ssid);
+    /* UI creation initializes settings later on another task; do not race it
+     * and silently miss boot credentials. Never erase NVS to recover it. */
+    esp_err_t storage = nvs_flash_init();
+    if (storage != ESP_OK) {
         portENTER_CRITICAL(&s_lock);
+        s_wifi.save_error = storage;
+        portEXIT_CRITICAL(&s_lock);
+    }
+    if (storage == ESP_OK && load_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        portENTER_CRITICAL(&s_lock);
+        snprintf(s_saved_ssid, sizeof(s_saved_ssid), "%s", ssid);
+        snprintf(s_saved_pass, sizeof(s_saved_pass), "%s", pass);
+        snprintf(s_wifi.ssid, sizeof(s_wifi.ssid), "%s", ssid);
+        snprintf(s_target_pass, sizeof(s_target_pass), "%s", pass);
+        s_rejoin_left = 3;
+        s_rejoin_at_ms = esp_timer_get_time() / 1000 + 5000;
         if (s_req.kind == REQ_NONE) {
             s_req.kind = REQ_JOIN;
             snprintf(s_req.ssid, sizeof(s_req.ssid), "%s", ssid);
             snprintf(s_req.pass, sizeof(s_req.pass), "%s", pass);
+            s_rejoin_left = 3;
+            s_wifi.state = BSP_WIFI_JOINING;
         }
         portEXIT_CRITICAL(&s_lock);
     }
+    portENTER_CRITICAL(&s_lock);
+    s_radio_ready = true;
+    s_wifi.state = s_req.kind == REQ_JOIN ? BSP_WIFI_JOINING : BSP_WIFI_READY;
+    s_wifi.error = 0;
+    portEXIT_CRITICAL(&s_lock);
+    wipe(pass, sizeof(pass));
     vTaskDelete(NULL);
 }
 
@@ -312,25 +362,33 @@ static void bringup_worker(void *arg)
 
 static bool queue_request(req_kind_t kind, const char *ssid, const char *pass)
 {
-    bsp_wifi_state_t state = get_state();
-    if (kind == REQ_SCAN ? (state != BSP_WIFI_READY && state != BSP_WIFI_ONLINE)
-                         : (state != BSP_WIFI_READY && state != BSP_WIFI_ONLINE && state != BSP_WIFI_ERROR))
-        return false;
     portENTER_CRITICAL(&s_lock);
+    bsp_wifi_state_t state = s_wifi.state;
+    bool startup_scan = kind == REQ_SCAN && state == BSP_WIFI_STARTING;
+    if ((!s_radio_ready && !startup_scan) || s_req.kind != REQ_NONE || s_wifi.scanning ||
+        state == BSP_WIFI_JOINING || s_connect_pending ||
+        esp_timer_get_time() / 1000 < s_scan_cooldown) {
+        portEXIT_CRITICAL(&s_lock); return false;
+    }
     s_req.kind = kind;
     snprintf(s_req.ssid, sizeof(s_req.ssid), "%s", ssid ? ssid : "");
     snprintf(s_req.pass, sizeof(s_req.pass), "%s", pass ? pass : "");
+    if (kind == REQ_SCAN) {
+        s_wifi.scanning = true;
+        s_wifi.scan_error = 0;
+        ++s_wifi.scan_seq;
+    } else {
+        s_wifi.state = BSP_WIFI_JOINING; /* reserve before the worker runs */
+        s_wifi.error = 0;
+        s_rejoin_left = 3;
+        s_rejoin_at_ms = 0;
+    }
     portEXIT_CRITICAL(&s_lock);
     return true;
 }
 
 bool bsp_wifi_scan(void)
 {
-    if (get_state() == BSP_WIFI_ERROR) {
-        /* The page's only control is "scan": when the link is down, make that
-           tap restart the Hosted bring-up instead of returning a silent false. */
-        return xTaskCreate(bringup_worker, "wifi_retry", 8192, NULL, 2, NULL) == pdPASS;
-    }
     return queue_request(REQ_SCAN, NULL, NULL);
 }
 
@@ -338,187 +396,291 @@ bool bsp_wifi_join_saved(const char *ssid)
 {
     if (!ssid || !*ssid) return false;
     char saved[33], pass[65];
-    if (!load_credentials(saved, sizeof(saved), pass, sizeof(pass)) || strcmp(saved, ssid) != 0)
-        return false;
-    return queue_request(REQ_JOIN, ssid, pass);
+    portENTER_CRITICAL(&s_lock);
+    memcpy(saved, s_saved_ssid, sizeof(saved));
+    memcpy(pass, s_saved_pass, sizeof(pass));
+    portEXIT_CRITICAL(&s_lock);
+    bool ok = !strcmp(saved, ssid) && valid_credentials(saved, pass) && queue_request(REQ_JOIN, ssid, pass);
+    wipe(pass, sizeof(pass));
+    return ok;
 }
 
 bool bsp_wifi_set_credentials(const char *ssid, const char *pass)
 {
-    if (!ssid || !*ssid || strlen(ssid) > 32 || (pass && strlen(pass) > 64)) return false;
-    if (!save_credentials(ssid, pass)) return false;
-    snprintf(s_saved_ssid, sizeof(s_saved_ssid), "%s", ssid);
-    return queue_request(REQ_SET, ssid, pass);
+    return valid_credentials(ssid, pass) && queue_request(REQ_SET, ssid, pass);
 }
 
-unsigned bsp_wifi_ap_list(char ssid[][33], int rssi[], unsigned max)
+static unsigned copy_ap_list_locked(char ssid[][33], int rssi[], unsigned max)
 {
     unsigned copied = 0;
-    portENTER_CRITICAL(&s_lock);
+    if (!ssid || !rssi) return 0;
     unsigned count = s_wifi.ap_count < max ? s_wifi.ap_count : max;
     for (unsigned i = 0; i < count; ++i) {
         snprintf(ssid[i], 33, "%s", s_wifi.ap_ssid[i]);
         rssi[i] = s_wifi.ap_rssi[i];
         ++copied;
     }
-    portEXIT_CRITICAL(&s_lock);
     return copied;
 }
 
-bsp_wifi_status_t bsp_wifi_hosted_status(void)
+static bsp_wifi_status_t copy_status_locked(void)
 {
     bsp_wifi_status_t out;
-    portENTER_CRITICAL(&s_lock);
     out.state = s_wifi.state;
     out.error = s_wifi.error;
     out.rssi = s_wifi.rssi;
     out.ap_count = s_wifi.ap_count;
     out.ap_raw = s_wifi.scan_raw;
+    out.scanning = s_wifi.scanning;
+    out.scan_seq = s_wifi.scan_seq;
+    out.scan_done_seq = s_wifi.scan_done_seq;
+    out.scan_error = s_wifi.scan_error;
+    out.save_error = s_wifi.save_error;
+    out.radio_ready = s_radio_ready;
     memcpy(out.ssid, s_wifi.ssid, sizeof(out.ssid));
     memcpy(out.ip, s_wifi.ip, sizeof(out.ip));
+    return out;
+}
+
+unsigned bsp_wifi_snapshot(char ssid[][33], int rssi[], unsigned max, bsp_wifi_status_t *status)
+{
+    /* A scan may finish between two independent reads. Publish its generation
+     * and APs under one lock, never tag an old list with a newer completion. */
+    portENTER_CRITICAL(&s_lock);
+    unsigned copied = copy_ap_list_locked(ssid, rssi, max);
+    if (status) *status = copy_status_locked();
     portEXIT_CRITICAL(&s_lock);
+    return copied;
+}
+
+unsigned bsp_wifi_ap_list(char ssid[][33], int rssi[], unsigned max)
+{
+    return bsp_wifi_snapshot(ssid, rssi, max, NULL);
+}
+
+bsp_wifi_status_t bsp_wifi_hosted_status(void)
+{
+    bsp_wifi_status_t out;
+    (void)bsp_wifi_snapshot(NULL, NULL, 0, &out);
     return out;
 }
 
 /* ---------------- service: execute queued requests ---------------- */
 
-static void join_now(const char *ssid, const char *pass)
+static void connect_now(void)
 {
-    wifi_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    /* SSID/password are byte arrays, not C strings: copy with an explicit
-       NUL so a 32-character SSID is not silently truncated by snprintf. */
-    size_t ssid_len = strnlen(ssid, sizeof(cfg.sta.ssid) - 1);
-    memcpy(cfg.sta.ssid, ssid, ssid_len);
-    cfg.sta.ssid[ssid_len] = 0;
-    const char *password = pass ? pass : "";
-    size_t pass_len = strnlen(password, sizeof(cfg.sta.password) - 1);
-    memcpy(cfg.sta.password, password, pass_len);
-    cfg.sta.password[pass_len] = 0;
-    cfg.sta.threshold.authmode = pass_len ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config_t cfg = {0};
+    /* Full 32-byte SSID and 64-byte hex PSK need not be NUL terminated. */
+    memcpy(cfg.sta.ssid, s_wifi.ssid, strlen(s_wifi.ssid));
+    memcpy(cfg.sta.password, s_target_pass, strlen(s_target_pass));
+    cfg.sta.threshold.authmode = s_target_pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-    portENTER_CRITICAL(&s_lock);
-    snprintf(s_wifi.ssid, sizeof(s_wifi.ssid), "%s", ssid);
-    s_wifi.ip[0] = 0;
-    s_wifi.state = BSP_WIFI_JOINING;
-    s_wifi.error = 0;
-    portEXIT_CRITICAL(&s_lock);
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    wipe(&cfg, sizeof(cfg));
     if (err == ESP_OK) err = esp_wifi_connect();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "join %s: %s", ssid, esp_err_to_name(err));
+        set_state(BSP_WIFI_ERROR, err);
+        portENTER_CRITICAL(&s_lock);
+        s_rejoin_at_ms = s_rejoin_left ? esp_timer_get_time() / 1000 + 5000 : 0;
+        portEXIT_CRITICAL(&s_lock);
+    }
+}
+
+static void join_now(const char *ssid, const char *pass)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool disconnect = s_link_up || s_wifi.ip[0];
+    snprintf(s_wifi.ssid, sizeof(s_wifi.ssid), "%s", ssid);
+    snprintf(s_target_pass, sizeof(s_target_pass), "%s", pass);
+    s_wifi.ip[0] = 0;
+    s_wifi.rssi = 0;
+    s_wifi.state = BSP_WIFI_JOINING;
+    s_wifi.error = 0;
+    s_save_pending = false;
+    s_link_up = false;
+    s_disconnect_wait = disconnect;
+    s_connect_pending = true;
+    s_join_deadline = esp_timer_get_time() / 1000 + 30000;
+    portEXIT_CRITICAL(&s_lock);
+    /* Applying a config while already connected fails. Wait for deliberate
+     * disconnect's event before configuring; do not treat it as a join failure. */
+    /* Some drivers return OK without a DISCONNECTED event when already idle.
+     * Only await that event if there really was a live association. */
+    if (!disconnect) return;
+    esp_err_t err = esp_wifi_disconnect();
+    if (err == ESP_ERR_WIFI_NOT_CONNECT) {
+        portENTER_CRITICAL(&s_lock);
+        s_disconnect_wait = false;
+        portEXIT_CRITICAL(&s_lock);
+    } else if (err != ESP_OK) {
+        portENTER_CRITICAL(&s_lock);
+        s_disconnect_wait = s_connect_pending = false;
+        portEXIT_CRITICAL(&s_lock);
         set_state(BSP_WIFI_ERROR, err);
     }
 }
 
-static void collect_scan_results(void)
+static void finish_scan(esp_err_t error)
 {
-    /* Runs on the app task: the record buffer is far too big for the event
-     * task's 2304-byte stack, and the RPC below has a deep call chain.
-     * Records are validated before caching: an entry without a printable SSID
-     * or with an impossible RSSI is dropped instead of shown as a blank row. */
-    uint16_t reported = 0;
-    (void)esp_wifi_scan_get_ap_num(&reported);
-    static char keep_ssid[WIFI_MAX_AP][33];   /* filled outside the lock */
-    static int keep_rssi[WIFI_MAX_AP];
-    unsigned kept = 0, seen = 0;
-    /* Pull one record per call: the bulk copy comes back misaligned after the
-       first entry (first SSID is correct, the rest decode as garbage/zero). */
-    for (unsigned i = 0; i < WIFI_SCAN_MAX && kept < WIFI_MAX_AP; ++i) {
-        wifi_ap_record_t rec;
-        memset(&rec, 0, sizeof(rec));
-        if (esp_wifi_scan_get_ap_record(&rec) != ESP_OK) break;
-        ++seen;
-        unsigned len = 0;
-        char ssid[33] = {0};
-        while (len < 32 && rec.ssid[len]) {
-            if (rec.ssid[len] < 0x20 || rec.ssid[len] > 0x7e) { len = 0; break; }
-            ssid[len] = (char)rec.ssid[len];
-            ++len;
-        }
-        if (!len || rec.rssi >= 0 || rec.rssi < -100) continue;
-        snprintf(keep_ssid[kept], sizeof(keep_ssid[kept]), "%s", ssid);
-        keep_rssi[kept] = rec.rssi;
-        ++kept;
-    }
     portENTER_CRITICAL(&s_lock);
-    s_wifi.scan_raw = reported;
-    s_wifi.ap_count = kept;
-    for (unsigned i = 0; i < kept; ++i) {
-        memcpy(s_wifi.ap_ssid[i], keep_ssid[i], sizeof(s_wifi.ap_ssid[i]));
-        s_wifi.ap_rssi[i] = keep_rssi[i];
-    }
+    s_wifi.scanning = false;
+    s_wifi.scan_error = error;
+    s_wifi.scan_done_seq = s_wifi.scan_seq;
+    s_scan_ready = false;
+    if (s_wifi.state == BSP_WIFI_SCANNING) s_wifi.state = BSP_WIFI_READY;
     portEXIT_CRITICAL(&s_lock);
-    ESP_LOGI(TAG, "scan done: reported=%u seen=%u kept=%u", (unsigned)reported, seen, kept);
 }
 
-/* All radio work runs here, never on app_main: one scan costs more stack than
- * the main task can spare once the Hosted RPC chain is inlined, and a smashed
- * app_main frame shows up as a load fault far away from this code. */
+static void collect_scan_results(void)
+{
+    /* Bulk API frees its driver snapshot. Bounded static storage avoids the
+     * tiny event stack and a truncated scan cannot leak leftover AP records. */
+    static wifi_ap_record_t records[WIFI_SCAN_MAX];
+    uint16_t reported = 0, count = WIFI_SCAN_MAX;
+    esp_err_t err = esp_wifi_scan_get_ap_num(&reported);
+    if (err == ESP_OK) err = esp_wifi_scan_get_ap_records(&count, records);
+    esp_err_t clear = esp_wifi_clear_ap_list();
+    if (err == ESP_OK && clear != ESP_OK) err = clear;
+    char names[WIFI_MAX_AP][33] = {{0}};
+    int signal[WIFI_MAX_AP] = {0};
+    unsigned kept = 0;
+    if (err == ESP_OK) {
+        for (unsigned i = 0; i < count && i < WIFI_SCAN_MAX && kept < WIFI_MAX_AP; ++i) {
+            const wifi_ap_record_t *ap = &records[i];
+            size_t len = strnlen((const char *)ap->ssid, 32);
+            if (!len || ap->rssi > 0 || ap->rssi < -127) continue;
+            bool control = false, duplicate = false;
+            for (size_t k = 0; k < len; ++k)
+                if (ap->ssid[k] < 0x20 || ap->ssid[k] == 0x7f) control = true;
+            for (unsigned k = 0; k < kept; ++k)
+                if (strlen(names[k]) == len && !memcmp(names[k], ap->ssid, len)) duplicate = true;
+            if (control || duplicate) continue;
+            /* UTF-8 and unknown glyphs remain real network identities. */
+            memcpy(names[kept], ap->ssid, len);
+            signal[kept++] = ap->rssi;
+        }
+        portENTER_CRITICAL(&s_lock);
+        s_wifi.scan_raw = reported;
+        s_wifi.ap_count = kept;
+        memcpy(s_wifi.ap_ssid, names, sizeof(names));
+        memcpy(s_wifi.ap_rssi, signal, sizeof(signal));
+        portEXIT_CRITICAL(&s_lock);
+    }
+    finish_scan(err); /* Failed RPC retains last good list; empty success clears it. */
+    ESP_LOGI(TAG, "scan complete: raw=%u cached=%u error=%d", reported, kept, err);
+}
+
+static void start_scan(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_scan_ready = false;
+    s_scan_deadline = esp_timer_get_time() / 1000 + 20000;
+    if (!s_wifi.ip[0]) s_wifi.state = BSP_WIFI_SCANNING;
+    portEXIT_CRITICAL(&s_lock);
+    wifi_scan_config_t scan = {0};
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan.scan_time.active.min = 60;
+    scan.scan_time.active.max = 150;
+    esp_err_t err = esp_wifi_scan_start(&scan, false);
+    if (err != ESP_OK) finish_scan(err);
+}
+
+/* Factored owner tick is exercised with deterministic IDF doubles in tests.
+ * No worker, event, UI callback or NVS operation runs on the display task. */
+static void service_step(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool ready = s_radio_ready;
+    bool done = s_scan_ready;
+    uint32_t scan_status = s_scan_status;
+    bool scan_timeout = s_wifi.scanning && s_req.kind != REQ_SCAN &&
+                        esp_timer_get_time() / 1000 >= s_scan_deadline;
+    portEXIT_CRITICAL(&s_lock);
+    if (!ready) {
+        if (get_state() == BSP_WIFI_ERROR) {
+            portENTER_CRITICAL(&s_lock);
+            bool pending = s_wifi.scanning;
+            wipe(&s_req, sizeof(s_req));
+            int error = s_wifi.error;
+            portEXIT_CRITICAL(&s_lock);
+            if (pending) finish_scan(error);
+        }
+        return;
+    }
+    if (done) {
+        if (!scan_status) collect_scan_results();
+        else { (void)esp_wifi_clear_ap_list(); finish_scan(ESP_FAIL); }
+    } else if (scan_timeout) {
+        (void)esp_wifi_scan_stop();
+        (void)esp_wifi_clear_ap_list();
+        portENTER_CRITICAL(&s_lock);
+        s_scan_cooldown = esp_timer_get_time() / 1000 + 1000;
+        portEXIT_CRITICAL(&s_lock);
+        finish_scan(ESP_ERR_TIMEOUT);
+    }
+    char ssid[33] = {0}, pass[65] = {0};
+    req_kind_t kind = REQ_NONE;
+    bool connect = false, persist = false, timeout = false;
+    char saved_ssid[33] = {0}, saved_pass[65] = {0};
+    portENTER_CRITICAL(&s_lock);
+    if (s_save_pending) {
+        s_save_pending = false;
+        persist = true;
+        memcpy(saved_ssid, s_wifi.ssid, sizeof(saved_ssid));
+        memcpy(saved_pass, s_target_pass, sizeof(saved_pass));
+    }
+    if (s_connect_pending && !s_disconnect_wait) {
+        s_connect_pending = false;
+        connect = true;
+    }
+    if (s_wifi.state == BSP_WIFI_JOINING && s_req.kind == REQ_NONE &&
+        esp_timer_get_time() / 1000 >= s_join_deadline) {
+        s_wifi.state = BSP_WIFI_ERROR;
+        s_wifi.error = ESP_ERR_TIMEOUT;
+        s_disconnect_wait = s_connect_pending = s_link_up = false;
+        s_rejoin_at_ms = s_rejoin_left ? esp_timer_get_time() / 1000 + 5000 : 0;
+        timeout = true; connect = false;
+    }
+    if (s_req.kind != REQ_NONE) {
+        kind = s_req.kind;
+        memcpy(ssid, s_req.ssid, sizeof(ssid));
+        memcpy(pass, s_req.pass, sizeof(pass));
+        wipe(&s_req, sizeof(s_req));
+    } else if (s_rejoin_left > 0 && s_rejoin_at_ms && !s_wifi.scanning &&
+               s_wifi.state != BSP_WIFI_JOINING && esp_timer_get_time() / 1000 >= s_rejoin_at_ms) {
+        kind = REQ_JOIN;
+        memcpy(ssid, s_wifi.ssid, sizeof(ssid));
+        memcpy(pass, s_target_pass, sizeof(pass));
+        --s_rejoin_left;
+        s_rejoin_at_ms = 0;
+        s_wifi.state = BSP_WIFI_JOINING;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (persist) {
+        bool ok = save_credentials(saved_ssid, saved_pass);
+        wifi_ap_record_t ap;
+        int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+        portENTER_CRITICAL(&s_lock);
+        s_wifi.save_error = ok ? 0 : ESP_FAIL;
+        if (ok) {
+            memcpy(s_saved_ssid, saved_ssid, sizeof(s_saved_ssid));
+            memcpy(s_saved_pass, saved_pass, sizeof(s_saved_pass));
+        }
+        if (s_wifi.state == BSP_WIFI_ONLINE) s_wifi.rssi = rssi;
+        portEXIT_CRITICAL(&s_lock);
+    }
+    wipe(saved_pass, sizeof(saved_pass));
+    if (timeout) (void)esp_wifi_disconnect();
+    if (connect) connect_now();
+    if (kind == REQ_SCAN) start_scan();
+    else if (kind != REQ_NONE) join_now(ssid, pass);
+    wipe(pass, sizeof(pass));
+}
+
 static void service_worker(void *arg)
 {
     (void)arg;
-    for (;;) {
-        if (s_scan_ready) {
-            s_scan_ready = false;
-            collect_scan_results();
-        }
-        /* Bounded re-join after an unexpected drop. */
-        if (s_rejoin_left > 0 && get_state() == BSP_WIFI_READY &&
-            esp_timer_get_time() / 1000 >= s_rejoin_at_ms) {
-            portENTER_CRITICAL(&s_lock);
-            bool idle = s_req.kind == REQ_NONE;
-            if (idle) {
-                s_req.kind = REQ_JOIN;
-                snprintf(s_req.ssid, sizeof(s_req.ssid), "%s", s_saved_ssid);
-                s_req.pass[0] = 0;   /* the worker reloads the stored password */
-            }
-            portEXIT_CRITICAL(&s_lock);
-            if (idle) {
-                --s_rejoin_left;
-                s_rejoin_at_ms = esp_timer_get_time() / 1000 + 5000;
-            }
-        }
-        req_kind_t kind;
-        char ssid[33], pass[65];
-        portENTER_CRITICAL(&s_lock);
-        kind = s_req.kind;
-        snprintf(ssid, sizeof(ssid), "%s", s_req.ssid);
-        snprintf(pass, sizeof(pass), "%s", s_req.pass);
-        s_req.kind = REQ_NONE;
-        portEXIT_CRITICAL(&s_lock);
-        if (kind != REQ_NONE) {
-            bsp_wifi_state_t state = get_state();
-            if (state == BSP_WIFI_READY || state == BSP_WIFI_ONLINE || state == BSP_WIFI_ERROR) {
-                if (kind == REQ_SCAN) {
-                    /* Keep a live association; the UI shows the scan list. */
-                    if (get_state() != BSP_WIFI_ONLINE) set_state(BSP_WIFI_SCANNING, 0);
-                    /* Shorter active dwell: a dual-band sweep with the default
-                       timing takes ~10 s, which reads as "the button is dead". */
-                    wifi_scan_config_t scan;
-                    memset(&scan, 0, sizeof(scan));
-                    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-                    scan.scan_time.active.min = 60;
-                    scan.scan_time.active.max = 150;
-                    esp_err_t err = esp_wifi_scan_start(&scan, false);
-                    if (err != ESP_OK) {
-                        ESP_LOGW(TAG, "scan: %s", esp_err_to_name(err));
-                        set_state(BSP_WIFI_READY, err);
-                    }
-                } else {
-                    /* REQ_SET already persisted the credentials; REQ_JOIN reloads them. */
-                    if (kind == REQ_JOIN && (!pass[0] || strcmp(ssid, s_saved_ssid) != 0)) {
-                        char saved[33], stored[65];
-                        if (load_credentials(saved, sizeof(saved), stored, sizeof(stored)) &&
-                            strcmp(saved, ssid) == 0)
-                            snprintf(pass, sizeof(pass), "%s", stored);
-                    }
-                    join_now(ssid, pass);
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
+    for (;;) { service_step(); vTaskDelay(pdMS_TO_TICKS(20)); }
 }
 
 void bsp_wifi_hosted_service(void)
@@ -529,15 +691,17 @@ void bsp_wifi_hosted_service(void)
 void bsp_wifi_hosted_init(void)
 {
     portENTER_CRITICAL(&s_lock);
+    if (s_started) { portEXIT_CRITICAL(&s_lock); return; }
+    s_started = true;
     memset(&s_wifi, 0, sizeof(s_wifi));
-    s_wifi.state = BSP_WIFI_OFF;
+    s_wifi.state = BSP_WIFI_STARTING;
     memset(&s_req, 0, sizeof(s_req));
     portEXIT_CRITICAL(&s_lock);
-    if (xTaskCreate(bringup_worker, "wifi_bringup", 8192, NULL, 2, NULL) != pdPASS) {
+    if (xTaskCreate(service_worker, "wifi_service", 10240, NULL, 2, NULL) != pdPASS) {
         set_state(BSP_WIFI_ERROR, ESP_ERR_NO_MEM);
         return;
     }
-    if (xTaskCreate(service_worker, "wifi_service", 8192, NULL, 2, NULL) != pdPASS)
+    if (xTaskCreate(bringup_worker, "wifi_bringup", 8192, NULL, 2, NULL) != pdPASS)
         set_state(BSP_WIFI_ERROR, ESP_ERR_NO_MEM);
 }
 
@@ -552,25 +716,40 @@ static const char *state_name(bsp_wifi_state_t state)
 static void report(const char *token)
 {
     bsp_wifi_status_t s = bsp_wifi_hosted_status();
-    char line[256];
+    char encoded[65];
+    size_t len = strlen(s.ssid);
+    for (size_t n = 0; n < len; ++n) snprintf(encoded+n*2,3,"%02x",(unsigned char)s.ssid[n]);
+    encoded[len*2] = 0;
+    char line[448];
     snprintf(line, sizeof(line),
-             "MEO:WIFI token=%s state=%s stage=%s error=%d en=%d ssid=%s rssi=%d ip=%s aps=%u raw=%u\n",
+             "MEO:WIFI token=%s state=%s stage=%s error=%d en=%d ssid_hex=%s rssi=%d ip=%s aps=%u raw=%u scanning=%u scan_seq=%u scan_done=%u scan_error=%d save_error=%d radio=%u reset=0\n",
              token, state_name(s.state), s_stage, s.error, gpio_get_level(PIN_C5_RESET),
-             s.ssid[0] ? s.ssid : "-", s.rssi, s.ip[0] ? s.ip : "-", s.ap_count, s.ap_raw);
+             encoded[0] ? encoded : "-", s.rssi, s.ip[0] ? s.ip : "-", s.ap_count, s.ap_raw,
+             s.scanning, (unsigned)s.scan_seq, (unsigned)s.scan_done_seq, s.scan_error, s.save_error, s.radio_ready);
     (void)bsp_usb_cdc_write(line);
 }
 
-static void report_scan(const char *token)
+static void report_scan(const char *token, int index)
 {
-    char ssid[WIFI_MAX_AP][33];
-    int rssi[WIFI_MAX_AP];
-    unsigned count = bsp_wifi_ap_list(ssid, rssi, WIFI_MAX_AP);
-    char line[416];
-    int n = snprintf(line, sizeof(line), "MEO:WIFI_SCAN token=%s count=%u list=", token, count);
-    for (unsigned i = 0; i < count && n < (int)sizeof(line); ++i)
-        n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%u:%d:%s", i ? "," : "", i, rssi[i], ssid[i]);
-    if (count) snprintf(line + n, sizeof(line) - (size_t)n, "\n");
-    else snprintf(line, sizeof(line), "MEO:WIFI_SCAN token=%s count=0 list=\n", token);
+    char names[WIFI_MAX_AP][33]; int rssi[WIFI_MAX_AP];
+    bsp_wifi_status_t s;
+    unsigned count = bsp_wifi_snapshot(names, rssi, WIFI_MAX_AP, &s);
+    char line[256];
+    if (index < 0) {
+        snprintf(line, sizeof(line), "MEO:WIFI_SCAN token=%s seq=%u done=%u scanning=%u error=%d count=%u encoding=hex\n",
+                 token,(unsigned)s.scan_seq,(unsigned)s.scan_done_seq,s.scanning,s.scan_error,count);
+    } else if ((unsigned)index < count) {
+        char encoded[65];
+        size_t len = strlen(names[index]);
+        for (size_t n = 0; n < len; ++n) snprintf(encoded+n*2,3,"%02x",(unsigned char)names[index][n]);
+        encoded[len*2] = 0;
+        snprintf(line,sizeof(line),"MEO:WIFI_AP token=%s seq=%u index=%d rssi=%d ssid_hex=%s\n",
+                 token,(unsigned)s.scan_done_seq,index,rssi[index],encoded);
+    } else {
+        snprintf(line,sizeof(line),"MEO:WIFI_REJECT token=%s reason=ap_index\n",token);
+    }
+    /* Each reply fits the real 512-byte CDC admission gate. Never batch six
+     * long SSIDs into a silently dropped oversized USB record. */
     (void)bsp_usb_cdc_write(line);
 }
 
@@ -579,9 +758,13 @@ bool bsp_wifi_hosted_command(const char *line)
     if (!line || strncmp(line, "WIFI ", 5) != 0) return false;
     char verb[12] = {0}, token[17] = {0};
     int used = 0;
-    if (sscanf(line, "WIFI %11s %16s %n", verb, token, &used) != 2) return true;
+    if (sscanf(line, "WIFI %11s %16s%n", verb, token, &used) != 2) return true;
     for (const char *p = token; *p; ++p) if (!isalnum((unsigned char)*p)) return true;
+    if (line[used] && !isspace((unsigned char)line[used])) return true;
     const char *rest = line + used;      /* arguments after "<verb> <token> " */
+    while (isspace((unsigned char)*rest)) ++rest;
+    if ((!strcmp(verb,"STATUS") || !strcmp(verb,"SCAN") || !strcmp(verb,"RETRY") ||
+         !strcmp(verb,"APS")) && *rest) return true;
     char reply[128];
     if (strcmp(verb, "STATUS") == 0) {
         report(token);
@@ -589,24 +772,33 @@ bool bsp_wifi_hosted_command(const char *line)
         bool queued = bsp_wifi_scan();
         snprintf(reply, sizeof(reply), "MEO:WIFI_ACCEPT token=%s op=SCAN queued=%u\n", token, queued);
         (void)bsp_usb_cdc_write(reply);
-        if (queued) report_scan(token);  /* previous results, if any */
     } else if (strcmp(verb, "RETRY") == 0) {
-        /* Re-run the transport bring-up without rebooting the board. */
-        bool ok = get_state() == BSP_WIFI_ERROR &&
-                  xTaskCreate(bringup_worker, "wifi_retry", 8192, NULL, 2, NULL) == pdPASS;
+        /* Retry a radio scan only; transport faults require explicit diagnosis. */
+        bool ok = bsp_wifi_scan(); /* radio retry only; NEVER spawn/reset transport */
         snprintf(reply, sizeof(reply), "MEO:WIFI_ACCEPT token=%s op=RETRY queued=%u\n", token, ok);
         (void)bsp_usb_cdc_write(reply);
     } else if (strcmp(verb, "APS") == 0) {
-        report_scan(token);
+        report_scan(token, -1);
+    } else if (strcmp(verb, "AP") == 0) {
+        int index; char extra;
+        if (sscanf(rest, "%d %c", &index, &extra) == 1 && index >= 0) report_scan(token, index);
     } else if (strcmp(verb, "JOIN") == 0) {
         char ssid[33] = {0};
-        bool queued = sscanf(rest, "%32s", ssid) == 1 && bsp_wifi_join_saved(ssid);
+        char extra;
+        bool queued = strcspn(rest," \t\r\n") <= 32 &&
+                      sscanf(rest, "%32s %c", ssid, &extra) == 1 && bsp_wifi_join_saved(ssid);
         snprintf(reply, sizeof(reply), "MEO:WIFI_ACCEPT token=%s op=JOIN queued=%u\n", token, queued);
         (void)bsp_usb_cdc_write(reply);
     } else if (strcmp(verb, "SET") == 0) {
         char ssid[33] = {0}, pass[65] = {0};
-        int fields = sscanf(rest, "%32s %64s", ssid, pass);
-        bool queued = fields >= 1 && bsp_wifi_set_credentials(ssid, fields == 2 ? pass : "");
+        char extra;
+        size_t name_len = strcspn(rest," \t\r\n");
+        const char *key = rest + name_len;
+        while (isspace((unsigned char)*key)) ++key;
+        int fields = sscanf(rest, "%32s %64s %c", ssid, pass, &extra);
+        bool queued = name_len<=32 && strcspn(key," \t\r\n")<=64 &&
+                      (fields == 1 || fields == 2) && bsp_wifi_set_credentials(ssid, fields == 2 ? pass : "");
+        wipe(pass, sizeof(pass));
         snprintf(reply, sizeof(reply), "MEO:WIFI_ACCEPT token=%s op=SET queued=%u\n", token, queued);
         (void)bsp_usb_cdc_write(reply);
     } else {

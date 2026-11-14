@@ -21,6 +21,16 @@ esp_err_t bsp_usb_hid_gesture(const uint8_t *report, size_t len);
 typedef void (*bsp_usb_line_cb_t)(const char *line, void *ctx);
 void bsp_usb_set_line_callback(bsp_usb_line_cb_t cb, void *ctx);
 
+/* A bounded binary receive lane for device data streams.  CDC remains the
+   control/download channel; callers explicitly enter this mode after a
+   short ASCII command, then receive arbitrary bytes until the owner leaves
+   it.  The callback must not block and must consume the whole supplied
+   buffer. */
+typedef void (*bsp_usb_binary_rx_cb_t)(const uint8_t *data, size_t len, void *ctx);
+void bsp_usb_set_binary_rx_callback(bsp_usb_binary_rx_cb_t cb, void *ctx);
+void bsp_usb_set_binary_rx(bool enabled);
+bool bsp_usb_binary_rx_enabled(void);
+
 /* 主动往 CDC 写一行（不经过 ESP_LOG，主机脚本用它读机器可读的 DEMO: 行） */
 /* Nonblocking, newline-terminated record, at most the configured CDC TX size.
  * ESP_OK means the entire record was queued, not delivered. Saturation or

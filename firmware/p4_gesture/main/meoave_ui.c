@@ -2,6 +2,7 @@
  * Logical coordinates use the complete 460x460 square panel. The proven ESP display
  * port owns 180-degree pixel rotation and LVGL owns pointer rotation once. */
 #include "meoave_ui.h"
+#include "meoave_icons.h"
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
 #include "fls2_display_diag.h"
@@ -60,15 +61,31 @@ LV_FONT_DECLARE(meo_font_44);
 #define GALLERY_MARGIN     56
 #define BACK_DRAG_SLOP     12
 #define BACK_COMMIT_PX     80
+#define SETTINGS_ROW_H     88
+#define SETTINGS_ROW_STEP  100
+#define WIFI_LIST_Y        128
+#define WIFI_LIST_H        316
+#define WIFI_ROW_H         72
+#define WIFI_ROW_STEP      80
+#define WIFI_NAME_X        66
+#define WIFI_NAME_W        194
+#define POWER_BODY_W       56
+#define POWER_BODY_H       28
+#define POWER_BORDER       2
+#define POWER_FILL_W       (POWER_BODY_W - POWER_BORDER * 2)
+#define POWER_FILL_H       (POWER_BODY_H - POWER_BORDER * 2)
 
 enum { ACT_HOME=1, ACT_APPS, ACT_SETTINGS, ACT_WIFI, ACT_BREATHE,
        ACT_DISPLAY, ACT_ACCESSIBILITY, ACT_DIM, ACT_BRIGHT,
        ACT_SLOT_LEFT, ACT_SLOT_RIGHT, ACT_WIFI_SCAN,
-       ACT_WIFI_AP0, ACT_WIFI_AP1, ACT_SPEAKER, ACT_VOL_DOWN, ACT_VOL_UP,
+       ACT_WIFI_AP0 = 32, ACT_WIFI_AP1, ACT_SPEAKER = 40, ACT_VOL_DOWN, ACT_VOL_UP,
        ACT_SPK_TEST, ACT_AUDIO_LOOP,
        ACT_PWD_KEY0 = 64,                 /* +0..9 digits, +10 delete, +11 ok */
-       ACT_PWD_MODE = 80, ACT_PWD_EYE, ACT_MIC, ACT_MIC_TEST };
-#define WIFI_ROWS 2
+       ACT_PWD_MODE = 80, ACT_PWD_EYE, ACT_MIC, ACT_MIC_TEST,
+       ACT_GAIN_DOWN, ACT_GAIN_UP, ACT_PWD_NEXT,
+       ACT_EXPRESSIONS, ACT_FACE_PREV, ACT_FACE_NEXT, ACT_FACE_MOUTH, ACT_FACE_PLAY,
+       ACT_FACE_LEVEL };
+#define WIFI_ROWS 6
 typedef struct {
     lv_obj_t *rail, *tiles[GALLERY_COUNT], *captions[GALLERY_VISIBLE];
     lv_obj_t *titles[GALLERY_VISIBLE], *dots[APP_COUNT];
@@ -83,7 +100,10 @@ typedef struct {
 enum { PWD_ABC = 0, PWD_UPPER, PWD_DIGIT, PWD_SYM };
 static const char *const pwd_t9[10] = {"", "", "abc", "def", "ghi", "jkl",
                                        "mno", "pqrs", "tuv", "wxyz"};
-static const char pwd_sym[10] = {'_', '-', '.', '@', '!', '#', '$', '%', '&', '*'};
+/* Every printable ASCII symbol, including space. Symbol keys cycle like T9. */
+static const char *const pwd_symbols[10] = {
+    " _", "-+=", ".,;:", "@/\\", "!?\"'", "#~`", "$^{}", "%|<>", "&()", "*[]"
+};
 static const int pwd_key_digit[PWD_KEY_COUNT] = {1,2,3,4,5,6,7,8,9,0,-1,-2};
 static struct {
     char ssid[33];
@@ -96,37 +116,84 @@ static struct {
     uint64_t last_ms;
 } s_pwd = {.mode = PWD_ABC, .mask = true, .last_key = -1};
 
+/* Both faces use the same renderer; the preview owns separate model/cache
+ * state so it can never overwrite an AI hold, gaze sample or home animation. */
+typedef struct {
+    lv_obj_t *eye[2], *pupil[2];
+    lv_point_precise_t points[2][EYE_POINTS];
+    bool valid;
+    int x[2], y[2], width[2], count[2];
+    lv_point_precise_t shown[2][EYE_POINTS];
+    int pupil_x[2], pupil_y[2];
+    bool pupil_on[2];
+    lv_obj_t *mouth[2];
+    lv_point_precise_t mouth_points[2][EYE_POINTS];
+    bool mouth_valid;
+} face_view_t;
+
+static const char *const expression_labels[MEO_EYE_COUNT] = {
+    "平静", "开心", "好奇", "困倦", "惊讶", "眨眼", "难过",
+    "兴奋", "害羞", "喜爱", "得意", "疑惑", "担心", "生气", "专注", "安心",
+};
+#define FACE_STEP_MS 2400u
 
 static struct {
     meo_model_t model;
     meo_ui_config_t config;
-    lv_obj_t *pages[MEO_PAGE_COUNT], *eye[2], *pupil[2];
-    lv_point_precise_t eye_points[2][EYE_POINTS];
-    lv_obj_t *brightness, *slider, *save_labels[3], *motion, *brightness_summary, *motion_summary;
+    lv_obj_t *pages[MEO_PAGE_COUNT];
+    face_view_t home_face;
+    lv_obj_t *home_capture_ring, *home_capture_mic;
+    lv_obj_t *home_capture_wave[8];
+    bool home_capture_active, home_wake_detected;
+    uint32_t home_wave_seq;
+    int home_wave_height[8];
+    struct {
+        meo_model_t model;
+        face_view_t face;
+        lv_obj_t *name, *mouth_button, *mouth_label, *play_button, *play_label, *level_label;
+        unsigned level;
+        uint64_t next_at;
+        bool autoplay, mouth_on;
+    } expression_preview;
+    lv_obj_t *brightness, *slider, *motion, *brightness_summary, *motion_summary;
+    lv_obj_t *interaction_sound;
     /* Speaker page: big percentage, slider, and the summary on the settings row. */
     lv_obj_t *volume, *volume_slider, *volume_summary;
-    /* Live acoustic self-test readout, updated only when the text changes. */
-    lv_obj_t *audio_result, *audio_meta;
-    char audio_result_text[40], audio_meta_text[40];
-    /* Status strip on the home canvas: Wi-Fi mark, percentage, battery gauge. */
-    lv_obj_t *wifi_mark, *power_text, *power_gauge, *power_fill;
-    lv_obj_t *wifi_summary, *wifi_page_mark, *wifi_page_state, *wifi_page_ssid;
+    /* Only on-demand playback errors belong on the product audio page. */
+    lv_obj_t *audio_result;
+    /* Status strip on the app launcher: Wi-Fi mark, percentage, battery gauge. */
+    lv_obj_t *wifi_mark, *power_text, *power_gauge, *power_fill, *power_terminal;
+    lv_obj_t *wifi_summary, *wifi_page_state, *wifi_page_ssid;
     lv_obj_t *wifi_rows[WIFI_ROWS], *wifi_row_ssid[WIFI_ROWS], *wifi_row_rssi[WIFI_ROWS];
+    lv_obj_t *wifi_row_mark[WIFI_ROWS], *wifi_status_mark;
+    int wifi_ap_rssi[WIFI_ROWS];
     lv_obj_t *wifi_hint, *wifi_notice, *wifi_scan_label;
     lv_obj_t *pwd_field, *pwd_text, *pwd_ssid, *pwd_mode, *pwd_eye;
-    lv_obj_t *pwd_keys[12], *pwd_key_labels[12];
-    lv_obj_t *mic_seg[2][MIC_SEGS], *mic_db[2], *mic_state;
-    lv_obj_t *mic_switch, *mic_knob;
+    lv_obj_t *pwd_keys[12], *pwd_key_labels[12], *pwd_next;
+    lv_obj_t *mic_seg[2][MIC_SEGS], *mic_db[2], *mic_state, *mic_summary;
+    lv_obj_t *mic_gain_slider, *mic_gain_value, *pwd_notice, *save_notice, *wifi_list;
+    lv_obj_t *settings_list;
+    bool settings_scrolling, settings_press_interrupted;
+    bool wifi_scrolling, wifi_press_interrupted;
+    lv_obj_t *preview_button, *preview_label;
+    uint64_t save_hide_at, pwd_notice_hide_at;
+    uint64_t shutdown_end_ms;
+    int shutdown_progress;
+    bool preview_busy;
     int8_t mic_lit[2][MIC_SEGS];   /* -1 = not painted yet */
-    int16_t mic_db_shown[2];
     int last_rate_tenths;          /* -1 = label cleared */
     float mic_target[2], mic_shown[2];
     char wifi_ap_ssid[WIFI_ROWS][33];
     unsigned wifi_ap_visible;
-    lv_obj_t *shutdown_layer, *shutdown_number, *shutdown_title, *shutdown_arc, *shutdown_hint, *shutdown_glow;
+    lv_obj_t *shutdown_layer, *shutdown_number, *shutdown_title, *shutdown_arc, *shutdown_hint;
     int battery_percent;
     bool charging;
     meo_wifi_state_t wifi_state;
+    bool wifi_scanning;
+    char wifi_connected_ssid[33];
+    uint32_t wifi_scan_done;
+    int wifi_save_error;
+    lv_obj_t *wifi_scan_button;
     gallery_t apps;
     lv_obj_t *bloom, *number;
     float bloom_level;
@@ -140,6 +207,8 @@ static struct {
     int back_offset;
     bool pointer_down, back_candidate, back_dragging, back_settling, back_commit;
     bool navigating, tap_moved, gallery_press_moving, press_blocked;
+    bool caption_candidate, caption_dragging;
+    int caption_scroll_start;
     bool ready;
 } ui;
 
@@ -190,14 +259,10 @@ static void label_text_if_changed(lv_obj_t *o, const char *text)
     lv_label_set_text(o, text);
 }
 
-/* Icons are native draw primitives, not private-use text glyphs. Keep their
- * geometry inside a 32-unit canvas and render at the requested pixel size;
- * never scale a label through a temporary transformed layer. USER_1 marks
- * passive icon objects for real-render regression checks. */
-typedef enum { ICON_LEFT=1, ICON_RIGHT, ICON_WIFI, ICON_SUN, ICON_EYE,
-               ICON_MINUS, ICON_PLUS, ICON_GEAR, ICON_FACE, ICON_FLOWER,
-               ICON_SPEAKER } icon_kind_t;
-
+/* Standard controls use the vendored Lucide SVG library, rasterized to A8 at
+ * each exact native size. No missing font glyphs, enlarged bitmaps, transformed
+ * layers or repeated arc-mask allocation. Product face/bloom marks stay native.
+ * USER_1 marks passive artwork for real-render regression checks. */
 typedef struct {
     lv_layer_t *layer;
     lv_area_t area;
@@ -219,18 +284,6 @@ static void icon_line(const icon_draw_t *d, float x1,float y1,float x2,float y2)
     line.color=d->ink; line.opa=LV_OPA_COVER; line.width=d->stroke;
     line.round_start=line.round_end=1;
     lv_draw_line(d->layer,&line);
-}
-
-static void icon_arc(const icon_draw_t *d, float x,float y,float radius,int start,int end)
-{
-    lv_draw_arc_dsc_t arc;
-    lv_draw_arc_dsc_init(&arc);
-    lv_point_precise_t center=icon_point(d,x,y);
-    arc.center=(lv_point_t){(int32_t)center.x,(int32_t)center.y};
-    arc.radius=(uint16_t)lroundf(radius*d->size/32.0f);
-    arc.width=d->stroke; arc.color=d->ink; arc.opa=LV_OPA_COVER;
-    arc.rounded=1; arc.start_angle=start; arc.end_angle=end;
-    lv_draw_arc(d->layer,&arc);
 }
 
 /* Launcher mark: six opaque, curved, variable-width strokes. Rounded
@@ -304,11 +357,9 @@ static void draw_breath_bloom(lv_event_t *event)
     }
 }
 
-/* Level-of-detail switch. A screen transition redraws BOTH screen trees on
- * every frame; a single ICON_FLOWER is 192 antialiased line draws, ICON_EYE
- * 24, the Wi-Fi mark four arcs. On apps/settings that measured 80-90 ms per
- * frame (13-15 fps). During the 180 ms swipe a soft dot reads the same at
- * speed and keeps rasterisation under a millisecond. */
+/* Only the procedural face/bloom marks need the existing transition LOD.
+ * Standard Lucide masks stay fully detailed even during movement; they do
+ * not allocate arc masks or need a second "restore all icons" repaint. */
 #define ICON_REGISTRY_MAX 96
 #define ICON_RESTORE_BATCH 8
 static lv_obj_t *s_icons[ICON_REGISTRY_MAX];
@@ -378,6 +429,13 @@ static void draw_icon(lv_event_t *event)
     lv_obj_get_coords(o,&d.area);
     d.stroke=(d.size*3+16)/32;
     if (d.stroke<2) d.stroke=2;
+    const lv_image_dsc_t *asset=meo_icon_asset((icon_kind_t)(uintptr_t)lv_obj_get_user_data(o),d.size);
+    if (asset) {
+        lv_draw_image_dsc_t image; lv_draw_image_dsc_init(&image);
+        image.src=asset; image.recolor=d.ink; image.recolor_opa=LV_OPA_COVER;
+        lv_draw_image(d.layer,&image,&d.area);
+        return;
+    }
     if (lv_obj_has_flag(o, LV_OBJ_FLAG_USER_3)) {
         lv_draw_rect_dsc_t dot;
         lv_draw_rect_dsc_init(&dot);
@@ -389,44 +447,6 @@ static void draw_icon(lv_event_t *event)
         return;
     }
     switch ((icon_kind_t)(uintptr_t)lv_obj_get_user_data(o)) {
-    case ICON_LEFT:
-        icon_line(&d,21,6,11,16); icon_line(&d,11,16,21,26); break;
-    case ICON_RIGHT:
-        icon_line(&d,11,6,21,16); icon_line(&d,21,16,11,26); break;
-    case ICON_WIFI:
-        icon_arc(&d,16,28,22,225,315);
-        icon_arc(&d,16,28,14,225,315);
-        icon_arc(&d,16,28,6,225,315);
-        icon_arc(&d,16,28,2,0,360); break;
-    case ICON_SUN:
-        icon_arc(&d,16,16,7,0,360);
-        for (int i=0;i<8;++i) {
-            float a=i*PI/4;
-            icon_line(&d,16+cosf(a)*11,16+sinf(a)*11,
-                         16+cosf(a)*14,16+sinf(a)*14);
-        }
-        break;
-    case ICON_EYE:
-        for (int i=0;i<12;++i) {
-            float a=i*PI/12, b=(i+1)*PI/12;
-            icon_line(&d,3+26.0f*i/12,16-8*sinf(a),3+26.0f*(i+1)/12,16-8*sinf(b));
-            icon_line(&d,3+26.0f*i/12,16+8*sinf(a),3+26.0f*(i+1)/12,16+8*sinf(b));
-        }
-        icon_arc(&d,16,16,4,0,360); break;
-    case ICON_MINUS: case ICON_PLUS:
-        icon_line(&d,7,16,25,16);
-        if ((icon_kind_t)(uintptr_t)lv_obj_get_user_data(o)==ICON_PLUS)
-            icon_line(&d,16,7,16,25);
-        break;
-    case ICON_GEAR:
-        d.stroke=LV_MAX(2,d.size*5/32);
-        for (int n=0; n<8; ++n) {
-            float a=n*PI/4;
-            icon_line(&d,16+cosf(a)*9,16+sinf(a)*9,
-                         16+cosf(a)*12,16+sinf(a)*12);
-        }
-        d.stroke=LV_MAX(2,d.size*5/32);
-        icon_arc(&d,16,16,10,0,360); break;
     case ICON_FACE:
         /* A friendly, solid smile-eye mark, not two generic pill containers.
          * Warm ivory belongs to the App mark only. Home remains black/white. */
@@ -442,33 +462,22 @@ static void draw_icon(lv_event_t *event)
         break;
     case ICON_FLOWER:
         draw_bloom(&d,1,-.10f); break;
-    case ICON_SPEAKER:
-        /* Body + cone on the left, sound waves drawn as three short strokes.
-           Deliberately arc-free: the page shows this icon twice at once, and
-           eight lv_draw_arc masks in one frame was enough to exhaust the
-           render buffers on the board (the page reset the chip on entry). */
-        icon_line(&d,3,13,8,13);
-        icon_line(&d,8,13,14,6);
-        icon_line(&d,14,6,14,26);
-        icon_line(&d,14,26,8,19);
-        icon_line(&d,8,19,3,19);
-        icon_line(&d,3,19,3,13);
-        icon_line(&d,18,13,18,19);
-        icon_line(&d,22,10,22,22);
-        icon_line(&d,26,7,26,25);
-        break;
+    default: break;
     }
 }
 
 static lv_obj_t *icon(lv_obj_t *parent, icon_kind_t kind,int size,uint32_t ink)
 {
+    LV_ASSERT_MSG(kind==ICON_FACE || kind==ICON_FLOWER || meo_icon_asset(kind,size),
+                  "Missing native-size Lucide asset");
     lv_obj_t *o=box(parent,0,0,size,size,0,0);
     lv_obj_set_style_bg_opa(o,LV_OPA_TRANSP,0);
     lv_obj_set_style_line_color(o,color(ink),0);
     lv_obj_add_flag(o,LV_OBJ_FLAG_USER_1);
     lv_obj_set_user_data(o,(void *)(uintptr_t)kind);
     lv_obj_add_event_cb(o,draw_icon,LV_EVENT_DRAW_MAIN,NULL);
-    if (s_icon_count < ICON_REGISTRY_MAX) s_icons[s_icon_count++]=o;
+    if ((kind==ICON_FACE || kind==ICON_FLOWER) && s_icon_count<ICON_REGISTRY_MAX)
+        s_icons[s_icon_count++]=o;
     return o;
 }
 
@@ -478,14 +487,45 @@ static void warmup_abort(void);
 static void track_pointer_motion(lv_event_t *event);
 static void update_breathe(void);
 static void shutdown_create(void);
-static void anim_text_opa(void *obj, int32_t value);
-static void glow_tick(void);
-static void mic_switch_paint(bool on);
+static void anim_text_opa(void *obj, int32_t value)
+{ lv_obj_set_style_text_opa(obj, (lv_opa_t)value, 0); }
+static void visible(lv_obj_t *o, bool show);
+static void shutdown_tick(void);
 static void pwd_tap_digit(int digit, uint64_t now);
 static void pwd_backspace(void);
 static void pwd_submit(void);
 static void pwd_mode_paint(void);
 static void pwd_render(void);
+static void pwd_commit(void);
+static void refresh_wifi_info(void);
+static void expression_preview_enter(void);
+static void expression_preview_select(int delta);
+static void expression_preview_controls(void);
+static void expression_preview_tick(void);
+static void page_leaving(meo_page_t from, meo_page_t to)
+{
+    if (from == MEO_EXPRESSIONS && to != MEO_EXPRESSIONS) {
+        ui.expression_preview.autoplay = false;
+        expression_preview_controls();
+    }
+    if (to == MEO_EXPRESSIONS && from != MEO_EXPRESSIONS) expression_preview_enter();
+    /* AI is the home dial. Keep the capture lease while the dial or the
+       engineering microphone page is visible, and release it everywhere
+       else. This makes the listening indicator describe real hardware state,
+       not merely the page the user last opened. */
+    if (from == MEO_MIC && to != MEO_MIC && ui.config.mic_test)
+        ui.config.mic_test(false);
+    if (to == MEO_MIC && from != MEO_MIC && ui.config.mic_test)
+        ui.config.mic_test(true);
+    if (from == MEO_HOME && to != MEO_HOME && ui.config.ai_mic_test)
+        ui.config.ai_mic_test(false);
+    if (to == MEO_HOME && from != MEO_HOME && ui.config.ai_mic_test)
+        ui.config.ai_mic_test(true);
+    if (from == MEO_PASSWORD && to != MEO_PASSWORD) {
+        memset(s_pwd.text, 0, sizeof(s_pwd.text));
+        s_pwd.len = 0; s_pwd.last_key = -1; pwd_render();
+    }
+}
 static lv_obj_t *button(lv_obj_t *parent, int x, int y, int w, int h,
                         uint32_t bg, const char *text, int id)
 {
@@ -548,13 +588,18 @@ static lv_obj_t *header(lv_obj_t *page, const char *name, int back)
 
 static void save_status(const char *text)
 {
-    for (unsigned i=0;i<3;i++) if (ui.save_labels[i]) lv_label_set_text(ui.save_labels[i],text);
+    if (!ui.save_notice) return;
+    label_text_if_changed(ui.save_notice, text ? text : "");
+    if (text && *text) {
+        lv_obj_remove_flag(ui.save_notice,LV_OBJ_FLAG_HIDDEN);
+        ui.save_hide_at = ui.clock_ms + 5000;
+    } else lv_obj_add_flag(ui.save_notice,LV_OBJ_FLAG_HIDDEN);
 }
 
 static void changed(void)
 {
     if (ui.config.settings_changed) ui.config.settings_changed(&ui.model.settings);
-    save_status(ui.config.settings_changed ? "正在保存设置" : "本次生效 · 尚未保存");
+    save_status(ui.config.settings_changed ? "" : "尚未保存");
 }
 
 static void refresh_settings(void)
@@ -562,11 +607,31 @@ static void refresh_settings(void)
     lv_label_set_text_fmt(ui.brightness, "%u%%", ui.model.settings.brightness);
     lv_label_set_text_fmt(ui.brightness_summary, "%u%%", ui.model.settings.brightness);
     lv_label_set_text(ui.motion_summary, ui.model.settings.reduced_motion ? "减少" : "标准");
+    if (ui.interaction_sound) {
+        if (ui.model.settings.interaction_sound) lv_obj_add_state(ui.interaction_sound, LV_STATE_CHECKED);
+        else lv_obj_remove_state(ui.interaction_sound, LV_STATE_CHECKED);
+    }
     if (ui.volume) lv_label_set_text_fmt(ui.volume, "%u%%", ui.model.settings.volume);
     if (ui.volume_summary) lv_label_set_text_fmt(ui.volume_summary, "%u%%", ui.model.settings.volume);
+    if (ui.mic_gain_value) lv_label_set_text_fmt(ui.mic_gain_value,"%u%%",(ui.model.settings.mic_gain*100+7)/14);
+    if (ui.mic_summary) {
+        char summary[24];
+        snprintf(summary, sizeof(summary), "%u%%", (ui.model.settings.mic_gain*100+7)/14);
+        label_text_if_changed(ui.mic_summary, summary);
+    }
+    lv_obj_t *lists[] = {ui.settings_list, ui.wifi_list};
+    for (unsigned i=0;i<sizeof(lists)/sizeof(lists[0]);++i) {
+        if (!lists[i]) continue;
+        if (ui.model.settings.reduced_motion)
+            lv_obj_remove_flag(lists[i], LV_OBJ_FLAG_SCROLL_MOMENTUM);
+        else lv_obj_add_flag(lists[i], LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    }
 }
 
 static void gallery_present(gallery_t *gallery, bool animate);
+static void gallery_hide_captions(gallery_t *gallery);
+static void gallery_position(gallery_t *gallery);
+static void wifi_request_scan(void);
 
 static gallery_t *current_gallery(void)
 {
@@ -594,11 +659,13 @@ void meo_ui_navigate(meo_page_t page)
     /* Defensive: a NULL slot must never reach lv_screen_load_anim(). */
     if (!ui.pages[page]) return;
     meo_page_t previous = ui.model.page;
+    page_leaving(previous,page);
     ui.model.page = page;
     if (page==MEO_BREATHE) update_breathe();
     /* Entering the network page asks the radio for a fresh scan; the callback
        only queues a request, so this never blocks the GUI task. */
-    if (page==MEO_WIFI && ui.config.wifi_scan) ui.config.wifi_scan();
+    /* Returning from password submission must not race its accepted JOIN. */
+    if (page==MEO_WIFI && previous!=MEO_PASSWORD) wifi_request_scan();
     ui.pointer_down = ui.back_candidate = false;
     bool back = page == meo_page_parent(previous);
     ui.navigating = true;
@@ -705,6 +772,7 @@ static void back_finish(lv_anim_t *animation)
     ui.back_dragging = ui.back_settling = ui.back_candidate = false;
     ui.back_offset = 0;
     if (commit) {
+        page_leaving(from,meo_page_parent(from));
         ui.model.page = meo_page_parent(from);
         ui.navigating = true;
         lv_screen_load(ui.pages[ui.model.page]);
@@ -785,6 +853,18 @@ static void track_pointer_motion(lv_event_t *event)
     lv_indev_t *indev=lv_indev_active();
     if (indev && ui.pointer_down) {
         update_tap_distance(indev);
+        if (ui.caption_candidate && ui.gesture_page == MEO_APPS && !ui.press_blocked) {
+            lv_point_t p; lv_indev_get_point(indev,&p);
+            int dx=p.x-ui.gesture_start.x,dy=p.y-ui.gesture_start.y;
+            if (!ui.caption_dragging && abs(dx)>12 && abs(dx)>abs(dy)*2) ui.caption_dragging=true;
+            if (ui.caption_dragging) {
+                ui.apps.recentering=true;
+                lv_obj_scroll_to_x(ui.apps.rail,ui.caption_scroll_start-dx,LV_ANIM_OFF);
+                ui.apps.recentering=false;
+                gallery_hide_captions(&ui.apps);
+                gallery_position(&ui.apps);
+            }
+        }
         /* LVGL delivers PRESSING to objects, not to the indev callback. */
         track_back_drag(indev);
     }
@@ -798,6 +878,16 @@ static void pointer_navigation(lv_event_t *event)
         ui.pointer_down = true;
         ui.tap_moved = false;
         ui.press_blocked = ui.navigating || ui.back_settling;
+        /* The first touch of a coasting list only stops it, even if LVGL
+           delivers SCROLL_END before PRESSED or the finger waits to release. */
+        if (ui.model.page == MEO_SETTINGS)
+            ui.press_blocked |= ui.settings_scrolling || ui.settings_press_interrupted ||
+                                lv_obj_is_scrolling(ui.settings_list);
+        if (ui.model.page == MEO_WIFI)
+            ui.press_blocked |= ui.wifi_scrolling || ui.wifi_press_interrupted ||
+                                lv_obj_is_scrolling(ui.wifi_list);
+        ui.settings_press_interrupted = false;
+        ui.wifi_press_interrupted = false;
         /* Latch at press time, not release: holding a moving card until it
            settles must never turn a scroll-interruption into an app launch. */
         gallery_t *gallery=current_gallery();
@@ -806,10 +896,19 @@ static void pointer_navigation(lv_event_t *event)
         ui.gesture_indev = indev;
         lv_indev_get_point(indev,&ui.gesture_start); /* Already rotated by LVGL. */
         ui.gesture_page = ui.model.page;
+        ui.caption_candidate=ui.caption_dragging=false;
+        if (gallery && !ui.gallery_press_moving) {
+            lv_obj_t *target=lv_indev_get_active_obj();
+            ui.caption_candidate=target==gallery->captions[0] || target==gallery->captions[1];
+            ui.caption_scroll_start=lv_obj_get_scroll_x(gallery->rail);
+        }
         ui.back_candidate = !ui.press_blocked && ui.model.page != MEO_HOME &&
                             ui.model.page != MEO_APPS &&
                             !owns_horizontal_input(lv_indev_get_active_obj());
         if (ui.press_blocked) {
+            /* wait_release suppresses RELEASED too; do not leave our own
+               pointer latch set and swallow every subsequent real tap. */
+            ui.pointer_down = ui.back_candidate = false;
             lv_indev_stop_processing(indev);
             lv_indev_wait_release(indev);
         }
@@ -817,6 +916,17 @@ static void pointer_navigation(lv_event_t *event)
                (code == LV_EVENT_RELEASED || code == LV_EVENT_GESTURE)) {
         update_tap_distance(indev);
         if (code == LV_EVENT_RELEASED) {
+            if (ui.caption_dragging) {
+                ui.caption_dragging=ui.caption_candidate=false;
+                ui.pointer_down=ui.back_candidate=false;
+                lv_indev_stop_processing(indev);
+                int first=(lv_obj_get_scroll_x(ui.apps.rail)+GALLERY_STEP/2)/GALLERY_STEP;
+                first=LV_CLAMP(1,first,GALLERY_COUNT-GALLERY_VISIBLE-1);
+                lv_obj_scroll_to_x(ui.apps.rail,first*GALLERY_STEP,
+                                   ui.model.settings.reduced_motion ? LV_ANIM_OFF : LV_ANIM_ON);
+                if (!lv_obj_is_scrolling(ui.apps.rail)) gallery_present(&ui.apps,true);
+                return;
+            }
             track_back_drag(indev);
             if (ui.back_dragging) { back_release(indev); return; }
             ui.pointer_down = ui.back_candidate = false;
@@ -829,6 +939,7 @@ static void pointer_navigation(lv_event_t *event)
 static bool s_notice_pulsing;     /* the infinite opacity animation is live */
 static void notice_pulse(bool on)
 {
+    if (ui.model.settings.reduced_motion) on = false;
     if (!ui.wifi_notice || s_notice_pulsing == on) return;
     s_notice_pulsing = on;
     lv_anim_delete(ui.wifi_notice, anim_text_opa);
@@ -858,8 +969,27 @@ static void wifi_notice_for(const char *text, uint32_t hold_ms)
         s_notice_hide_at = 0;
         notice_pulse(false);
     }
+    refresh_wifi_info(); /* Notice and SSID share one line, never overlap. */
 }
 static void wifi_notice(const char *text) { wifi_notice_for(text, 4000); }
+
+static void wifi_request_scan(void)
+{
+    if (ui.wifi_scanning) { wifi_notice_for("扫描中",0); return; }
+    if (ui.wifi_state == MEO_WIFI_CONNECTING) { wifi_notice("连接中"); return; }
+    if (!ui.config.wifi_scan) { wifi_notice("暂不可用"); return; }
+    bool ok = ui.config.wifi_scan();
+    /* Latch acceptance immediately: a second tap before the radio snapshot
+       must not enqueue another scan. Only the radio completion ends it. */
+    if (ok) ui.wifi_scanning=true;
+    wifi_notice_for(ok ? "扫描中" : "暂不可用", ok ? 0 : 4000);
+}
+
+static void interaction_feedback(void)
+{
+    if (ui.model.settings.interaction_sound && ui.config.interaction_sound)
+        ui.config.interaction_sound();
+}
 
 static void action(lv_event_t *event)
 {
@@ -870,6 +1000,7 @@ static void action(lv_event_t *event)
     if (indev && lv_indev_get_type(indev)==LV_INDEV_TYPE_POINTER &&
         (ui.tap_moved || lv_indev_get_gesture_dir(indev)!=LV_DIR_NONE)) return;
     int id = (int)(uintptr_t)lv_event_get_user_data(event);
+    interaction_feedback();
     if (id >= ACT_PWD_KEY0 && id <= ACT_PWD_KEY0 + PWD_KEY_COUNT - 1) {
         int index = id - ACT_PWD_KEY0;
         int digit = pwd_key_digit[index];
@@ -879,13 +1010,30 @@ static void action(lv_event_t *event)
         return;
     }
     if (id == ACT_PWD_MODE) {
+        pwd_commit();
         s_pwd.mode = (s_pwd.mode + 1) & 3;
-        s_pwd.last_key = -1;
         pwd_mode_paint();
         return;
     }
+    if (id == ACT_PWD_NEXT) { pwd_commit(); return; }
+    if (id >= ACT_WIFI_AP0 && id < ACT_WIFI_AP0 + WIFI_ROWS) {
+        unsigned index=(unsigned)(id-ACT_WIFI_AP0);
+        if (index < ui.wifi_ap_visible) {
+            if (ui.wifi_scanning || ui.wifi_state==MEO_WIFI_CONNECTING ||
+                ui.wifi_state==MEO_WIFI_STARTING || !ui.config.wifi_connect) {
+                wifi_notice_for(ui.wifi_scanning ? "扫描中" : "暂不可用",ui.wifi_scanning ? 0 : 4000);
+                return;
+            }
+            bool ok=ui.config.wifi_join && ui.config.wifi_join(ui.wifi_ap_ssid[index]);
+            if (!ok) meo_ui_password_open(ui.wifi_ap_ssid[index]);
+            else meo_ui_set_wifi(MEO_WIFI_CONNECTING,ui.wifi_ap_ssid[index],0);
+        }
+        return;
+    }
     if (id == ACT_PWD_EYE) {
+        pwd_commit();
         s_pwd.mask = !s_pwd.mask;
+        lv_obj_set_user_data(ui.pwd_eye,(void *)(uintptr_t)(s_pwd.mask ? ICON_EYE_OFF : ICON_EYE));
         lv_obj_set_style_line_color(ui.pwd_eye, color(s_pwd.mask ? WHITE : ACCENT_BLUE), 0);
         pwd_render();
         return;
@@ -917,6 +1065,26 @@ static void action(lv_event_t *event)
     case ACT_ACCESSIBILITY: meo_ui_navigate(MEO_ACCESSIBILITY); break;
     case ACT_MIC: meo_ui_navigate(MEO_MIC); break;
     case ACT_SPEAKER: meo_ui_navigate(MEO_SPEAKER); break;
+    case ACT_EXPRESSIONS: meo_ui_navigate(MEO_EXPRESSIONS); break;
+    case ACT_FACE_PREV: expression_preview_select(-1); break;
+    case ACT_FACE_NEXT: expression_preview_select(1); break;
+    case ACT_FACE_MOUTH:
+        ui.expression_preview.mouth_on = !ui.expression_preview.mouth_on;
+        expression_preview_controls();
+        for (int i=0; i<2; ++i) visible(ui.expression_preview.face.mouth[i],false);
+        break;
+    case ACT_FACE_LEVEL:
+        ui.expression_preview.level=ui.expression_preview.level==100 ? 30 :
+                                    ui.expression_preview.level==30 ? 60 : 100;
+        meo_model_set_expression_level(&ui.expression_preview.model,
+                ui.expression_preview.model.expression,ui.expression_preview.level/100.f,0);
+        expression_preview_controls();
+        break;
+    case ACT_FACE_PLAY:
+        ui.expression_preview.autoplay = !ui.expression_preview.autoplay;
+        ui.expression_preview.next_at = ui.clock_ms + FACE_STEP_MS;
+        expression_preview_controls();
+        break;
     case ACT_VOL_DOWN: case ACT_VOL_UP: {
         int value = ui.model.settings.volume + (id==ACT_VOL_DOWN ? -10 : 10);
         value = value < 0 ? 0 : value > 100 ? 100 : value;
@@ -926,20 +1094,22 @@ static void action(lv_event_t *event)
         refresh_settings(); changed(); break;
     }
     case ACT_SPK_TEST:
-        /* Fire and forget: the adapter plays the tone on its own task. */
-        if (ui.config.speaker_test) ui.config.speaker_test();
+        if (ui.preview_busy) break;
+        if (ui.config.speaker_test && ui.config.speaker_test()) {
+            ui.preview_busy=true;
+            label_text_if_changed(ui.preview_label,"播放中");
+            lv_obj_add_state(ui.preview_button,LV_STATE_DISABLED);
+        } else label_text_if_changed(ui.audio_result,"暂不可用");
         break;
     case ACT_AUDIO_LOOP:
         /* Physical DAC->PA->air->MIC->ADC self test, run off the GUI task. */
         if (ui.config.audio_loop) ui.config.audio_loop();
         break;
-    case ACT_MIC_TEST: {
-        /* The switch is the single owner of capture: on = start, off = stop. */
-        bool on = !ui.model.settings.mic_test;
-        ui.model.settings.mic_test = on;
-        mic_switch_paint(on);
-        if (ui.config.mic_test) ui.config.mic_test(on);
-        changed();
+    case ACT_GAIN_DOWN: case ACT_GAIN_UP: {
+        int gain=ui.model.settings.mic_gain+(id==ACT_GAIN_UP ? 1 : -1);
+        ui.model.settings.mic_gain=(uint8_t)LV_CLAMP(0,gain,14);
+        lv_slider_set_value(ui.mic_gain_slider,ui.model.settings.mic_gain,LV_ANIM_OFF);
+        refresh_settings(); changed();
         break;
     }
     case ACT_DIM: case ACT_BRIGHT: {
@@ -951,21 +1121,7 @@ static void action(lv_event_t *event)
         refresh_settings(); changed(); break;
     }
     case ACT_WIFI_SCAN: {
-        bool down = ui.wifi_state == MEO_WIFI_ERROR;
-        wifi_notice_for(down ? "重试中" : "扫描中", 20000);
-        bool ok = ui.config.wifi_scan ? ui.config.wifi_scan() : false;
-        if (!ok) wifi_notice_for("Wi-Fi 未就绪", 5000);
-        break;
-    }
-    case ACT_WIFI_AP0: case ACT_WIFI_AP1: {
-        unsigned index = (unsigned)(id - ACT_WIFI_AP0);
-        if (index < ui.wifi_ap_visible) {
-            /* A tap must never look dead: say why nothing happened. */
-            bool ok = ui.config.wifi_join && ui.config.wifi_join(ui.wifi_ap_ssid[index]);
-            /* Success needs no notice: the state line above already turns into
-               "Wi-Fi 连接中". Repeating it looked like doubled characters. */
-            if (!ok) meo_ui_password_open(ui.wifi_ap_ssid[index]);
-        }
+        wifi_request_scan();
         break;
     }
     }
@@ -975,13 +1131,49 @@ static void settings_event(lv_event_t *event)
 {
     lv_obj_t *target = lv_event_get_target_obj(event);
     if (target == ui.motion) ui.model.settings.reduced_motion = lv_obj_has_state(target, LV_STATE_CHECKED);
+    else if (target == ui.interaction_sound) {
+        ui.model.settings.interaction_sound = lv_obj_has_state(target, LV_STATE_CHECKED);
+        if (ui.model.settings.interaction_sound) interaction_feedback();
+    }
     else if (target == ui.volume_slider) ui.model.settings.volume = (uint8_t)lv_slider_get_value(target);
+    else if (target == ui.mic_gain_slider) ui.model.settings.mic_gain = (uint8_t)lv_slider_get_value(target);
     else {
         ui.model.settings.brightness = (uint8_t)lv_slider_get_value(target);
     }
     refresh_settings();
     refresh_apps();
+    notice_pulse(!lv_obj_has_flag(ui.wifi_notice,LV_OBJ_FLAG_HIDDEN));
     changed();
+}
+
+static void face_create(face_view_t *face, lv_obj_t *parent, float scale)
+{
+    for (int i = 0; i < 2; ++i) {
+        face->eye[i] = lv_line_create(parent);
+        lv_obj_remove_style_all(face->eye[i]);
+        lv_obj_set_size(face->eye[i], lroundf(140*scale), lroundf(160*scale));
+        lv_obj_set_style_line_color(face->eye[i], color(HOME_EYE), 0);
+        lv_obj_set_style_line_opa(face->eye[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_line_rounded(face->eye[i], true, 0);
+        lv_obj_remove_flag(face->eye[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        face->pupil[i] = box(face->eye[i], lroundf(58*scale), lroundf(68*scale),
+                             lroundf(24*scale), lroundf(24*scale), HOME_BG, lroundf(12*scale));
+    }
+}
+
+static void face_mouth_create(face_view_t *face, lv_obj_t *parent, int y)
+{
+    for (int lip=0;lip<2;++lip) {
+        lv_obj_t *line=lv_line_create(parent);
+        face->mouth[lip]=line;
+        lv_obj_remove_style_all(line);
+        lv_obj_set_pos(line,194,y);lv_obj_set_size(line,72,48);
+        lv_obj_set_style_line_color(line,color(HOME_EYE),0);
+        lv_obj_set_style_line_width(line,5,0);
+        lv_obj_set_style_line_rounded(line,true,0);
+        lv_obj_remove_flag(line,LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
+        visible(line,false);
+    }
 }
 
 static void home_create(void)
@@ -989,28 +1181,33 @@ static void home_create(void)
     lv_obj_t *p = ui.pages[MEO_HOME];
     lv_obj_add_flag(p, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(p, action, LV_EVENT_CLICKED, (void *)(uintptr_t)ACT_APPS);
-    /* The home page is only the face: two large white eyes and simple black pupils. */
-    for (int i = 0; i < 2; ++i) {
-        ui.eye[i] = lv_line_create(p);
-        lv_obj_remove_style_all(ui.eye[i]);
-        lv_obj_set_size(ui.eye[i], 140, 160);
-        lv_obj_set_style_line_color(ui.eye[i], color(HOME_EYE), 0);
-        lv_obj_set_style_line_opa(ui.eye[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_line_rounded(ui.eye[i], true, 0);
-        lv_obj_remove_flag(ui.eye[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        ui.pupil[i] = box(ui.eye[i], 58, 68, 24, 24, HOME_BG, 12);
+    /* Home deliberately retains the approved eyes-only composition. */
+    face_create(&ui.home_face,p,1.0f);
+    face_mouth_create(&ui.home_face,p,286);
+    /* A quiet, full-width listening rail. It is hidden unless the audio task
+       has actually started I2S RX, so a dead codec never looks like recording. */
+    /* Keep the capture rail on the top layer so the proven home page child
+       layout remains unchanged for the renderer/geometry tests. It is still
+       non-clickable and is explicitly hidden outside the AI dial. */
+    lv_obj_t *capture_layer=lv_layer_top();
+    /* Listening feedback is part of the character, not a toolbar.  Keep the
+       microphone small and surround it with a quiet circular pulse; the old
+       dark pill looked like a debug button and stole focus from the eyes. */
+    ui.home_capture_ring=box(capture_layer,194,350,72,72,BG,36);
+    lv_obj_set_style_bg_opa(ui.home_capture_ring,LV_OPA_TRANSP,0);
+    lv_obj_set_style_border_width(ui.home_capture_ring,1,0);
+    lv_obj_set_style_border_color(ui.home_capture_ring,color(ACCENT_CYAN),0);
+    lv_obj_set_style_border_opa(ui.home_capture_ring,LV_OPA_70,0);
+    ui.home_capture_mic=icon(capture_layer,ICON_MIC,32,ACCENT_CYAN);
+    lv_obj_set_pos(ui.home_capture_mic,214,370);
+    static const int xs[8]={96,124,152,180,280,308,336,364};
+    for (int i=0;i<8;++i) {
+        ui.home_capture_wave[i]=box(capture_layer,xs[i],383,5,6,ACCENT_CYAN,3);
+        ui.home_wave_height[i]=6;
     }
-    /* Status strip sits above the eyes and never covers the tap-to-apps area.
-       Passive objects only: the page itself stays the single tap target. */
-    ui.wifi_mark = icon(p, ICON_WIFI, 30, DIM);
-    lv_obj_set_pos(ui.wifi_mark, 232, 44);
-    ui.power_text = label(p, "--", 272, 40, 76, &meo_font_28, WHITE, true);
-    ui.power_gauge = box(p, 356, 44, 56, 28, HOME_BG, 8);
-    lv_obj_set_style_border_width(ui.power_gauge, 2, 0);
-    lv_obj_set_style_border_color(ui.power_gauge, color(MUTED), 0);
-    lv_obj_set_style_border_opa(ui.power_gauge, LV_OPA_COVER, 0);
-    ui.power_fill = box(ui.power_gauge, 3, 3, 50, 22, WHITE, 5);
-    box(p, 414, 53, 4, 10, MUTED, 2);
+    visible(ui.home_capture_ring,false);
+    visible(ui.home_capture_mic,false);
+    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],false);
 }
 
 /* The icon rail moves; its two caption targets are siblings on the screen.
@@ -1165,36 +1362,63 @@ static void gallery_create(lv_obj_t *page, gallery_t *g, int y, int caption_y,
 
 static void apps_create(void)
 {
+    lv_obj_t *p=ui.pages[MEO_APPS];
     static const char *const names[]={"设置","AI","呼吸"};
     static const int actions[]={ACT_SETTINGS,ACT_HOME,ACT_BREATHE};
     static const icon_kind_t symbols[]={ICON_GEAR,ICON_FACE,ICON_FLOWER};
     gallery_create(ui.pages[MEO_APPS],&ui.apps,129,306,names,actions,symbols);
     refresh_apps();
+    /* Status belongs to the launcher; the AI dial contains only its eyes. */
+    ui.wifi_mark = icon(p, ICON_WIFI, 30, DIM);
+    lv_obj_set_pos(ui.wifi_mark, 48, 44);
+    ui.power_text = label(p, "--", 262, 40, 86, &meo_font_28, WHITE, true);
+    lv_obj_set_style_text_align(ui.power_text, LV_TEXT_ALIGN_RIGHT, 0);
+    ui.power_gauge = box(p, 356, 44, POWER_BODY_W, POWER_BODY_H, HOME_BG, 8);
+    lv_obj_set_style_border_width(ui.power_gauge, POWER_BORDER, 0);
+    lv_obj_set_style_border_color(ui.power_gauge, color(MUTED), 0);
+    lv_obj_set_style_border_opa(ui.power_gauge, LV_OPA_COVER, 0);
+    /* Child coordinates already start INSIDE the border. Adding the border
+       twice shifted the old fill down/right and left a broken outline. */
+    ui.power_fill = box(ui.power_gauge, 0, 0, POWER_FILL_W, POWER_FILL_H, WHITE, 6);
+    /* Overlap the shell by one pixel: no detached cap or AA hairline. */
+    ui.power_terminal=box(p,356+POWER_BODY_W-1,53,4,10,MUTED,2);
+    visible(ui.power_gauge,false);visible(ui.power_text,false);visible(ui.power_terminal,false);
 }
 
-/* Settings switch: a pill track with a knob. Painted only on change, so the
- * row costs nothing while it sits still. */
-static void mic_switch_paint(bool on)
+
+
+static void list_scroll(lv_event_t *event)
 {
-    if (!ui.mic_switch || !ui.mic_knob) return;
-    lv_obj_set_style_bg_color(ui.mic_switch, color(on ? 0x1E4A46 : 0x2A2A2A), 0);
-    lv_obj_set_style_bg_color(ui.mic_knob, color(on ? ACCENT_CYAN : 0x8A8A8A), 0);
-    lv_obj_set_x(ui.mic_knob, on ? 35 : 3);
+    bool wifi = lv_event_get_current_target(event) == ui.wifi_list;
+    bool *scrolling = wifi ? &ui.wifi_scrolling : &ui.settings_scrolling;
+    bool *interrupted = wifi ? &ui.wifi_press_interrupted : &ui.settings_press_interrupted;
+    meo_page_t page = wifi ? MEO_WIFI : MEO_SETTINGS;
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_SCROLL_BEGIN) *scrolling = true;
+    else if (code == LV_EVENT_SCROLL_END) {
+        /* This LVGL stops native throw before dispatching the next PRESSED.
+           Capture that interruption here rather than relying on a cooldown. */
+        lv_indev_t *indev = lv_indev_active();
+        if (*scrolling && ui.model.page == page && indev &&
+            !ui.pointer_down && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED)
+            *interrupted = true;
+        *scrolling = false;
+    }
 }
 
-static lv_obj_t *setting_row(lv_obj_t *page, int y, const char *name, icon_kind_t symbol,
+static lv_obj_t *setting_row(lv_obj_t *list, int index, const char *name, icon_kind_t symbol,
                              uint32_t tint, int action_id, bool chevron)
 {
-    /* Settings are component cards rather than compact phone list rows.
-     * Five rows have to fit above the 460 px canvas, so the card is 64 px
-     * tall (badge 44, type still 28 px) instead of the old 78. */
-    int w = 396, h = 64;
-    lv_obj_t *row = button(page, (460-w)/2, y, w, h, CARD, NULL, action_id);
+    /* Give each action breathing room instead of shrinking five rows to fit.
+       The partially visible next card is the only scroll affordance needed. */
+    int w = 396, h = SETTINGS_ROW_H;
+    lv_obj_t *row = button(list, 0, index * SETTINGS_ROW_STEP, w, h, CARD, NULL, action_id);
     lv_obj_set_style_radius(row, 22, 0);
     lv_obj_t *badge = box(row, 14, (h-44)/2, 44, 44, tint, 14);
-    lv_obj_t *mark = icon(badge, symbol, 28, 0xFFFFFF);
+    lv_obj_t *mark = icon(badge, symbol, 32, 0xFFFFFF);
     lv_obj_center(mark);
-    label(row, name, 76, (h-34)/2, 150, UI_SETTINGS_FONT, WHITE, false);
+    lv_obj_t *name_label = label(row, name, 76, 0, 150, UI_SETTINGS_FONT, WHITE, false);
+    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 76, 0);
     if (chevron) {
         lv_obj_t *mark_right = icon(row, ICON_RIGHT, 24, DIM);
         lv_obj_set_pos(mark_right, w - 40, (h - 26) / 2);
@@ -1202,71 +1426,93 @@ static lv_obj_t *setting_row(lv_obj_t *page, int y, const char *name, icon_kind_
     return row;
 }
 
+static lv_obj_t *setting_summary(lv_obj_t *row, const char *text, int x, int width)
+{
+    lv_obj_t *summary = label(row, text, x, 0, width, UI_SETTINGS_FONT, MUTED, false);
+    lv_obj_set_style_text_align(summary, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(summary, LV_ALIGN_LEFT_MID, x, 0);
+    return summary;
+}
+
+/* One stable value column makes Wi-Fi, brightness, accessibility, speaker,
+ * and microphone rows read as one system. The previous rows used different
+ * x positions, and the long microphone summary could overlap the title's
+ * layout box on the 460px panel. The chevron begins at x=356, so this column
+ * ends at x=348 and keeps an intentional 8px gap. Right-align the content
+ * to that edge rather than centering short values in the wide label box. */
+#define SETTINGS_VALUE_X 188
+#define SETTINGS_VALUE_W 160
+
 static void settings_create(void)
 {
-    lv_obj_t *p = ui.pages[MEO_SETTINGS];
-    header(p, "设置", ACT_APPS);
-    lv_obj_t *row = setting_row(p, 104, "Wi-Fi", ICON_WIFI, 0x2873CB, ACT_WIFI, true);
-    ui.wifi_summary = label(row, "未接入", 196, 15, 140, UI_SETTINGS_FONT, MUTED, true);
-    row = setting_row(p, 176, "显示与亮度", ICON_SUN, 0xA96724, ACT_DISPLAY, true);
-    ui.brightness_summary = label(row, "80%", 246, 15, 88, UI_SETTINGS_FONT, MUTED, true);
-    row = setting_row(p, 248, "辅助功能", ICON_EYE, 0x7952BE, ACT_ACCESSIBILITY, true);
-    ui.motion_summary = label(row, "标准", 246, 15, 88, UI_SETTINGS_FONT, MUTED, true);
-    /* Speaker: opens the volume page. The row itself shows the current level,
-       so the most-used state is visible without entering. */
-    row = setting_row(p, 320, "扬声器", ICON_SPEAKER, 0x2E7D6B, ACT_SPEAKER, true);
-    ui.volume_summary = label(row, "50%", 246, 15, 88, UI_SETTINGS_FONT, MUTED, true);
-    /* Microphone: the row opens the meter page, the switch starts/stops the
-       capture itself. Tapping the switch must not navigate (no event bubble). */
-    row = setting_row(p, 392, "麦克风测试", ICON_FLOWER, 0xBE5272, ACT_MIC, false);
-    ui.mic_switch = box(row, 396 - 96, (64 - 40) / 2, 72, 40, 0x2A2A2A, 20);
-    lv_obj_add_flag(ui.mic_switch, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(ui.mic_switch, action, LV_EVENT_CLICKED,
-                        (void *)(uintptr_t)ACT_MIC_TEST);
-    ui.mic_knob = box(ui.mic_switch, 3, 3, 34, 34, 0x8A8A8A, 17);
-    lv_obj_remove_flag(ui.mic_knob, LV_OBJ_FLAG_CLICKABLE);
-    mic_switch_paint(ui.model.settings.mic_test);
+    lv_obj_t *p=ui.pages[MEO_SETTINGS];
+    header(p,"设置",ACT_APPS);
+    lv_obj_t *h=lv_obj_get_child(p,0);
+    lv_obj_set_y(h,16);lv_obj_set_height(h,72);
+    ui.settings_list=box(p,32,104,396,340,BG,0);
+    lv_obj_add_flag(ui.settings_list,LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK |
+                   LV_OBJ_FLAG_SCROLLABLE);
+    /* Never hand a vertical drag to the screen, or overscroll into a blank
+       page. Horizontal drags still belong to the existing swipe-back logic. */
+    lv_obj_remove_flag(ui.settings_list,LV_OBJ_FLAG_SCROLL_ELASTIC |
+                       LV_OBJ_FLAG_SCROLL_CHAIN_HOR | LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_set_scroll_dir(ui.settings_list,LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ui.settings_list,LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(ui.settings_list,color(DIM),LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(ui.settings_list,LV_OPA_70,LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(ui.settings_list,3,LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(ui.settings_list,2,LV_PART_SCROLLBAR);
+    lv_obj_add_event_cb(ui.settings_list,list_scroll,LV_EVENT_ALL,NULL);
+    lv_obj_add_event_cb(ui.settings_list,track_pointer_motion,LV_EVENT_PRESSING,NULL);
+    lv_obj_t *row=setting_row(ui.settings_list,0,"Wi-Fi",ICON_WIFI,0x2873CB,ACT_WIFI,true);
+    ui.wifi_summary=setting_summary(row,"未接入",SETTINGS_VALUE_X,SETTINGS_VALUE_W);
+    row=setting_row(ui.settings_list,1,"显示与亮度",ICON_SUN,0xA96724,ACT_DISPLAY,true);
+    ui.brightness_summary=setting_summary(row,"80%",SETTINGS_VALUE_X,SETTINGS_VALUE_W);
+    row=setting_row(ui.settings_list,2,"辅助功能",ICON_EYE,0x7952BE,ACT_ACCESSIBILITY,true);
+    ui.motion_summary=setting_summary(row,"标准",SETTINGS_VALUE_X,SETTINGS_VALUE_W);
+    row=setting_row(ui.settings_list,3,"扬声器",ICON_SPEAKER,0x2E7D6B,ACT_SPEAKER,true);
+    ui.volume_summary=setting_summary(row,"50%",SETTINGS_VALUE_X,SETTINGS_VALUE_W);
+    row=setting_row(ui.settings_list,4,"麦克风",ICON_MIC,0xBE5272,ACT_MIC,true);
+    ui.mic_summary=setting_summary(row,"29%",SETTINGS_VALUE_X,SETTINGS_VALUE_W);
+    setting_row(ui.settings_list,5,"表情预览",ICON_FACE,0x567EB8,ACT_EXPRESSIONS,true);
+}
+
+void meo_ui_set_volume(int percent)
+{
+    if (!ui.ready) return;
+    percent = LV_CLAMP(0, percent, 100);
+    if (percent == ui.model.settings.volume) return;
+    ui.model.settings.volume = (uint8_t)percent;
+    lv_slider_set_value(ui.volume_slider, percent, LV_ANIM_OFF);
+    refresh_settings();
+    changed();
 }
 
 static void speaker_create(void)
 {
-    lv_obj_t *p = ui.pages[MEO_SPEAKER];
-    header(p, "扬声器", ACT_SETTINGS);
-    lv_obj_t *card = box(p, 42, 124, 376, 168, CARD, 25);
-    label(card, "音量", 24, 14, 180, UI_SETTINGS_FONT, WHITE, false);
-    ui.volume = label(card, "50%", 224, 6, 128, &meo_font_44, ACCENT_CYAN, true);
-    lv_obj_t *slider = lv_slider_create(card);
-    ui.volume_slider = slider;
-    lv_obj_set_pos(slider, 80, 92);
-    lv_obj_set_size(slider, 216, 12);
-    lv_obj_set_ext_click_area(slider, 24);
-    lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, ui.model.settings.volume, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(slider, color(0x3A3A3A), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(slider, color(ACCENT_CYAN), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(slider, color(WHITE), LV_PART_KNOB);
-    lv_obj_set_style_pad_all(slider, 5, LV_PART_KNOB);
-    lv_obj_add_event_cb(slider, settings_event, LV_EVENT_VALUE_CHANGED, NULL);
-    lv_obj_t *down = button(card, 6, 56, 64, 64, 0x262626, NULL, ACT_VOL_DOWN);
-    lv_obj_t *up = button(card, 298, 56, 64, 64, 0x262626, NULL, ACT_VOL_UP);
-    lv_obj_center(icon(down, ICON_MINUS, 28, WHITE));
-    lv_obj_center(icon(up, ICON_PLUS, 28, WHITE));
-
-    /* Two independent actions: a quick audible tone, and the full physical
-       loopback self test (DAC/PA A-B checks). Both text strings use glyphs
-       already present in the shipped font. */
-    lv_obj_t *test = button(p, 32, 306, 190, 62, 0x1E4A46, NULL, ACT_SPK_TEST);
-    lv_obj_t *tmark = icon(test, ICON_SPEAKER, 26, WHITE);
-    lv_obj_set_pos(tmark, 10, 18);
-    label(test, "播放测试音", 44, 15, 142, UI_SETTINGS_FONT, WHITE, false);
-    lv_obj_t *loop = button(p, 238, 306, 190, 62, 0x2A3A5E, NULL, ACT_AUDIO_LOOP);
-    label(loop, "回路测试", 0, 14, 190, UI_SETTINGS_FONT, WHITE, true);
-
-    ui.audio_result = label(p, "WAIT", 32, 380, 396, UI_SETTINGS_FONT, MUTED, false);
-    ui.audio_meta = label(p, "MCLK -- MIC --/--", 32, 414, 396,
-                          UI_SETTINGS_FONT, MUTED, false);
-    memset(ui.audio_result_text, 0, sizeof(ui.audio_result_text));
-    memset(ui.audio_meta_text, 0, sizeof(ui.audio_meta_text));
+    lv_obj_t *p=ui.pages[MEO_SPEAKER];
+    header(p,"扬声器",ACT_SETTINGS);
+    lv_obj_t *card=box(p,32,126,396,174,CARD,30);
+    label(card,"音量",24,20,160,UI_SETTINGS_FONT,MUTED,false);
+    ui.volume=label(card,"50%",228,10,144,&meo_font_44,ACCENT_CYAN,true);
+    ui.volume_slider=lv_slider_create(card);
+    lv_obj_set_pos(ui.volume_slider,92,112);lv_obj_set_size(ui.volume_slider,212,12);
+    lv_obj_set_ext_click_area(ui.volume_slider,22);
+    lv_slider_set_range(ui.volume_slider,0,100);
+    lv_slider_set_value(ui.volume_slider,ui.model.settings.volume,LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(ui.volume_slider,color(0x353535),LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui.volume_slider,color(ACCENT_CYAN),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(ui.volume_slider,color(WHITE),LV_PART_KNOB);
+    lv_obj_set_style_pad_all(ui.volume_slider,6,LV_PART_KNOB);
+    lv_obj_add_event_cb(ui.volume_slider,settings_event,LV_EVENT_VALUE_CHANGED,NULL);
+    lv_obj_t *down=button(card,12,86,64,64,0x252525,NULL,ACT_VOL_DOWN);
+    lv_obj_t *up=button(card,320,86,64,64,0x252525,NULL,ACT_VOL_UP);
+    lv_obj_center(icon(down,ICON_MINUS,28,WHITE));lv_obj_center(icon(up,ICON_PLUS,28,WHITE));
+    ui.preview_button=button(p,100,326,260,76,0x153A38,NULL,ACT_SPK_TEST);
+    lv_obj_set_style_bg_color(ui.preview_button,color(0x182626),LV_STATE_DISABLED);
+    lv_obj_t *mark=icon(ui.preview_button,ICON_SPEAKER,32,ACCENT_CYAN);lv_obj_set_pos(mark,34,22);
+    ui.preview_label=label(ui.preview_button,"试听",80,20,146,UI_SETTINGS_FONT,WHITE,true);
+    ui.audio_result=label(p,"",40,414,380,UI_SETTINGS_FONT,MUTED,true);
 }
 
 static void display_settings_create(void)
@@ -1298,7 +1544,7 @@ static void accessibility_create(void)
 {
     lv_obj_t *p = ui.pages[MEO_ACCESSIBILITY];
     header(p, "辅助功能", ACT_SETTINGS);
-    lv_obj_t *card = box(p, 48, 148, 364, 92, CARD, 23);
+    lv_obj_t *card = box(p, 48, 124, 364, 92, CARD, 23);
     label(card, "减少动态效果", 22, 29, 230, UI_SETTINGS_FONT, WHITE, false);
     ui.motion = lv_switch_create(card);
     lv_obj_set_pos(ui.motion, 266, 24);
@@ -1310,82 +1556,150 @@ static void accessibility_create(void)
     lv_obj_set_style_bg_color(ui.motion, color(WHITE), LV_PART_KNOB | LV_STATE_CHECKED);
     if (ui.model.settings.reduced_motion) lv_obj_add_state(ui.motion, LV_STATE_CHECKED);
     lv_obj_add_event_cb(ui.motion, settings_event, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *sound_card = box(p, 48, 236, 364, 92, CARD, 23);
+    label(sound_card, "交互音效", 22, 29, 230, UI_SETTINGS_FONT, WHITE, false);
+    ui.interaction_sound = lv_switch_create(sound_card);
+    lv_obj_set_pos(ui.interaction_sound, 266, 24);
+    lv_obj_set_size(ui.interaction_sound, 68, 38);
+    lv_obj_set_ext_click_area(ui.interaction_sound, 13);
+    lv_obj_set_style_bg_color(ui.interaction_sound, color(0x3A3A3A), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui.interaction_sound, color(0xD79A57), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(ui.interaction_sound, color(WHITE), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(ui.interaction_sound, color(WHITE), LV_PART_KNOB | LV_STATE_CHECKED);
+    if (ui.model.settings.interaction_sound) lv_obj_add_state(ui.interaction_sound, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(ui.interaction_sound, settings_event, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 static void wifi_create(void)
 {
-    lv_obj_t *p = ui.pages[MEO_WIFI];
-    header(p, "网络", ACT_SETTINGS);
-    /* Page identity stays an icon, not a colour block: same mark as settings. */
-    ui.wifi_page_mark = icon(p, ICON_WIFI, 56, ACCENT_BLUE);
-    lv_obj_set_pos(ui.wifi_page_mark, 34, 118);
-    ui.wifi_page_state = label(p, "Wi-Fi 未接入", 106, 116, 314, UI_SETTINGS_FONT, WHITE, false);
-    ui.wifi_page_ssid = label(p, "—", 106, 152, 314, UI_SETTINGS_FONT, MUTED, false);
-    /* Transient feedback for tap actions: every tap must visibly do something. */
-    ui.wifi_notice = label(p, "", 106, 186, 314, UI_SETTINGS_FONT, ACCENT_AMBER, false);
-    lv_obj_add_flag(ui.wifi_notice, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *scan = button(p, 110, 226, 240, 64, 0x16283C, NULL, ACT_WIFI_SCAN);
-    ui.wifi_scan_label = label(scan, "扫描附近网络", 0, 0, 240, UI_SETTINGS_FONT, WHITE, true);
+    lv_obj_t *p=ui.pages[MEO_WIFI];
+    /* One action row and one status line. The list owns the rest of the
+     * square panel: four full 72px targets rather than a 142px letterbox. */
+    lv_obj_t *title=header(p,"网络",ACT_SETTINGS);
+    lv_obj_t *back=lv_obj_get_parent(title);
+    lv_obj_set_pos(back,24,12); lv_obj_set_size(back,264,64);
+    lv_obj_t *chevron=lv_obj_get_child(back,0);
+    lv_obj_set_size(chevron,32,32); lv_obj_align(chevron,LV_ALIGN_LEFT_MID,0,0);
+    lv_obj_set_width(title,192); lv_obj_align(title,LV_ALIGN_LEFT_MID,56,0);
+    /* The status and every network row share exactly the same text columns.
+       A notice temporarily replaces BOTH columns, never a second status. */
+    lv_obj_t *status=box(p,24,82,412,44,BG,0);
+    ui.wifi_status_mark=icon(status,ICON_WIFI,32,DIM);
+    lv_obj_set_pos(ui.wifi_status_mark,18,6);
+    ui.wifi_page_ssid=label(status,"未连接",WIFI_NAME_X,5,WIFI_NAME_W,UI_SETTINGS_FONT,MUTED,false);
+    lv_label_set_long_mode(ui.wifi_page_ssid,LV_LABEL_LONG_DOT);
+    ui.wifi_page_state=label(status,"",262,5,132,UI_SETTINGS_FONT,MUTED,false);
+    lv_obj_set_style_text_align(ui.wifi_page_state,LV_TEXT_ALIGN_RIGHT,0);
+    ui.wifi_notice=label(status,"",18,5,376,UI_SETTINGS_FONT,ACCENT_AMBER,false);
+    lv_obj_add_flag(ui.wifi_notice,LV_OBJ_FLAG_HIDDEN);
+    /* A quiet text action, not another Wi-Fi status badge. The entire
+       transparent 112x64 area remains tappable; only a press adds a surface. */
+    lv_obj_t *scan=button(p,324,12,112,64,BG,NULL,ACT_WIFI_SCAN);
+    lv_obj_set_style_radius(scan,16,0);
+    lv_obj_set_style_bg_opa(scan,LV_OPA_TRANSP,0);
+    lv_obj_set_style_bg_color(scan,color(0x141E28),LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(scan,LV_OPA_COVER,LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(scan,LV_OPA_TRANSP,LV_STATE_DISABLED);
+    ui.wifi_scan_button=scan;
+    ui.wifi_scan_label=label(scan,"扫描",0,0,112,UI_SETTINGS_FONT,ACCENT_BLUE,true);
     lv_obj_center(ui.wifi_scan_label);
-    ui.wifi_hint = label(p, "点扫描找网络", 40, 306, 380, UI_SETTINGS_FONT, MUTED, true);
-    static const int rows[WIFI_ROWS] = {ACT_WIFI_AP0, ACT_WIFI_AP1};
-    for (unsigned i = 0; i < WIFI_ROWS; ++i) {
-        lv_obj_t *row = button(p, 32, 304 + (int)i * 58, 396, 54, CARD, NULL, rows[i]);
-        lv_obj_set_style_radius(row, 18, 0);
-        ui.wifi_rows[i] = row;
-        ui.wifi_row_ssid[i] = label(row, "", 18, 10, 230, UI_SETTINGS_FONT, WHITE, false);
-        ui.wifi_row_rssi[i] = label(row, "", 244, 10, 132, UI_SETTINGS_FONT, MUTED, true);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    ui.wifi_hint=label(p,"点扫描找网络",40,258,380,UI_SETTINGS_FONT,MUTED,true);
+    /* One quiet inset surface, not four oversized grey pills. The whole row
+       stays a 72px target; subtle rules and signal marks carry the hierarchy. */
+    ui.wifi_list=box(p,24,WIFI_LIST_Y,412,WIFI_LIST_H,0x0B1016,26);
+    lv_obj_set_style_clip_corner(ui.wifi_list,true,0);
+    visible(ui.wifi_list,false);
+    lv_obj_add_flag(ui.wifi_list,LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK |
+                   LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ui.wifi_list,LV_OBJ_FLAG_SCROLL_ELASTIC |
+                       LV_OBJ_FLAG_SCROLL_CHAIN_HOR | LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_set_scroll_dir(ui.wifi_list,LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ui.wifi_list,LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(ui.wifi_list,color(DIM),LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(ui.wifi_list,LV_OPA_70,LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(ui.wifi_list,3,LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(ui.wifi_list,2,LV_PART_SCROLLBAR);
+    lv_obj_add_event_cb(ui.wifi_list,list_scroll,LV_EVENT_ALL,NULL);
+    lv_obj_add_event_cb(ui.wifi_list,track_pointer_motion,LV_EVENT_PRESSING,NULL);
+    for (unsigned i=0;i<WIFI_ROWS;++i) {
+        lv_obj_t *row=button(ui.wifi_list,0,(int)i*WIFI_ROW_STEP,412,WIFI_ROW_H,0x0B1016,NULL,ACT_WIFI_AP0+(int)i);
+        lv_obj_set_style_radius(row,14,0);
+        lv_obj_set_style_bg_color(row,color(0x192B3B),LV_STATE_PRESSED);
+        ui.wifi_row_mark[i]=icon(row,ICON_WIFI,32,ACCENT_BLUE);
+        lv_obj_set_pos(ui.wifi_row_mark[i],18,20);
+        box(row,WIFI_NAME_X,71,328,1,0x1B2732,0);
+        ui.wifi_rows[i]=row;
+        ui.wifi_row_ssid[i]=label(row,"",WIFI_NAME_X,20,WIFI_NAME_W,UI_SETTINGS_FONT,WHITE,false);
+        lv_label_set_long_mode(ui.wifi_row_ssid[i],LV_LABEL_LONG_DOT);
+        lv_obj_set_height(ui.wifi_row_ssid[i],meo_font_28.line_height);
+        ui.wifi_row_rssi[i]=label(row,"",262,20,132,UI_SETTINGS_FONT,MUTED,true);
+        lv_obj_set_style_text_align(ui.wifi_row_rssi[i],LV_TEXT_ALIGN_RIGHT,0);
+        lv_obj_add_flag(row,LV_OBJ_FLAG_HIDDEN);
     }
 }
 
 
-/* ---------------- on-screen password entry ----------------
- * Design constraints for a 460x460 panel: pointer only, no long-press help, at
- * least 64 px targets and 28 px type. A full QWERTY cannot satisfy that (10+
- * columns), so this is a feature-phone T9 pad: 12 keys of 99x78, one mode chip,
- * multi-tap with a 700 ms commit, and a masked field that always shows the tail. */
-
+/* ---------------- compact-device keyboard ----------------
+ * A familiar 3-column phone keypad gives every key 132x64 pixels. Connection,
+ * visibility and deletion are separate controls; no tiny QWERTY. Repeated
+ * letters can be committed explicitly instead of waiting for the tap timeout.
+ * Labels remain 28 px, including the letter groups and the current mode. */
 static void pwd_render(void)
 {
     if (!ui.pwd_text) return;
-    /* Show the tail: typing appends, so the newest characters must stay visible. */
-    const unsigned keep = 10;
-    char display[PWD_MAX + 8] = {0};
-    unsigned start = s_pwd.len > keep ? s_pwd.len - keep : 0;
-    unsigned n = 0;
-    if (start) display[n++] = '\xe2', display[n++] = '\x80', display[n++] = '\xa6'; /* … */
-    for (unsigned i = start; i < s_pwd.len; ++i)
-        display[n++] = s_pwd.mask ? '*' : s_pwd.text[i];
-    display[n] = 0;
-    lv_label_set_text(ui.pwd_text, display);
-    lv_obj_set_style_text_color(ui.pwd_text, color(s_pwd.len ? WHITE : DIM), 0);
-    if (!s_pwd.len) lv_label_set_text(ui.pwd_text, "密码");
+    char display[PWD_MAX+8];
+    unsigned start=0;
+    for (;;) {
+        unsigned n=0;
+        if (start) display[n++]='~'; /* tail marker, part of shipped ASCII */
+        for (unsigned i=start;i<s_pwd.len;++i) {
+            bool pending=s_pwd.last_key>=0 && i+1==s_pwd.len;
+            display[n++]=s_pwd.mask && !pending ? '*' : s_pwd.text[i];
+        }
+        display[n]=0;
+        lv_point_t extent;
+        lv_text_get_size(&extent,display,&meo_font_28,0,0,LV_COORD_MAX,LV_TEXT_FLAG_NONE);
+        if (extent.x<=232 || start>=s_pwd.len) break;
+        ++start;
+    }
+    label_text_if_changed(ui.pwd_text,s_pwd.len ? display : "密码");
+    lv_obj_set_style_text_color(ui.pwd_text,color(s_pwd.len ? WHITE : DIM),0);
+    if (ui.pwd_next) {
+        if (s_pwd.last_key>=0) lv_obj_remove_state(ui.pwd_next,LV_STATE_DISABLED);
+        else lv_obj_add_state(ui.pwd_next,LV_STATE_DISABLED);
+        lv_obj_set_style_text_color(lv_obj_get_child(ui.pwd_next,0),
+                                    color(s_pwd.last_key>=0 ? WHITE : DIM),0);
+    }
+}
+
+static void pwd_commit(void)
+{
+    s_pwd.last_key=-1;
+    pwd_render();
 }
 
 static void pwd_mode_paint(void)
 {
-    static const char *const names[4] = {"abc", "ABC", "123", "!@#"};
-    if (ui.pwd_mode) lv_label_set_text(ui.pwd_mode, names[s_pwd.mode & 3]);
-    char label[8];
-    for (unsigned i = 0; i < PWD_KEY_COUNT; ++i) {
+    static const char *const names[4]={"abc","ABC","123","!@#"};
+    if (ui.pwd_mode) lv_label_set_text(ui.pwd_mode,names[s_pwd.mode & 3]);
+    char text[16];
+    for (unsigned i=0;i<PWD_KEY_COUNT;++i) {
         if (!ui.pwd_key_labels[i]) continue;
-        int digit = pwd_key_digit[i];
-        if (digit < 0) continue;                       /* delete / ok keep their text */
-        if (s_pwd.mode == PWD_DIGIT) { label[0] = (char)('0' + digit); label[1] = 0; }
-        else if (s_pwd.mode == PWD_SYM) { label[0] = pwd_sym[digit]; label[1] = 0; }
-        else {
-            const char *letters = pwd_t9[digit];
-            if (!letters[0]) snprintf(label, sizeof(label), "%s", digit == 1 ? "." : "-");
-            else {
-                char shown[8];
-                snprintf(shown, sizeof(shown), "%s", letters);
-                if (s_pwd.mode == PWD_UPPER)
-                    for (char *c = shown; *c; ++c) if (*c >= 'a' && *c <= 'z') *c -= 32;
-                snprintf(label, sizeof(label), "%s", shown);
-            }
+        int digit=pwd_key_digit[i];
+        if (digit<0) continue;
+        if (s_pwd.mode==PWD_DIGIT) snprintf(text,sizeof(text),"%d",digit);
+        else if (s_pwd.mode==PWD_SYM) {
+            snprintf(text,sizeof(text),"%s",pwd_symbols[digit]);
+            if (!digit) snprintf(text,sizeof(text),"空格_");
+        } else {
+            const char *letters=pwd_t9[digit];
+            if (!letters[0]) snprintf(text,sizeof(text),"%d %s",digit,digit==1 ? "." : "-");
+            else snprintf(text,sizeof(text),"%d %s",digit,letters);
+            if (s_pwd.mode==PWD_UPPER)
+                for (char *c=text;*c;++c) if (*c>='a' && *c<='z') *c-=32;
         }
-        lv_label_set_text(ui.pwd_key_labels[i], label);
+        lv_label_set_text(ui.pwd_key_labels[i],text);
     }
 }
 
@@ -1401,79 +1715,79 @@ static void pwd_push(const char *add)
 
 static void pwd_backspace(void)
 {
-    if (!s_pwd.len) return;
-    s_pwd.text[--s_pwd.len] = 0;
+    s_pwd.last_key=-1; s_pwd.tap=0; s_pwd.last_ms=0;
+    if (s_pwd.len) s_pwd.text[--s_pwd.len]=0;
     pwd_render();
 }
 
 static void pwd_tap_digit(int digit, uint64_t now)
 {
-    if (s_pwd.mode == PWD_DIGIT) { char c[2] = {(char)('0' + digit), 0}; pwd_push(c); return; }
-    if (s_pwd.mode == PWD_SYM) { char c[2] = {pwd_sym[digit], 0}; pwd_push(c); return; }
-    const char *letters = pwd_t9[digit];
-    if (!letters[0]) { pwd_push(digit == 1 ? "." : "-"); return; }  /* 1/0 = punctuation */
-    bool chain = s_pwd.last_key == digit && now - s_pwd.last_ms < PWD_TAP_MS &&
-                 s_pwd.len && s_pwd.text[s_pwd.len - 1] != ' ';
-    int index = 0;
-    if (chain) {
-        index = (s_pwd.tap + 1) % (int)strlen(letters);
-        s_pwd.len -= 1;                                 /* only ASCII is ever pushed */
-        s_pwd.text[s_pwd.len] = 0;
-        pwd_render();
+    if (digit<0 || digit>9) return;
+    if (s_pwd.mode==PWD_DIGIT) {
+        pwd_commit();
+        char c[2]={(char)('0'+digit),0}; pwd_push(c); return;
     }
-    char c[2] = {letters[index], 0};
-    if (s_pwd.mode == PWD_UPPER && c[0] >= 'a' && c[0] <= 'z') c[0] -= 32;
-    pwd_push(c);
-    s_pwd.last_key = digit;
-    s_pwd.tap = index;
-    s_pwd.last_ms = now;
+    const char *letters=s_pwd.mode==PWD_SYM ? pwd_symbols[digit] : pwd_t9[digit];
+    if (!letters[0]) { pwd_commit(); pwd_push(digit==1 ? "." : "-"); return; }
+    bool chain=s_pwd.last_key==digit && now-s_pwd.last_ms<PWD_TAP_MS && s_pwd.len;
+    int index=chain ? (s_pwd.tap+1)%(int)strlen(letters) : 0;
+    if (chain) s_pwd.text[--s_pwd.len]=0;
+    if (s_pwd.len>=PWD_MAX) { pwd_commit(); return; }
+    char c[2]={letters[index],0};
+    if (s_pwd.mode==PWD_UPPER && c[0]>='a' && c[0]<='z') c[0]-=32;
+    pwd_push(c); s_pwd.last_key=digit; s_pwd.tap=index; s_pwd.last_ms=now; pwd_render();
 }
 
 static void pwd_submit(void)
 {
-    if (!s_pwd.len) { wifi_notice_for("无密码", 3000); return; }
-    bool ok = ui.config.wifi_connect &&
-              ui.config.wifi_connect(s_pwd.ssid, s_pwd.text);
-    memset(s_pwd.text, 0, sizeof(s_pwd.text));    /* never keep the key in RAM */
-    s_pwd.len = 0;
-    if (!ok) { wifi_notice_for("Wi-Fi 未就绪", 5000); return; }
-    wifi_notice("");                 /* the state line reports progress */
-    meo_ui_navigate(MEO_WIFI);
+    pwd_commit();
+    bool ok=ui.config.wifi_connect && ui.config.wifi_connect(s_pwd.ssid,s_pwd.text);
+    if (!ok) {
+        /* The request was rejected, not consumed. Keep both buffer and field. */
+        label_text_if_changed(ui.pwd_notice,"暂不可用");
+        visible(ui.pwd_ssid,false); visible(ui.pwd_notice,true);
+        ui.pwd_notice_hide_at=ui.clock_ms+4000;
+        return;
+    }
+    meo_ui_set_wifi(MEO_WIFI_CONNECTING,s_pwd.ssid,0);
+    wifi_notice("连接中");
+    meo_ui_navigate(MEO_WIFI); /* page_leaving securely clears the accepted key */
 }
 
 static void password_create(void)
 {
-    lv_obj_t *p = ui.pages[MEO_PASSWORD];
-    header(p, "密码", ACT_WIFI);
-    lv_obj_t *chip = button(p, 336, 40, 88, 64, CARD, NULL, ACT_PWD_MODE);
-    ui.pwd_mode = label(chip, "abc", 0, 0, 88, &meo_font_28, ACCENT_AMBER, true);
-    lv_obj_center(ui.pwd_mode);
-
-    ui.pwd_ssid = label(p, "", 24, 116, 412, &meo_font_28, MUTED, false);
-    ui.pwd_field = box(p, 24, 158, 352, 64, CARD, 20);
-    ui.pwd_text = label(ui.pwd_field, "密码", 18, 16, 316, &meo_font_28, DIM, false);
-    lv_label_set_long_mode(ui.pwd_text, LV_LABEL_LONG_CLIP);
-    lv_obj_t *eye = button(p, 384, 158, 64, 64, CARD, NULL, ACT_PWD_EYE);
-    ui.pwd_eye = icon(eye, ICON_EYE, 34, WHITE);
-    lv_obj_center(ui.pwd_eye);
-
-    /* 3 rows x 4 columns: 1-4 / 5-8 / 9 0 delete OK */
-    /* 3 rows must fit 240..456: 3*64 + 2*12 = 216, so keys stay >= the 64 px
-       target without running off the panel. */
-    const int key_w = 99, key_h = 64, gap = 10, gap_y = 12, x0 = 24, y0 = 240;
-    for (unsigned i = 0; i < PWD_KEY_COUNT; ++i) {
-        int col = (int)(i % 4), row = (int)(i / 4);
-        lv_obj_t *key = button(p, x0 + col * (key_w + gap), y0 + row * (key_h + gap_y),
-                               key_w, key_h, CARD, NULL, ACT_PWD_KEY0 + (int)i);
-        lv_obj_set_style_radius(key, 22, 0);
-        int digit = pwd_key_digit[i];
-        const char *text = digit >= 0 ? "" : (digit == -1 ? "<-" : "OK");
-        ui.pwd_keys[i] = key;
-        ui.pwd_key_labels[i] = label(key, text, 0, 0, key_w, &meo_font_28, WHITE, true);
+    lv_obj_t *p=ui.pages[MEO_PASSWORD];
+    ui.pwd_ssid=header(p,"密码",ACT_WIFI);
+    lv_obj_t *back=lv_obj_get_parent(ui.pwd_ssid);
+    lv_obj_set_pos(back,24,12); lv_obj_set_size(back,284,64);
+    lv_obj_t *chevron=lv_obj_get_child(back,0);
+    lv_obj_set_size(chevron,32,32); lv_obj_align(chevron,LV_ALIGN_LEFT_MID,0,0);
+    lv_obj_set_width(ui.pwd_ssid,228); lv_obj_align(ui.pwd_ssid,LV_ALIGN_LEFT_MID,56,0);
+    lv_label_set_long_mode(ui.pwd_ssid,LV_LABEL_LONG_DOT);
+    ui.pwd_notice=label(p,"",80,28,228,&meo_font_28,ACCENT_AMBER,false);
+    visible(ui.pwd_notice,false);
+    ui.pwd_keys[11]=button(p,324,12,112,64,0x183D37,NULL,ACT_PWD_KEY0+11);
+    ui.pwd_key_labels[11]=label(ui.pwd_keys[11],"连接",0,0,112,&meo_font_28,ACCENT_CYAN,true);
+    lv_obj_center(ui.pwd_key_labels[11]);
+    ui.pwd_field=box(p,24,88,268,72,CARD,20);
+    ui.pwd_text=label(ui.pwd_field,"密码",18,18,232,&meo_font_28,DIM,false);
+    lv_label_set_long_mode(ui.pwd_text,LV_LABEL_LONG_CLIP);
+    lv_obj_t *eye=button(p,300,88,64,72,CARD,NULL,ACT_PWD_EYE);
+    ui.pwd_eye=icon(eye,ICON_EYE_OFF,34,WHITE); lv_obj_center(ui.pwd_eye);
+    ui.pwd_keys[10]=button(p,372,88,64,72,CARD,NULL,ACT_PWD_KEY0+10);
+    lv_obj_center(icon(ui.pwd_keys[10],ICON_DELETE,32,WHITE));
+    for (unsigned i=0;i<10;++i) {
+        int col=i==9 ? 1 : (int)(i%3), row=i==9 ? 3 : (int)(i/3);
+        ui.pwd_keys[i]=button(p,24+col*140,176+row*70,132,64,CARD,NULL,ACT_PWD_KEY0+(int)i);
+        ui.pwd_key_labels[i]=label(ui.pwd_keys[i],"",0,0,132,&meo_font_28,WHITE,true);
         lv_obj_center(ui.pwd_key_labels[i]);
     }
-    pwd_render();
-    pwd_mode_paint();
+    lv_obj_t *mode=button(p,24,386,132,64,0x30241A,NULL,ACT_PWD_MODE);
+    ui.pwd_mode=label(mode,"abc",0,0,132,&meo_font_28,ACCENT_AMBER,true);
+    lv_obj_center(ui.pwd_mode);
+    ui.pwd_next=button(p,304,386,132,64,0x16283C,"下一位",ACT_PWD_NEXT);
+    lv_obj_set_style_bg_color(ui.pwd_next,color(CARD),LV_STATE_DISABLED);
+    pwd_mode_paint(); pwd_render();
 }
 
 bool meo_ui_font_has(const char *utf8)
@@ -1488,10 +1802,13 @@ void meo_ui_password_open(const char *ssid)
     if (!ui.ready) return;
     memset(s_pwd.text, 0, sizeof(s_pwd.text));
     s_pwd.len = 0;
+    visible(ui.pwd_notice,false); visible(ui.pwd_ssid,true); ui.pwd_notice_hide_at=0;
     s_pwd.last_key = -1;
     s_pwd.tap = 0;
     s_pwd.mode = PWD_ABC;
     s_pwd.mask = true;
+    lv_obj_set_user_data(ui.pwd_eye,(void *)(uintptr_t)ICON_EYE_OFF);
+    lv_obj_set_style_line_color(ui.pwd_eye,color(WHITE),0);
     snprintf(s_pwd.ssid, sizeof(s_pwd.ssid), "%s", ssid ? ssid : "");
     if (ui.pwd_ssid) {
         const char *shown = text_renderable(s_pwd.ssid, &meo_font_28) ? s_pwd.ssid : "已选网络";
@@ -1510,84 +1827,90 @@ void meo_ui_password_open(const char *ssid)
  * every segment whose state did not change. */
 static void mic_create(void)
 {
-    lv_obj_t *p = ui.pages[MEO_MIC];
-    header(p, "麦克风", ACT_SETTINGS);
-
-    ui.mic_db[0] = label(p, "L    -96 dB", 32, 146, 320, &meo_font_28, DIM, false);
-    ui.mic_db[1] = label(p, "R    -96 dB", 32, 262, 320, &meo_font_28, DIM, false);
-    ui.mic_state = label(p, "待机", 32, 374, 320, &meo_font_28, MUTED, false);
-
-    /* 13 segments of 24 px with a 4 px gap fill 72..432, leaving room for the
-       L/R label column without touching the panel edge. */
-    const int seg_w = 24, gap = 4, x0 = 72, seg_h = 34;
-    const int row_y[2] = {190, 306};
-    for (int c = 0; c < 2; ++c) {
-        for (int i = 0; i < MIC_SEGS; ++i) {
-            lv_obj_t *seg = box(p, x0 + i * (seg_w + gap), row_y[c],
-                                seg_w, seg_h, 0x1A1A1A, 8);
-            ui.mic_seg[c][i] = seg;
-        }
+    lv_obj_t *p=ui.pages[MEO_MIC];header(p,"麦克风",ACT_SETTINGS);
+    lv_obj_t *meter=box(p,32,120,396,138,CARD,28);
+    const int ys[2]={22,78};
+    for (int c=0;c<2;++c) {
+        ui.mic_db[c]=label(meter,c ? "R" : "L",20,ys[c]+3,36,UI_SETTINGS_FONT,MUTED,false);
+        for (int n=0;n<MIC_SEGS;++n)
+            ui.mic_seg[c][n]=box(meter,68+n*24,ys[c],19,34,0x242424,6);
     }
-    ui.mic_target[0] = ui.mic_target[1] = 0.0f;
-    ui.mic_shown[0] = ui.mic_shown[1] = 0.0f;
-    ui.mic_db_shown[0] = ui.mic_db_shown[1] = -1000;
-    memset(ui.mic_lit, -1, sizeof(ui.mic_lit));
+    lv_obj_t *card=box(p,32,266,396,146,CARD,28);
+    lv_obj_t *gain_mark=icon(card,ICON_MIC,32,ACCENT_AMBER);
+    lv_obj_set_pos(gain_mark,24,16);
+    ui.mic_gain_value=label(card,"29%",230,6,140,&meo_font_44,ACCENT_AMBER,true);
+    ui.mic_gain_slider=lv_slider_create(card);
+    lv_obj_set_pos(ui.mic_gain_slider,92,103);lv_obj_set_size(ui.mic_gain_slider,212,12);
+    lv_obj_set_ext_click_area(ui.mic_gain_slider,20);
+    lv_slider_set_range(ui.mic_gain_slider,0,14);
+    lv_slider_set_value(ui.mic_gain_slider,ui.model.settings.mic_gain,LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(ui.mic_gain_slider,color(0x353535),LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui.mic_gain_slider,color(ACCENT_AMBER),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(ui.mic_gain_slider,color(WHITE),LV_PART_KNOB);
+    lv_obj_set_style_pad_all(ui.mic_gain_slider,6,LV_PART_KNOB);
+    lv_obj_add_event_cb(ui.mic_gain_slider,settings_event,LV_EVENT_VALUE_CHANGED,NULL);
+    lv_obj_t *down=button(card,12,76,64,64,0x252525,NULL,ACT_GAIN_DOWN);
+    lv_obj_t *up=button(card,320,76,64,64,0x252525,NULL,ACT_GAIN_UP);
+    lv_obj_center(icon(down,ICON_MINUS,28,WHITE));lv_obj_center(icon(up,ICON_PLUS,28,WHITE));
+    ui.mic_state=label(p,"准备中",40,420,380,UI_SETTINGS_FONT,MUTED,true);
+    memset(ui.mic_lit,-1,sizeof(ui.mic_lit));
 }
 
-void meo_ui_set_mic(const float level[2], bool running)
+void meo_ui_set_mic(const float level[2],bool running)
 {
     if (!ui.ready || !level) return;
-    for (int c = 0; c < 2; ++c) {
-        float v = level[c];
-        if (v < 0) v = 0;
-        if (v > 1) v = 1;
-        ui.mic_target[c] = v;
-        int db = v > 0.0001f ? (int)(20.0f * log10f(v)) : -96;
-        if (db < -96) db = -96;
-        if (db != ui.mic_db_shown[c] && ui.mic_db[c]) {
-            ui.mic_db_shown[c] = db;
-            lv_label_set_text_fmt(ui.mic_db[c], "%c   %d dB",
-                                  c ? 'R' : 'L', db);
-            lv_obj_set_style_text_color(ui.mic_db[c],
-                                        color(v > 0.02f ? WHITE : DIM), 0);
-        }
-    }
-    if (ui.mic_state)
-        lv_label_set_text(ui.mic_state, running ? "运行" : "待机");
+    for (int c=0;c<2;++c) ui.mic_target[c]=running ? LV_CLAMP(0.0f,level[c],1.0f) : 0;
+    if (ui.mic_state) label_text_if_changed(ui.mic_state,running ? "正在聆听" : "未就绪");
+    ui.home_capture_active=running;
+    bool show=(ui.model.page==MEO_HOME) && (running || ui.home_wake_detected);
+    visible(ui.home_capture_ring,show);
+    visible(ui.home_capture_mic,show);
+    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],show);
+}
+
+void meo_ui_set_wake_state(bool wake_detected)
+{
+    if (!ui.ready) return;
+    ui.home_wake_detected=wake_detected;
+    uint32_t ink=wake_detected ? ACCENT_AMBER : ACCENT_CYAN;
+    if (ui.home_capture_ring) lv_obj_set_style_border_color(ui.home_capture_ring,color(ink),0);
+    if (ui.home_capture_mic) lv_obj_set_style_line_color(ui.home_capture_mic,color(ink),0);
+    for (int i=0;i<8;++i) if (ui.home_capture_wave[i])
+        lv_obj_set_style_bg_color(ui.home_capture_wave[i],color(ink),0);
+    bool show=(ui.model.page==MEO_HOME) && (ui.home_capture_active || wake_detected);
+    visible(ui.home_capture_ring,show);
+    visible(ui.home_capture_mic,show);
+    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],show);
 }
 
 void meo_ui_set_audio(const meo_audio_view_t *view)
 {
-    if (!ui.ready || !view || !ui.audio_result || !ui.audio_meta) return;
+    if (!ui.ready || !view) return;
+    ui.preview_busy=view->playback_busy;
+    label_text_if_changed(ui.preview_label,view->playback_busy ? "播放中" : "试听");
+    if (view->playback_busy) lv_obj_add_state(ui.preview_button,LV_STATE_DISABLED);
+    else lv_obj_remove_state(ui.preview_button,LV_STATE_DISABLED);
+    label_text_if_changed(ui.audio_result,view->playback_error ? "播放失败" : "");
+}
 
-    /* ASCII-only status: the shipped font covers it, and no per-frame text
-       rebuild happens because both labels are cached by their strings. */
-    char result[40];
-    if (view->busy) snprintf(result, sizeof(result), "RUN");
-    else if (view->loop_state == 2 || view->loop_state == 3)
-        snprintf(result, sizeof(result), "%s %d",
-                 view->loop_state == 2 ? "PASS" : "FAIL", view->loop_score);
-    else snprintf(result, sizeof(result), "WAIT");
-
-    if (strcmp(result, ui.audio_result_text) != 0) {
-        strncpy(ui.audio_result_text, result, sizeof(ui.audio_result_text) - 1);
-        ui.audio_result_text[sizeof(ui.audio_result_text) - 1] = '\0';
-        lv_label_set_text(ui.audio_result, result);
-        uint32_t col = view->loop_state == 2 ? ACCENT_CYAN
-                     : view->loop_state == 3 ? 0xFF8A8A
-                     : view->busy ? ACCENT_AMBER : MUTED;
-        lv_obj_set_style_text_color(ui.audio_result, color(col), 0);
+void meo_ui_capture_view(meo_ui_capture_view_t *out)
+{
+    if (!out) return;
+    memset(out,0,sizeof(*out));
+    if (!ui.ready || !ui.home_capture_ring || !ui.home_capture_wave[0]) return;
+    out->visible=ui.model.page==MEO_HOME && lv_obj_is_visible(ui.home_capture_ring) &&
+                 lv_obj_is_visible(ui.home_capture_mic);
+    out->wave_seq=ui.home_wave_seq;
+    out->ink=lv_color_to_u32(lv_obj_get_style_bg_color(ui.home_capture_wave[0],0)) & 0xFFFFFF;
+    out->ack=out->visible && out->ink==ACCENT_AMBER;
+    out->min_height=UINT32_MAX;
+    for (int i=0;i<8;++i) {
+        out->visible=out->visible && lv_obj_is_visible(ui.home_capture_wave[i]);
+        unsigned h=(unsigned)lv_obj_get_height(ui.home_capture_wave[i]);
+        if (h<out->min_height) out->min_height=h;
+        if (h>out->max_height) out->max_height=h;
     }
-
-    char meta[40];
-    snprintf(meta, sizeof(meta), "MCLK %d%% MIC %u/%u VOL %d%s",
-             view->mclk_duty, view->route_l, view->route_r, view->volume,
-             view->mic_running ? "" : " OFF");
-    if (strcmp(meta, ui.audio_meta_text) != 0) {
-        strncpy(ui.audio_meta_text, meta, sizeof(ui.audio_meta_text) - 1);
-        ui.audio_meta_text[sizeof(ui.audio_meta_text) - 1] = '\0';
-        lv_label_set_text(ui.audio_meta, meta);
-    }
+    out->ack=out->ack && out->visible;
 }
 
 /* Called from the UI tick: smooth + repaint only the segments that flipped. */
@@ -1612,6 +1935,30 @@ static void mic_tick(void)
                                  : ACCENT_CYAN;
             lv_obj_set_style_bg_color(ui.mic_seg[c][i], color(ink), 0);
         }
+    }
+    if (ui.model.page==MEO_HOME && ui.home_capture_ring &&
+        (ui.home_capture_active || ui.home_wake_detected)) {
+        float level=(ui.mic_shown[0]+ui.mic_shown[1])*.5f;
+        float phase=(float)(ui.clock_ms%900)/900.0f;
+        for (int i=0;i<8;++i) {
+            float wave=ui.home_capture_active ? (0.14f+level*.86f) : .12f;
+            int side=i<4 ? i : 7-i;
+            float ripple=0.5f+0.5f*sinf((phase*2.0f*PI)+(float)side*.72f);
+            float envelope=0.38f+0.62f*(1.0f-(float)side/4.0f);
+            int h=LV_CLAMP(5,(int)lroundf(5.0f+wave*(11.0f+13.0f*ripple)*envelope),28);
+            if (h==ui.home_wave_height[i]) continue;
+            ui.home_wave_height[i]=h;
+            int y=386-h/2;
+            lv_obj_set_pos(ui.home_capture_wave[i],lv_obj_get_x(ui.home_capture_wave[i]),y);
+            lv_obj_set_height(ui.home_capture_wave[i],h);
+            ++ui.home_wave_seq;
+        }
+        float pulse=0.5f+0.5f*sinf((phase*2.0f*PI));
+        int border=ui.home_wake_detected ? 2 : 1;
+        lv_obj_set_style_border_width(ui.home_capture_ring,border,0);
+        lv_obj_set_style_border_opa(ui.home_capture_ring,
+                                    (lv_opa_t)(ui.home_wake_detected ?
+                                               145 : 70+(int)lroundf(pulse*55)),0);
     }
 }
 
@@ -1648,17 +1995,8 @@ static uint64_t normalize_input_time(uint64_t sample)
  * frame repainted the equivalent of ~80 full screens per second, which starved
  * touch handling and made the whole UI feel stuck. Compute the target state,
  * compare with what the panel already shows, and push only real changes. */
-static struct {
-    bool valid;
-    int x[2], y[2], width[2], count[2];
-    lv_point_precise_t pts[2][EYE_POINTS];
-    int pupil_x[2], pupil_y[2];
-    bool pupil_on[2];
-} s_eye;
-
-static void update_home(void)
+static void update_face(face_view_t *face, const meo_model_t *m, float scale, int center_y)
 {
-    const meo_model_t *m = &ui.model;
     for (int i = 0; i < 2; ++i) {
         const meo_eye_shape_t *s = &m->eye_shape[i];
         int width = (int)lroundf(s->width * m->openness);
@@ -1667,55 +2005,173 @@ static void update_home(void)
          * blink; preserve its horizontal footprint rather than disappearing. */
         float half_x = s->half_x + (s->width - width) * .5f;
         unsigned count = half_x < .1f && fabsf(s->arch) < .1f ? 2 : EYE_POINTS;
-        int x = (i ? 309 : 151) - 70 + (int)lroundf(m->eye_x * 16);
-        int y = 150 + (int)lroundf(m->eye_y * 12);
+        int x = 230 + (int)lroundf(((i ? 79 : -79) - 70)*scale) + (int)lroundf(m->eye_x*16*scale);
+        int y = center_y - (int)lroundf(80*scale) + (int)lroundf(m->eye_y*12*scale);
+        width = (int)lroundf(width*scale);
 
         lv_point_precise_t tmp[EYE_POINTS];
         for (unsigned j = 0; j < count; ++j) {
             float t = -1 + 2.0f * j / (count - 1);
-            tmp[j].x = lroundf(70 + half_x * t);
-            tmp[j].y = lroundf(80 + s->y + m->openness *
-                               (s->half_y * t + s->arch * (t * t - .5f)));
+            tmp[j].x = lroundf((70 + half_x * t)*scale);
+            tmp[j].y = lroundf((80 + s->y + m->openness *
+                               (s->half_y * t + s->arch * (t * t - .5f)))*scale);
         }
+        /* Pixel quantization can collapse ALL 17 samples of a nearly round
+           eye during a blink/morph. LVGL skips a zero-length polyline, which
+           made that eye disappear. Keep a one-pixel round-capped spine. */
+        unsigned distinct=1;
+        for (unsigned j=1;j<count;++j)
+            if (tmp[j].x!=tmp[distinct-1].x || tmp[j].y!=tmp[distinct-1].y)
+                tmp[distinct++]=tmp[j];
+        count=distinct;
+        if (count==1) {tmp[1]=tmp[0];tmp[1].y+=1;count=2;}
 
-        bool moved = !s_eye.valid || s_eye.x[i] != x || s_eye.y[i] != y;
-        bool resized = !s_eye.valid || s_eye.width[i] != width;
-        bool reshaped = !s_eye.valid || s_eye.count[i] != (int)count ||
-                        memcmp(tmp, s_eye.pts[i], count * sizeof(tmp[0])) != 0;
+        bool moved = !face->valid || face->x[i] != x || face->y[i] != y;
+        bool resized = !face->valid || face->width[i] != width;
+        bool reshaped = !face->valid || face->count[i] != (int)count ||
+                        memcmp(tmp, face->shown[i], count * sizeof(tmp[0])) != 0;
 
         /* Order matters: a width change is the expensive invalidation, so apply
            it before the points when both change, and let LVGL merge. */
         if (moved) {
-            lv_obj_set_pos(ui.eye[i], x, y);
-            s_eye.x[i] = x;
-            s_eye.y[i] = y;
+            lv_obj_set_pos(face->eye[i], x, y);
+            face->x[i] = x;
+            face->y[i] = y;
         }
         if (resized) {
-            lv_obj_set_style_line_width(ui.eye[i], width, 0);
-            s_eye.width[i] = width;
+            lv_obj_set_style_line_width(face->eye[i], width, 0);
+            face->width[i] = width;
         }
         if (reshaped) {
-            memcpy(ui.eye_points[i], tmp, count * sizeof(tmp[0]));
-            lv_line_set_points(ui.eye[i], ui.eye_points[i], count);
-            s_eye.count[i] = (int)count;
-            memcpy(s_eye.pts[i], tmp, count * sizeof(tmp[0]));
+            memcpy(face->points[i], tmp, count * sizeof(tmp[0]));
+            lv_line_set_points(face->eye[i], face->points[i], count);
+            face->count[i] = (int)count;
+            memcpy(face->shown[i], tmp, count * sizeof(tmp[0]));
         }
 
-        int pupil_x = 58 + (int)lroundf(m->eye_x * 10);
-        int pupil_y = 68 + (int)lroundf(m->eye_y * 7);
+        int pupil_x = (int)lroundf(58*scale) + (int)lroundf(m->eye_x*10*scale);
+        int pupil_y = (int)lroundf(68*scale) + (int)lroundf(m->eye_y*7*scale);
         bool round_eye = s->half_y > 0.5f || fabsf(s->arch) < .1f;
         bool pupil_on = round_eye && width > 24;
-        if (!s_eye.valid || s_eye.pupil_x[i] != pupil_x || s_eye.pupil_y[i] != pupil_y) {
-            lv_obj_set_pos(ui.pupil[i], pupil_x, pupil_y);
-            s_eye.pupil_x[i] = pupil_x;
-            s_eye.pupil_y[i] = pupil_y;
+        if (!face->valid || face->pupil_x[i] != pupil_x || face->pupil_y[i] != pupil_y) {
+            lv_obj_set_pos(face->pupil[i], pupil_x, pupil_y);
+            face->pupil_x[i] = pupil_x;
+            face->pupil_y[i] = pupil_y;
         }
-        if (!s_eye.valid || s_eye.pupil_on[i] != pupil_on) {
-            visible(ui.pupil[i], pupil_on);
-            s_eye.pupil_on[i] = pupil_on;
+        if (!face->valid || face->pupil_on[i] != pupil_on) {
+            visible(face->pupil[i], pupil_on);
+            face->pupil_on[i] = pupil_on;
         }
     }
-    s_eye.valid = true;
+    face->valid = true;
+}
+
+static void update_mouth(face_view_t *face, const meo_mouth_shape_t *s, bool on)
+{
+    for (int lip=0;lip<2;++lip) {
+        lv_point_precise_t points[EYE_POINTS];
+        for (unsigned j=0;j<EYE_POINTS;++j) {
+            float t=-1+2.0f*j/(EYE_POINTS-1),arc=1-t*t;
+            float opening=s->aperture*sqrtf(arc);
+            points[j].x=lroundf(36+s->half_x*t);
+            points[j].y=lroundf(24+s->curve*arc+s->tilt*t+(lip ? -opening : opening));
+        }
+        if (!face->mouth_valid || memcmp(points,face->mouth_points[lip],sizeof(points))) {
+            memcpy(face->mouth_points[lip],points,sizeof(points));
+            lv_line_set_points(face->mouth[lip],face->mouth_points[lip],EYE_POINTS);
+        }
+        visible(face->mouth[lip],on && (!lip || s->aperture>.75f));
+    }
+    face->mouth_valid=true;
+}
+
+static void update_home(void)
+{
+    update_face(&ui.home_face,&ui.model,1.0f,230);
+    update_mouth(&ui.home_face,&ui.model.mouth_shape,ui.model.expression_media);
+}
+
+static void expression_preview_controls(void)
+{
+    if (!ui.expression_preview.name) return;
+    label_text_if_changed(ui.expression_preview.name,
+                         expression_labels[ui.expression_preview.model.expression]);
+    char level[12];snprintf(level,sizeof(level),"%u%%",ui.expression_preview.level);
+    label_text_if_changed(ui.expression_preview.level_label,level);
+    label_text_if_changed(ui.expression_preview.play_label,
+                         ui.expression_preview.autoplay ? "暂停" : "轮播");
+    lv_obj_set_style_bg_color(ui.expression_preview.play_button,
+                             color(ui.expression_preview.autoplay ? 0x16242E : CARD),0);
+    lv_obj_set_style_text_color(ui.expression_preview.play_label,
+                               color(ui.expression_preview.autoplay ? ACCENT_BLUE : WHITE),0);
+    lv_obj_set_style_bg_color(ui.expression_preview.mouth_button,
+                             color(ui.expression_preview.mouth_on ? 0x16242E : CARD),0);
+    lv_obj_set_style_text_color(ui.expression_preview.mouth_label,
+                               color(ui.expression_preview.mouth_on ? ACCENT_BLUE : MUTED),0);
+}
+
+static void expression_preview_enter(void)
+{
+    meo_expression_t expression=ui.expression_preview.model.expression;
+    meo_model_init(&ui.expression_preview.model,ui.clock_ms,&ui.model.settings);
+    meo_model_set_expression_level(&ui.expression_preview.model,expression,ui.expression_preview.level/100.f,0);
+    ui.expression_preview.autoplay=false;
+    ui.expression_preview.next_at=ui.clock_ms+FACE_STEP_MS;
+    expression_preview_controls();
+    expression_preview_tick();
+}
+
+static void expression_preview_select(int delta)
+{
+    int next=(ui.expression_preview.model.expression+delta+MEO_EYE_COUNT)%MEO_EYE_COUNT;
+    meo_model_set_expression_level(&ui.expression_preview.model,(meo_expression_t)next,ui.expression_preview.level/100.f,0);
+    ui.expression_preview.autoplay=false; /* manual selection always holds */
+    ui.expression_preview.next_at=ui.clock_ms+FACE_STEP_MS;
+    expression_preview_controls();
+}
+
+static void expression_preview_tick(void)
+{
+    if (ui.expression_preview.autoplay && ui.clock_ms>=ui.expression_preview.next_at) {
+        uint64_t steps=1+(ui.clock_ms-ui.expression_preview.next_at)/FACE_STEP_MS;
+        int next=(ui.expression_preview.model.expression+steps%MEO_EYE_COUNT)%MEO_EYE_COUNT;
+        meo_model_set_expression_level(&ui.expression_preview.model,(meo_expression_t)next,ui.expression_preview.level/100.f,0);
+        ui.expression_preview.next_at=ui.clock_ms+FACE_STEP_MS;
+        expression_preview_controls();
+    }
+    meo_model_tick(&ui.expression_preview.model,ui.clock_ms);
+    update_face(&ui.expression_preview.face,&ui.expression_preview.model,.82f,192);
+    update_mouth(&ui.expression_preview.face,&ui.expression_preview.model.mouth_shape,
+                 ui.expression_preview.mouth_on);
+}
+
+static void expressions_create(void)
+{
+    lv_obj_t *p=ui.pages[MEO_EXPRESSIONS];
+    header(p,"表情预览",ACT_SETTINGS);
+    lv_obj_t *h=lv_obj_get_child(p,0);
+    lv_obj_set_y(h,16);lv_obj_set_height(h,72);
+    face_create(&ui.expression_preview.face,p,.82f);
+    face_mouth_create(&ui.expression_preview.face,p,240);
+    lv_obj_t *previous=button(p,32,310,72,72,CARD,NULL,ACT_FACE_PREV);
+    lv_obj_t *mark=icon(previous,ICON_LEFT,40,WHITE);lv_obj_center(mark);
+    lv_obj_t *next=button(p,356,310,72,72,CARD,NULL,ACT_FACE_NEXT);
+    mark=icon(next,ICON_RIGHT,40,WHITE);lv_obj_center(mark);
+    ui.expression_preview.name=label(p,"平静",112,316,236,&meo_font_44,WHITE,true);
+    ui.expression_preview.mouth_button=button(p,32,390,120,64,CARD,NULL,ACT_FACE_MOUTH);
+    ui.expression_preview.mouth_label=label(ui.expression_preview.mouth_button,"嘴巴",0,0,120,UI_BODY_FONT,ACCENT_BLUE,true);
+    lv_obj_center(ui.expression_preview.mouth_label);
+    ui.expression_preview.play_button=button(p,308,390,120,64,CARD,NULL,ACT_FACE_PLAY);
+    ui.expression_preview.play_label=label(ui.expression_preview.play_button,"轮播",0,0,120,UI_BODY_FONT,WHITE,true);
+    lv_obj_center(ui.expression_preview.play_label);
+    ui.expression_preview.mouth_on=true;
+    lv_obj_t *strength=button(p,170,390,120,64,CARD,NULL,ACT_FACE_LEVEL);
+    ui.expression_preview.level_label=label(strength,"100%",0,0,120,UI_BODY_FONT,ACCENT_AMBER,true);
+    lv_obj_center(ui.expression_preview.level_label);
+    ui.expression_preview.level=100;
+    meo_model_init(&ui.expression_preview.model,ui.clock_ms,&ui.model.settings);
+    meo_model_set_expression(&ui.expression_preview.model,MEO_EYE_CALM,0);
+    expression_preview_controls();expression_preview_tick();
 }
 
 static void update_breathe(void)
@@ -1965,13 +2421,27 @@ static void tick(lv_timer_t *timer)
        arrives, never leave the icons at low detail permanently. Also drives
        the small per-frame batches that restore full detail. */
     icon_lod_service();
+    if (s_pwd.last_key>=0 && ui.clock_ms-s_pwd.last_ms>=PWD_TAP_MS) pwd_commit();
     if (s_notice_hide_at && ui.clock_ms >= s_notice_hide_at) wifi_notice("");
+    if (ui.save_hide_at && ui.clock_ms>=ui.save_hide_at) {save_status("");ui.save_hide_at=0;}
+    if (ui.pwd_notice_hide_at && ui.clock_ms>=ui.pwd_notice_hide_at) {
+        visible(ui.pwd_notice,false);visible(ui.pwd_ssid,true);ui.pwd_notice_hide_at=0;
+    }
     /* The overlay is fully opaque and covers the whole panel: animating the
        face underneath would repaint ~91k px per tick for nobody to see. */
-    if (ui.model.page == MEO_HOME && !s_overlay_up) update_home();
-    else if (ui.model.page == MEO_BREATHE) update_breathe();
-    else if (ui.model.page == MEO_MIC) mic_tick();
-    glow_tick();
+    if (!s_overlay_up) {
+        if (ui.model.page == MEO_HOME) update_home();
+        else if (ui.model.page == MEO_EXPRESSIONS) expression_preview_tick();
+        else if (ui.model.page == MEO_BREATHE) update_breathe();
+
+        /* Home is both the eye dial and the live listening surface.  Keep
+           the VU/waveform tick independent from the face branch above;
+           using else-if here made the home waveform freeze at its initial
+           height while the microphone page continued to work. */
+        if (ui.model.page == MEO_MIC || ui.model.page == MEO_HOME)
+            mic_tick();
+    }
+    shutdown_tick();
     /* Animation windows must also expire on a completely static page, where
        RENDER_READY never fires. */
     fps_check_deadline();
@@ -2059,15 +2529,24 @@ void meo_ui_create(const meo_ui_config_t *config)
     password_create();
     mic_create();
     speaker_create();
+    expressions_create();
     /* After every page exists: refresh_settings() writes ui.volume and
        ui.volume_summary, which are NULL until speaker_create() ran. */
     refresh_settings();
     breathe_create();
     ui.battery_percent = -1;   /* unknown until the adapter samples the ADC */
     ui.last_rate_tenths = -1;
-    ui.wifi_state = MEO_WIFI_OFF;
+    ui.wifi_state = ui.config.wifi_scan ? MEO_WIFI_STARTING : MEO_WIFI_UNAVAILABLE;
     shutdown_create();
+    ui.save_notice=label(lv_layer_top(),"",40,396,380,UI_SETTINGS_FONT,WHITE,true);
+    lv_obj_set_style_bg_color(ui.save_notice,color(0x432B1A),0);
+    lv_obj_set_style_bg_opa(ui.save_notice,LV_OPA_COVER,0);
+    lv_obj_set_style_pad_ver(ui.save_notice,8,0);
+    lv_obj_set_style_radius(ui.save_notice,16,0);
+    lv_obj_add_flag(ui.save_notice,LV_OBJ_FLAG_HIDDEN);
     ui.ready = true;
+    meo_ui_set_wifi(ui.wifi_state,NULL,0);
+    meo_ui_set_wifi_scan(false,0,0,0);
     for (lv_indev_t *indev=lv_indev_get_next(NULL);indev;indev=lv_indev_get_next(indev)) {
         if (lv_indev_get_type(indev)==LV_INDEV_TYPE_POINTER &&
             lv_indev_get_display(indev)==lv_display_get_default())
@@ -2112,12 +2591,24 @@ void meo_ui_set_breath_mode(meo_breath_mode_t mode)
 void meo_ui_set_expression(meo_expression_t expression, uint32_t hold_ms)
 { meo_model_set_expression(&ui.model, expression, hold_ms); }
 
+void meo_ui_set_sentence_pose(meo_expression_t expression, float intensity,
+                              const meo_face_pose_t *pose)
+{
+    if (ui.model.settings.reduced_motion) {
+        meo_face_pose_t still;
+        if (meo_expression_pose(expression,intensity,0,false,&still)) {
+            still.mouth.aperture=0;
+            meo_model_set_media_pose(&ui.model,expression,intensity,&still);
+        }
+    } else meo_model_set_media_pose(&ui.model,expression,intensity,pose);
+}
+
 void meo_ui_auto_expression(void)
 { meo_model_auto_expression(&ui.model); }
 
 void meo_ui_settings_saved(bool success)
 {
-    if (ui.ready) save_status(success ? "已保存到设备" : "保存失败");
+    if (ui.ready) save_status(success ? "" : "保存失败");
 }
 
 /* ---------------- status strip, Wi-Fi summary, shutdown overlay ---------------- */
@@ -2129,20 +2620,23 @@ static void power_paint(void)
     bool known = pct >= 0;
     visible(ui.power_gauge, known);
     visible(ui.power_text, known);
+    visible(ui.power_terminal, known);
     if (!known) return;
     if (pct > 100) pct = 100;
-    /* Home is the face and stays strictly monochrome: level is ink, and a
-       trailing "+" means VBUS is present (it does NOT mean the cell is
-       charging). Colour is reserved for the settings/network pages. */
-    int width = (pct * 50 + 50) / 100;
-    if (width < 2) width = 2;
-    lv_obj_set_width(ui.power_fill, width);
-    lv_obj_set_style_bg_color(ui.power_fill, color(WHITE), 0);
-    lv_obj_set_style_border_color(ui.power_gauge, color(ui.charging ? WHITE : MUTED), 0);
+    /* VBUS is not proof of charging. Keep a simple one-line percentage. */
+    bool full = pct == 100;
+    int width = (pct * POWER_FILL_W + 50) / 100;
+    lv_obj_set_width(ui.power_fill, LV_MAX(1, width));
+    visible(ui.power_fill, pct > 0 && !full);
+    /* A full battery is one solid rounded silhouette, not two antialiased
+       shapes meeting at an internal seam. Zero is genuinely empty. */
+    lv_obj_set_style_bg_color(ui.power_gauge, color(full ? WHITE : HOME_BG), 0);
+    uint32_t edge = full || ui.charging ? WHITE : MUTED;
+    lv_obj_set_style_border_color(ui.power_gauge, color(edge), 0);
+    lv_obj_set_style_bg_color(ui.power_terminal, color(edge), 0);
     lv_obj_set_style_text_color(ui.power_text, color(WHITE), 0);
     char pct_text[16];
-    if (ui.charging) snprintf(pct_text, sizeof(pct_text), "%d%%+", pct);
-    else snprintf(pct_text, sizeof(pct_text), "%d%%", pct);
+    snprintf(pct_text, sizeof(pct_text), "%d%%", pct);
     label_text_if_changed(ui.power_text, pct_text);
 }
 
@@ -2155,23 +2649,52 @@ void meo_ui_set_power(int percent, bool charging)
     power_paint();
 }
 
-/* Line under the state: the connected SSID, else how many networks were found.
- * Keeping it populated removes the 76 px hole that appeared when both the SSID
- * and the transient notice were hidden. */
+/* This is the only presenter for network status. Association, result count,
+ * progress and errors cannot independently paint overlapping labels. */
 static void refresh_wifi_info(void)
 {
     if (!ui.wifi_page_ssid) return;
-    if (ui.wifi_state == MEO_WIFI_ONLINE) {
-        visible(ui.wifi_page_ssid, true);
-        return;                          /* text set by meo_ui_set_wifi */
+    bool notice=ui.wifi_notice && !lv_obj_has_flag(ui.wifi_notice,LV_OBJ_FLAG_HIDDEN);
+    visible(ui.wifi_page_ssid,!notice);
+    visible(ui.wifi_page_state,!notice);
+    visible(ui.wifi_status_mark,!notice);
+    if (ui.wifi_status_mark)
+        lv_obj_set_style_line_color(ui.wifi_status_mark,
+            color(ui.wifi_state==MEO_WIFI_ONLINE ? ACCENT_CYAN : DIM),0);
+    if (!notice) {
+        const char *left="未连接", *right="";
+        char count[32];
+        if (ui.wifi_state==MEO_WIFI_ONLINE) {
+            left=ui.wifi_connected_ssid[0] ? ui.wifi_connected_ssid : "已连接网络";
+            right="已接入";
+        } else if (ui.wifi_state==MEO_WIFI_CONNECTING) left="连接中";
+        else if (ui.wifi_state==MEO_WIFI_STARTING) left="启动中";
+        else if (ui.wifi_state==MEO_WIFI_UNAVAILABLE) left="暂不可用";
+        else if (ui.wifi_state==MEO_WIFI_ERROR) left="连接失败";
+        if (ui.wifi_ap_visible && ui.wifi_state!=MEO_WIFI_ONLINE) {
+            snprintf(count,sizeof(count),"%u 个网络",ui.wifi_ap_visible);
+            right=count;
+        }
+        label_text_if_changed(ui.wifi_page_ssid,left);
+        label_text_if_changed(ui.wifi_page_state,right);
+        lv_obj_set_style_text_color(ui.wifi_page_state,color(ui.wifi_state==MEO_WIFI_ONLINE ? ACCENT_CYAN : MUTED),0);
     }
-    if (ui.wifi_ap_visible) {
-        char found[48];
-        snprintf(found, sizeof(found), "找到 %u 个网络", ui.wifi_ap_visible);
-        label_text_if_changed(ui.wifi_page_ssid, found);
-        visible(ui.wifi_page_ssid, true);
-    } else {
-        visible(ui.wifi_page_ssid, false);
+    if (ui.wifi_hint) visible(ui.wifi_hint,!ui.wifi_ap_visible && !notice &&
+                             ui.wifi_state!=MEO_WIFI_UNAVAILABLE && ui.wifi_state!=MEO_WIFI_CONNECTING);
+    if (ui.wifi_scan_button) {
+        bool blocked=ui.wifi_scanning || ui.wifi_state==MEO_WIFI_CONNECTING ||
+                     ui.wifi_state==MEO_WIFI_STARTING || ui.wifi_state==MEO_WIFI_UNAVAILABLE;
+        if (blocked) lv_obj_add_state(ui.wifi_scan_button,LV_STATE_DISABLED);
+        else lv_obj_remove_state(ui.wifi_scan_button,LV_STATE_DISABLED);
+        lv_obj_set_style_text_color(ui.wifi_scan_label,color(blocked ? DIM : ACCENT_BLUE),0);
+    }
+    for (unsigned i=0;i<ui.wifi_ap_visible;++i) {
+        bool connected=ui.wifi_state==MEO_WIFI_ONLINE &&
+                       !strcmp(ui.wifi_ap_ssid[i],ui.wifi_connected_ssid);
+        uint32_t ink=connected ? ACCENT_CYAN : ui.wifi_ap_rssi[i]>=-67 ? ACCENT_BLUE : 0x698298;
+        lv_obj_set_style_line_color(ui.wifi_row_mark[i],color(ink),0);
+        lv_obj_set_style_text_color(ui.wifi_row_ssid[i],color(connected ? ACCENT_CYAN : WHITE),0);
+        lv_obj_set_style_bg_color(ui.wifi_rows[i],color(connected ? 0x10252A : 0x0B1016),0);
     }
 }
 
@@ -2179,6 +2702,7 @@ void meo_ui_set_wifi(meo_wifi_state_t state, const char *ssid, int rssi)
 {
     if (!ui.ready) return;
     (void)rssi; /* Signal strength is not drawn; kept for the report path. */
+    meo_wifi_state_t previous=ui.wifi_state;
     ui.wifi_state = state;
     uint32_t ink = state == MEO_WIFI_ONLINE ? ACCENT_BLUE :
                   state == MEO_WIFI_CONNECTING ? ACCENT_AMBER :
@@ -2190,26 +2714,53 @@ void meo_ui_set_wifi(meo_wifi_state_t state, const char *ssid, int rssi)
     const char *label_text = state == MEO_WIFI_ONLINE ? (ssid && *ssid ? "已接入" : "已接入")
                            : state == MEO_WIFI_CONNECTING ? "连接中"
                            : state == MEO_WIFI_ERROR ? "连接失败" : "未接入";
-    label_text_if_changed(ui.wifi_summary, label_text);
-    if (state == MEO_WIFI_ONLINE || state == MEO_WIFI_ERROR) wifi_notice("");
-    const char *scan_text = state == MEO_WIFI_ERROR ? "重试连接" : "扫描附近网络";
-    label_text_if_changed(ui.wifi_scan_label, scan_text);
-    char page_state[48];
-    snprintf(page_state, sizeof(page_state), "Wi-Fi %s", label_text);
-    label_text_if_changed(ui.wifi_page_state, page_state);
+    if (state != previous && !ui.wifi_scanning &&
+        (state == MEO_WIFI_ONLINE || state == MEO_WIFI_ERROR ||
+         state == MEO_WIFI_READY || state == MEO_WIFI_UNAVAILABLE || state == MEO_WIFI_OFF))
+        wifi_notice("");
+    if (state == MEO_WIFI_STARTING) label_text = "启动中";
+    if (state == MEO_WIFI_READY) label_text = "未连接";
+    if (state == MEO_WIFI_UNAVAILABLE) label_text = "暂不可用";
+    label_text_if_changed(ui.wifi_summary,label_text);
+    /* Keep the control label stable. The status rail is the only place that
+       says "扫描中", so the page never presents two competing states. */
+    label_text_if_changed(ui.wifi_scan_label,"扫描");
+
     const char *name = state == MEO_WIFI_ONLINE && ssid && *ssid ? ssid : "";
     if (name[0] && !text_renderable(name, &meo_font_28)) name = "已连接网络";
-    if (name[0]) label_text_if_changed(ui.wifi_page_ssid, name);
+    snprintf(ui.wifi_connected_ssid,sizeof(ui.wifi_connected_ssid),"%s",name);
+    refresh_wifi_info();
+}
+
+void meo_ui_set_wifi_scan(bool active, int error, uint32_t completion_seq, int save_error)
+{
+    if (!ui.ready) return;
+    bool completed=completion_seq!=ui.wifi_scan_done &&
+        !(ui.model.page==MEO_WIFI && (ui.pointer_down || lv_obj_is_scrolling(ui.wifi_list)));
+    ui.wifi_scanning=active;
+    if (completed) ui.wifi_scan_done=completion_seq;
+    if (active) {
+        wifi_notice_for("扫描中",0);
+    } else if (completed) {
+        /* The status rail is intentionally compact: failure is actionable and
+           does not need a sentence that wraps into a second line. */
+        wifi_notice(error ? "扫描失败" : ui.wifi_ap_visible ? "" : "未找到网络");
+    }
+    if (save_error && save_error!=ui.wifi_save_error) wifi_notice("保存失败");
+    ui.wifi_save_error=save_error;
+    label_text_if_changed(ui.wifi_scan_label,"扫描");
     refresh_wifi_info();
 }
 
 void meo_ui_set_scan_list(const char ssid[][33], const int rssi[], unsigned count)
 {
     if (!ui.ready) return;
+    if (ui.model.page==MEO_WIFI && (ui.pointer_down || lv_obj_is_scrolling(ui.wifi_list))) return;
     unsigned rows = count > WIFI_ROWS ? WIFI_ROWS : count;
     ui.wifi_ap_visible = rows;
     for (unsigned i = 0; i < WIFI_ROWS; ++i) {
         if (i < rows && ssid[i][0]) {
+            ui.wifi_ap_rssi[i]=rssi[i];
             snprintf(ui.wifi_ap_ssid[i], sizeof(ui.wifi_ap_ssid[i]), "%s", ssid[i]);
             if (text_renderable(ui.wifi_ap_ssid[i], &meo_font_28)) {
                 label_text_if_changed(ui.wifi_row_ssid[i], ui.wifi_ap_ssid[i]);
@@ -2227,151 +2778,85 @@ void meo_ui_set_scan_list(const char ssid[][33], const int rssi[], unsigned coun
             visible(ui.wifi_rows[i], false);
         }
     }
-    if (ui.wifi_hint) visible(ui.wifi_hint, rows == 0);
+
+    visible(ui.wifi_list,rows>0);
     refresh_wifi_info();
 }
 
-static void anim_bg_opa(void *obj, int32_t value)
+/* Opaque independent screen: only the thin ring changes every logic tick.
+   The deadline is latched once; one-second status reports never restart it. */
+static void shutdown_tick(void)
 {
-    lv_obj_set_style_bg_opa(obj, (lv_opa_t)value, 0);
-}
-
-static void anim_text_opa(void *obj, int32_t value)
-{
-    lv_obj_set_style_text_opa(obj, (lv_opa_t)value, 0);
-}
-
-/* Halo breathing, driven from the 20 ms tick. As a standalone screen the
-   overlay is the only layer rasterised, so a full 30 fps update cycle fits in
-   the frame budget; the old 85 ms step (12 fps) left visible 90 ms gaps. */
-#define GLOW_STEP_MS 20
-static uint64_t s_glow_at_ms;
-static uint32_t s_glow_phase;
-
-static void glow_start(bool on)
-{
-    if (!ui.shutdown_glow) return;
-    s_glow_phase = 0;
-    s_glow_at_ms = ui.clock_ms;
-    if (!on) lv_obj_set_style_bg_opa(ui.shutdown_glow, 22, 0);
-}
-
-static void glow_tick(void)
-{
-    if (!s_overlay_up || !ui.shutdown_glow) return;
-    if (ui.clock_ms < s_glow_at_ms) return;
-    s_glow_at_ms = ui.clock_ms + GLOW_STEP_MS;
-    s_glow_phase = (s_glow_phase + 1) % 40;          /* 40 steps x 85 ms = 3.4 s */
-    float t = (float)s_glow_phase / 39.0f;
-    float wave = 0.5f - 0.5f * cosf(t * 6.2831853f);
-    lv_obj_set_style_bg_opa(ui.shutdown_glow, (lv_opa_t)(14 + 30.0f * wave), 0);
-}
-
-/* Each new digit fades up once: motion confirms the count is live. Scaling the
- * label would invalidate its parent (the full-screen overlay) every frame, so
- * the pulse is done on text opacity instead. */
-static void number_pop(void)
-{
-    if (!ui.shutdown_number) return;
-    lv_anim_delete(ui.shutdown_number, anim_text_opa);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, ui.shutdown_number);
-    lv_anim_set_exec_cb(&a, anim_text_opa);
-    lv_anim_set_values(&a, 110, LV_OPA_COVER);
-    lv_anim_set_duration(&a, 220);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
+    if (!s_overlay_up || s_key_number_shown<=0) return;
+    uint64_t remaining=ui.shutdown_end_ms>ui.clock_ms ? ui.shutdown_end_ms-ui.clock_ms : 0;
+    int progress=ui.model.settings.reduced_motion ? s_key_number_shown*1000/3 :
+                 (int)(remaining*1000/3000);
+    progress=LV_CLAMP(0,progress,1000);
+    if (progress!=ui.shutdown_progress) {
+        ui.shutdown_progress=progress; lv_arc_set_value(ui.shutdown_arc,progress);
+    }
 }
 
 static void shutdown_create(void)
 {
-    /* A standalone screen, NOT a child of lv_layer_top(). A top-layer
-       overlay forces LVGL to rasterise two full-screen layers on every
-       animation frame; as the active screen it is the only layer drawn,
-       which halves the halo animation's frame cost. */
-    ui.shutdown_layer = box(NULL, 0, 0, 460, 460, 0x000000, 0);
-    lv_obj_set_style_bg_opa(ui.shutdown_layer, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_font(ui.shutdown_layer, &meo_font_28, 0);
-    ui.shutdown_title = label(ui.shutdown_layer, "即将关机", 40, 96, 380, &meo_font_28, WHITE, true);
-
-    /* A closed ring reads as a countdown; an open arc looked like a horseshoe.
-       Rotation 270 puts the ring's start at 12 o'clock. */
-    /* Soft halo behind the ring: the only moving element besides the number,
-       so the page reads as "counting" rather than a static warning. */
-    ui.shutdown_glow = box(ui.shutdown_layer, 141, 154, 178, 178, ACCENT_AMBER, 89);
-    lv_obj_set_style_bg_opa(ui.shutdown_glow, 22, 0);
-    lv_obj_set_style_transform_pivot_x(ui.shutdown_glow, 89, 0);
-    lv_obj_set_style_transform_pivot_y(ui.shutdown_glow, 89, 0);
-
-    ui.shutdown_arc = lv_arc_create(ui.shutdown_layer);
-    lv_obj_set_pos(ui.shutdown_arc, 141, 154);
-    lv_obj_set_size(ui.shutdown_arc, 178, 178);
-    lv_arc_set_rotation(ui.shutdown_arc, 270);
-    lv_arc_set_bg_angles(ui.shutdown_arc, 0, 360);
-    lv_arc_set_range(ui.shutdown_arc, 0, 50);
-    lv_arc_set_value(ui.shutdown_arc, 50);
-    lv_obj_remove_style(ui.shutdown_arc, NULL, LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(ui.shutdown_arc, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ui.shutdown_arc, 11, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(ui.shutdown_arc, color(0x262626), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ui.shutdown_arc, 11, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(ui.shutdown_arc, color(ACCENT_AMBER), LV_PART_INDICATOR);
-    lv_obj_remove_flag(ui.shutdown_arc, LV_OBJ_FLAG_CLICKABLE);
-
-    ui.shutdown_number = label(ui.shutdown_layer, "5", 141, 218, 178, &meo_font_44, WHITE, true);
-    ui.shutdown_hint = label(ui.shutdown_layer, "松手即取消", 60, 362, 340, &meo_font_28, MUTED, true);
+    ui.shutdown_layer=box(NULL,0,0,460,460,BG,0);
+    lv_obj_set_style_text_font(ui.shutdown_layer,&meo_font_28,0);
+    ui.shutdown_title=label(ui.shutdown_layer,"即将关机",40,62,380,&meo_font_28,WHITE,true);
+    ui.shutdown_arc=lv_arc_create(ui.shutdown_layer);
+    lv_obj_set_pos(ui.shutdown_arc,114,126); lv_obj_set_size(ui.shutdown_arc,232,232);
+    lv_arc_set_rotation(ui.shutdown_arc,270); lv_arc_set_bg_angles(ui.shutdown_arc,0,360);
+    lv_arc_set_range(ui.shutdown_arc,0,1000); lv_arc_set_value(ui.shutdown_arc,1000);
+    lv_obj_remove_style(ui.shutdown_arc,NULL,LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(ui.shutdown_arc,LV_OPA_TRANSP,LV_PART_MAIN);
+    lv_obj_set_style_border_width(ui.shutdown_arc,0,LV_PART_MAIN);
+    lv_obj_set_style_pad_all(ui.shutdown_arc,0,LV_PART_MAIN);
+    lv_obj_set_style_arc_width(ui.shutdown_arc,6,LV_PART_MAIN);
+    lv_obj_set_style_arc_color(ui.shutdown_arc,color(0x242424),LV_PART_MAIN);
+    lv_obj_set_style_arc_width(ui.shutdown_arc,7,LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ui.shutdown_arc,color(ACCENT_AMBER),LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(ui.shutdown_arc,true,LV_PART_INDICATOR);
+    lv_obj_remove_flag(ui.shutdown_arc,LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
+    ui.shutdown_number=label(ui.shutdown_layer,"3",141,216,178,&meo_font_44,WHITE,true);
+    ui.shutdown_hint=label(ui.shutdown_layer,"松手取消",40,391,380,&meo_font_28,MUTED,true);
 }
 
 void meo_ui_set_shutdown(int seconds_left)
 {
     if (!ui.ready || !ui.shutdown_layer) return;
-    if (seconds_left < 0) {
+    if (seconds_left<0) {
         if (s_overlay_up) {
-            s_overlay_up = false;
-            s_eye.valid = false;        /* force one fresh face push */
+            s_overlay_up=false; ui.home_face.valid=false;
+            ui.expression_preview.face.valid=false;
             lv_screen_load(ui.pages[ui.model.page]);
         }
-        glow_start(false);
-        s_key_number_shown = -1;
+        s_key_number_shown=-1; ui.shutdown_end_ms=0;
         return;
     }
+    seconds_left=LV_MIN(seconds_left,3);
     if (!s_overlay_up) {
-        s_overlay_up = true;
+        warmup_abort();
+        /* A shutdown may interrupt a back drag or its settling animation.
+           Cancel that ownership before loading the independent screen. */
+        lv_anim_delete(NULL,back_set_offset);
+        lv_obj_set_x(ui.pages[ui.gesture_page],0);
+        ui.back_dragging=ui.back_settling=ui.back_candidate=ui.back_commit=false;
+        ui.back_offset=0;
+        ui.pointer_down=ui.caption_candidate=ui.caption_dragging=false;
+        ui.tap_moved=true;
+        if (ui.gesture_indev) lv_indev_wait_release(ui.gesture_indev);
+        s_overlay_up=true;
+        ui.shutdown_end_ms=ui.clock_ms+(uint64_t)seconds_left*1000;
+        ui.shutdown_progress=-1;
+        visible(ui.save_notice,false);
         lv_screen_load(ui.shutdown_layer);
-        /* Fade the whole overlay in so it never snaps onto the screen. */
-        lv_obj_set_style_bg_opa(ui.shutdown_layer, LV_OPA_TRANSP, 0);
-        lv_anim_t fade;
-        lv_anim_init(&fade);
-        lv_anim_set_var(&fade, ui.shutdown_layer);
-        lv_anim_set_exec_cb(&fade, anim_bg_opa);
-        lv_anim_set_values(&fade, 0, 255);
-        lv_anim_set_duration(&fade, 150);
-        lv_anim_set_path_cb(&fade, lv_anim_path_ease_out);
-        lv_anim_start(&fade);
-        glow_start(true);
     }
-    if (seconds_left > 0) {
-        bool changed = s_key_number_shown != seconds_left;
-        label_text_if_changed(ui.shutdown_title, "即将关机");
-        char digit[16];
-        snprintf(digit, sizeof(digit), "%d", seconds_left);
-        label_text_if_changed(ui.shutdown_number, digit);
-        if (ui.shutdown_arc) lv_arc_set_value(ui.shutdown_arc, seconds_left * 10);
-        visible(ui.shutdown_hint, true);
-        if (changed) {
-            s_key_number_shown = seconds_left;
-            number_pop();
-        }
-    } else {
-        /* Rail released: the key can no longer cancel anything. */
-        label_text_if_changed(ui.shutdown_title, "正在关机");
-        label_text_if_changed(ui.shutdown_number, "");
-        if (ui.shutdown_arc) lv_arc_set_value(ui.shutdown_arc, 0);
-        visible(ui.shutdown_hint, false);
-        s_key_number_shown = -1;
-        glow_start(false);
-    }
+    s_key_number_shown=seconds_left;
+    label_text_if_changed(ui.shutdown_title,seconds_left ? "即将关机" : "正在关机");
+    char digit[8]; snprintf(digit,sizeof(digit),"%d",seconds_left);
+    label_text_if_changed(ui.shutdown_number,seconds_left ? digit : "");
+    visible(ui.shutdown_hint,seconds_left>0);
+    if (seconds_left) shutdown_tick();
+    else { ui.shutdown_progress=0;lv_arc_set_value(ui.shutdown_arc,0); }
 }
 
 const meo_model_t *meo_ui_model(void) { return &ui.model; }
@@ -2381,8 +2866,9 @@ const char *meo_ui_page_name(meo_page_t page)
 {
     static const char *names[] = {
         "eyes", "apps", "settings", "wifi",
-        "breathe", "display", "accessibility", "password", "mic", "speaker"
+        "breathe", "display", "accessibility", "password", "mic", "speaker", "expressions"
     };
+    _Static_assert(sizeof(names)/sizeof(names[0])==MEO_PAGE_COUNT,"Page name table must cover every page");
     /* Guard the array itself, not MEO_PAGE_COUNT: this list has silently
        lagged behind the enum before, and names[9] read a garbage pointer that
        surfaced as a crash inside printf on the page that was just entered. */

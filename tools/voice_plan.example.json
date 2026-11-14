@@ -1,0 +1,21 @@
+{
+  "generation": 1,
+  "sentences": [
+    {
+      "text": "你好，我在这里。",
+      "expressions": [
+        {"at": 0, "expression": "CURIOUS", "intensity": 0.5, "transition_ms": 160},
+        {"at": 0.35, "expression": "HAPPY", "intensity": 0.8, "transition_ms": 180},
+        {"at": 0.7, "expression": "EXCITED", "intensity": 0.65, "transition_ms": 220}
+      ]
+    },
+    {
+      "text": "今天也陪着你。",
+      "expressions": [
+        {"at": 0, "expression": "LOVE", "intensity": 0.5, "transition_ms": 160},
+        {"at": 0.4, "expression": "WINK", "intensity": 0.65, "transition_ms": 180},
+        {"at": 0.75, "expression": "RELIEVED", "intensity": 0.7, "transition_ms": 240}
+      ]
+    }
+  ]
+}

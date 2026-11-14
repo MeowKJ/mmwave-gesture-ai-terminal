@@ -87,6 +87,12 @@ def environment(config: dict) -> dict:
     idf_version = cfg(config, "toolchain", "idf_version", "")
     if idf_version:
         env["ESP_IDF_VERSION"] = idf_version
+    # The component manifest uses this variable to make ESP-SR opt-in.  A
+    # missing variable is an error in Component Manager, so every managed
+    # build gets an explicit value.  Set [features].espsr=true only after the
+    # official esp-sr component and the custom WakeNet asset are installed.
+    espsr = cfg(config, "features", "espsr", "0")
+    env["MEOAVE_USE_ESP_SR"] = "1" if str(espsr).lower() in ("1", "true", "yes", "on") else "0"
     python_path = cfg(config, "toolchain", "python", "") or env.get("IDF_PYTHON_ENV_PATH", "")
     if python_path:
         path = Path(python_path)
@@ -95,6 +101,10 @@ def environment(config: dict) -> dict:
         else:
             env["IDF_PYTHON_ENV_PATH"] = str(path)
     prepend = []
+    # ESP-SR's model packer invokes `python` by name. Use this build's selected
+    # interpreter rather than whichever unrelated Python happens to be first.
+    if python_path and Path(python_path).is_file():
+        prepend.append(str(Path(python_path).parent))
     for key in ("compiler_bin", "riscv_bin", "cmake_bin", "ninja_bin"):
         value = cfg(config, "toolchain", key, "")
         if value:
@@ -141,6 +151,8 @@ def build_signature(config: dict, profile: str, build_dir: Path, sdkconfig: Path
         "idf_path": env.get("IDF_PATH", ""),
         "idf_tools_path": env.get("IDF_TOOLS_PATH", ""),
         "esp_rom_elf_dir": env.get("ESP_ROM_ELF_DIR", ""),
+        "espsr": env.get("MEOAVE_USE_ESP_SR", "0"),
+        "espsr_asset_sha": env.get("MEOAVE_ESPSR_ASSET_SHA", ""),
     }
     return json.dumps(sig, sort_keys=True)
 
@@ -204,8 +216,20 @@ def build(config: dict, profile: str, reconfigure: bool = False, c5_payload: Pat
     else:
         build_name = cfg(config, "build", "product_dir", "build_meoave")
         defaults = cfg(config, "build", "product_defaults", "sdkconfig.defaults;sdkconfig.product.defaults")
+    if profile == "product" and "sdkconfig.hosted.defaults" not in defaults.split(";"):
+        defaults += ";sdkconfig.hosted.defaults"
     build_dir = p4 / build_name
     sdkconfig = p4 / ("sdkconfig." + profile)
+    if profile in ("product", "hosted") and env.get("MEOAVE_USE_ESP_SR") == "1":
+        import espsr_model
+        fragment, sha = espsr_model.configure(p4, build_dir, sdkconfig, config.get("espsr", {}))
+        if fragment:
+            defaults += ";" + str(fragment)
+            env["MEOAVE_ESPSR_ASSET_SHA"] = sha
+    # IDF defaults do not override existing sdkconfig values. Migrate the old
+    # offline product once, preserving display/power/audio and build caches.
+    if profile == "product" and sdkconfig.is_file():
+        migrate_product_wifi(sdkconfig, p4 / "sdkconfig.hosted.defaults")
     extra_configure = []
     if profile == "programmer":
         payload = c5_payload or c5_dir(config) / cfg(config, "build", "c5_dir", "build_c5") / "c5_hosted_slave_merged.bin"
@@ -253,7 +277,99 @@ def build(config: dict, profile: str, reconfigure: bool = False, c5_payload: Pat
 
     run([ninja, "-C", str(build_dir), "-j", str(jobs)], p4, env, f"build {profile}")
     verify_product_ui(build_dir, env)
+    if profile in ("product", "hosted") and str(env.get("MEOAVE_USE_ESP_SR", "0")) == "1":
+        verify_product_espsr(build_dir, env)
+    if profile in ("product", "hosted"):
+        verify_product_wifi(build_dir)
     return build_dir
+
+
+def migrate_product_wifi(sdkconfig: Path, hosted_defaults: Path) -> None:
+    current = sdkconfig.read_text(encoding="utf-8")
+    if "CONFIG_APP_MEOAVE_WIFI_HOSTED=y" in current.splitlines():
+        return
+    # Only Wi-Fi/Hosted policy is migrated; diagnostic profiles are excluded.
+    policy = [line for line in hosted_defaults.read_text(encoding="utf-8").splitlines()
+              if line.startswith("CONFIG_") or line.startswith("# CONFIG_")]
+    policy = [line for line in policy if any(prefix in line for prefix in
+              ("CONFIG_ESP_HOSTED_", "CONFIG_ESP_WIFI_REMOTE_", "CONFIG_SLAVE_IDF_", "CONFIG_APP_MEOAVE_WIFI_"))]
+    keys = {line.split("=", 1)[0].removeprefix("# ").split()[0] for line in policy}
+    lines = [line for line in current.splitlines()
+             if line.split("=", 1)[0].removeprefix("# ").split(" ", 1)[0] not in keys]
+    sdkconfig.write_text("\n".join(lines + policy) + "\n", encoding="utf-8")
+    print("Migrated legacy offline product: enabled C5 Wi-Fi (kept build cache)", flush=True)
+
+
+def verify_product_wifi(build_dir: Path) -> None:
+    path = build_dir / "config" / "sdkconfig.json"
+    values = json.loads(path.read_text(encoding="utf-8"))
+    required = ("APP_MEOAVE_WIFI_HOSTED", "ESP_WIFI_REMOTE_ENABLED", "ESP_HOSTED_ENABLED",
+                "ESP_HOSTED_CP_TARGET_ESP32C5", "ESP_HOSTED_SDIO_HOST_INTERFACE")
+    missing = [key for key in required if values.get(key) is not True]
+    if missing or values.get("APP_C5_NATIVE_MAINTENANCE") or values.get("APP_C5_SDIO_LOADER"):
+        raise RuntimeError("Product Wi-Fi is not linked/configured: " + ", ".join(missing))
+    verify_wifi_abi(build_dir)
+    print("PASS: product C5 Wi-Fi enabled (real scan callback, not offline UI)", flush=True)
+
+
+def validate_wifi_abi(layouts: dict) -> None:
+    required = ("bsp_wifi_hosted.c", "rpc_rsp.c", "rpc_wrap.c", "esp_wifi_weak.c")
+    for name in required:
+        if not layouts.get(name, {}).get("wifi_ap_record_t"):
+            raise RuntimeError("Cannot verify Wi-Fi ABI: missing DWARF type in " + name)
+    types = {name for unit in layouts.values() for name in unit}
+    for name in sorted(types):
+        found = {unit: types[name] for unit, types in layouts.items() if name in types}
+        values = list(found.values())
+        if any(value != values[0] for value in values[1:]):
+            raise RuntimeError("Wi-Fi ABI mismatch for " + name + ": " + repr(found))
+
+
+def verify_wifi_abi(build_dir: Path) -> dict:
+    # Use the actual linked translation units, not a mock sizeof() assertion.
+    # Native vs remote IDF headers once yielded 92/96-byte AP records here.
+    from elftools.elf.elffile import ELFFile
+    elfs = list(build_dir.glob("*.elf"))
+    if len(elfs) != 1:
+        raise RuntimeError("Cannot verify Wi-Fi ABI: expected one application ELF")
+    units = ("bsp_wifi_hosted.c", "rpc_rsp.c", "rpc_wrap.c", "esp_wifi_weak.c")
+    names = {b"wifi_ap_record_t", b"wifi_config_t", b"wifi_init_config_t",
+             b"wifi_event_sta_scan_done_t", b"wifi_event_sta_connected_t",
+             b"wifi_event_sta_disconnected_t"}
+    layouts = {}
+    with elfs[0].open("rb") as stream:
+        dwarf = ELFFile(stream).get_dwarf_info()
+        for cu in dwarf.iter_CUs():
+            attr = cu.get_top_DIE().attributes.get("DW_AT_name")
+            unit = Path(attr.value.decode(errors="replace")).name if attr else ""
+            if unit not in units:
+                continue
+            found = {}
+            for die in cu.iter_DIEs():
+                name = die.attributes.get("DW_AT_name")
+                if die.tag != "DW_TAG_typedef" or not name or name.value not in names:
+                    continue
+                struct = die.get_DIE_from_attribute("DW_AT_type")
+                size = struct.attributes.get("DW_AT_byte_size")
+                if not size:
+                    continue
+                members = []
+                for member in struct.iter_children():
+                    if member.tag != "DW_TAG_member":
+                        continue
+                    row = []
+                    for key in ("DW_AT_name", "DW_AT_data_member_location", "DW_AT_bit_size", "DW_AT_bit_offset", "DW_AT_data_bit_offset"):
+                        value = member.attributes.get(key)
+                        value = value.value if value else None
+                        row.append(value.decode(errors="replace") if isinstance(value, bytes) else value)
+                    members.append(row)
+                found[name.value.decode()] = {"size": size.value, "members": members}
+            layouts[unit] = found
+    validate_wifi_abi(layouts)
+    (build_dir / "wifi_abi.json").write_text(json.dumps(layouts, indent=2), encoding="utf-8")
+    size = layouts["bsp_wifi_hosted.c"]["wifi_ap_record_t"]["size"]
+    print(f"PASS: Wi-Fi ABI identical in application/Hosted/RPC (AP record {size} bytes)", flush=True)
+    return layouts
 
 
 def verify_product_ui(build_dir: Path, env: dict) -> None:
@@ -271,6 +387,43 @@ def verify_product_ui(build_dir: Path, env: dict) -> None:
     if missing:
         raise RuntimeError("Product UI missing from linked ELF: " + ", ".join(sorted(missing)))
     print("PASS: product UI entry and renderer present in final ELF", flush=True)
+
+
+def verify_product_espsr(build_dir: Path, env: dict) -> None:
+    """Verify that ESP-SR is linked without claiming a model is present."""
+    config_path = build_dir / "config" / "sdkconfig.json"
+    if not config_path.is_file():
+        raise RuntimeError("Cannot verify ESP-SR: generated sdkconfig.json is missing")
+    values = json.loads(config_path.read_text(encoding="utf-8"))
+    if values.get("APP_MEOAVE_ESPSR") is not True:
+        raise RuntimeError("ESP-SR adapter is disabled in the product configuration")
+    if str(env.get("MEOAVE_USE_ESP_SR", "0")) != "1":
+        print("WARN: ESP-SR component is configured but MEOAVE_USE_ESP_SR is 0", flush=True)
+        return
+
+    cache = (build_dir / "CMakeCache.txt").read_text(encoding="utf-8")
+    nm = next((line.split("=", 1)[1] for line in cache.splitlines()
+               if line.startswith("CMAKE_NM:FILEPATH=")), "")
+    elfs = list(build_dir.glob("*.elf"))
+    if not nm or len(elfs) != 1:
+        raise RuntimeError("Cannot verify ESP-SR: expected CMAKE_NM and one application ELF")
+    result = subprocess.run([nm, "--defined-only", str(elfs[0])],
+                            env=env, check=True, capture_output=True, text=True)
+    symbols = {line.split()[-1] for line in result.stdout.splitlines() if line.split()}
+    missing = {"meoave_espsr_init", "meo_wake_feed_audio", "esp_wn_handle_from_name"} - symbols
+    if missing:
+        raise RuntimeError("ESP-SR path missing from linked ELF: " + ", ".join(sorted(missing)))
+
+    model = values.get("APP_MEOAVE_ESPSR_WAKE_MODEL", "")
+    image = build_dir / "srmodels" / "srmodels.bin"
+    import espsr_model
+    keyword = values.get("APP_MEOAVE_ESPSR_WAKE_WORD", "猫猫")
+    result = espsr_model.inspect_image(image, model, keyword)
+    if result["ready"]:
+        scope = "production target" if keyword == "猫猫" else "DIAGNOSTIC ONLY, not 猫猫"
+        print(f"PASS: ESP-SR linked; exact {keyword} model packaged ({model}, {scope}); acoustic acceptance still required", flush=True)
+    else:
+        print(f"PASS: ESP-SR linked; WARN: {result['reason']} ({model}); acoustic wake remains disabled", flush=True)
 
 
 def tests(config: dict) -> None:
@@ -514,6 +667,22 @@ def main() -> int:
     hw.add_argument("--cycles", type=int, default=1)
     hw.add_argument("--restarts", type=int, default=3)
     hw.add_argument("--report", default="test-results/tools_usb_iteration.json")
+    wake = sub.add_parser("wake-acoustic", help="play a local phrase and verify real ESP-SR acoustic/UI feedback")
+    wake.add_argument("--build-dir", default="firmware/p4_gesture/build_meoave")
+    wake.add_argument("--port")
+    wake.add_argument("--baud", default="921600")
+    wake.add_argument("--flash", action="store_true", help="flash the selected product image first")
+    wake.add_argument("--wav", help="local voice WAV; otherwise Windows SAPI generates Hi，喵喵")
+    wake.add_argument("--negative-wav", help="non-keyword spoken PCM WAV for the negative control")
+    wake.add_argument("--phrase", default="Hi，喵喵")
+    wake.add_argument("--voice")
+    wake.add_argument("--rate", type=int, default=0)
+    wake.add_argument("--repeat", type=int, default=3)
+    wake.add_argument("--gap", type=float, default=3.0)
+    wake.add_argument("--listen-after", type=float, default=2.8)
+    wake.add_argument("--timeout", type=float, default=60.0)
+    wake.add_argument("--soak-seconds", type=int, default=420)
+    wake.add_argument("--report", default="firmware/p4_gesture/test-results/wake-acoustic.json")
     wifi = sub.add_parser("wifi", help="one explicit C5 SDIO CMD5 status probe")
     wifi.add_argument("--report", default="test-results/wifi_sdio_probe.json")
     wifi.add_argument("--no-reset", action="store_true",
@@ -580,6 +749,25 @@ def main() -> int:
         tests(config)
     elif args.command == "hardware":
         hardware(config, args)
+    elif args.command == "wake-acoustic":
+        command = [python_command(config), str(TOOLS / "wake_acoustic_acceptance.py"),
+                   "--build-dir", str(resolve(args.build_dir)),
+                   "--baud", str(args.baud), "--phrase", args.phrase,
+                   "--rate", str(args.rate), "--repeat", str(args.repeat),
+                   "--gap", str(args.gap), "--listen-after", str(args.listen_after),
+                   "--timeout", str(args.timeout), "--soak-seconds", str(args.soak_seconds),
+                   "--report", str(resolve(args.report))]
+        if args.port:
+            command.extend(["--port", args.port])
+        if args.flash:
+            command.append("--flash")
+        if args.wav:
+            command.extend(["--wav", str(resolve(args.wav))])
+        if args.negative_wav:
+            command.extend(["--negative-wav", str(resolve(args.negative_wav))])
+        if args.voice:
+            command.extend(["--voice", args.voice])
+        return subprocess.run(command, cwd=ROOT, env=environment(config)).returncode
     elif args.command == "wifi":
         return wifi_status(config, args)
     elif args.command == "c5":

@@ -18,9 +18,40 @@ esp_target = "esp32p4"
 jobs = 8 # bound compiler parallelism for reproducible desktop builds
 product_dir = "build_meoave"
 hosted_dir = "build_meoave_hosted"
-product_defaults = "sdkconfig.defaults;sdkconfig.product.defaults"
+product_defaults = "sdkconfig.defaults;sdkconfig.product.defaults;sdkconfig.hosted.defaults"
 hosted_defaults = "sdkconfig.defaults;sdkconfig.hosted.defaults"
+
+[features]
+# Link ESP-SR by default. Without the custom 猫猫 model the firmware remains
+# fail-closed and the build tool prints a warning instead of claiming wakeup.
+espsr = true
+
+[espsr]
+# Optional local asset root, containing exactly the model_name folder with
+# _MODEL_INFO_, wn9_data and wn9_index. Requires a real custom 猫猫 model;
+# renaming a stock model does not change its recognized phrase.
+model_dir = ""
+model_name = "wn9_maomao"
+# Opt-in acoustic diagnosis only after approval. "hi_miaomiao" selects the
+# official Hi,喵喵 model; it does NOT recognize the production target 猫猫.
+diagnostic_preset = ""
 
 [hardware]
 flash_report = "test-results/tools_flash.json"
 runtime_report = "test-results/tools_runtime.json"
+
+# Optional GPU-side TTS. Run voice_gateway.py in upstream's OWN Python env,
+# not the ESP-IDF venv. All weights/reference audio remain local and out of Git.
+[voice]
+engine = "indextts2"
+repo = ""
+revision = "" # reviewed upstream 40-character Git SHA, NOT moving main
+model_dir = ""
+cfg_path = ""
+reference_wav = "" # own/licensed voice only
+device = "cuda:0"
+[voice.aux_paths]
+w2v_bert = ""
+semantic_codec = ""
+campplus = ""
+bigvgan = ""

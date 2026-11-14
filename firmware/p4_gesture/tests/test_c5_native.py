@@ -110,6 +110,9 @@ class NativeTests(unittest.TestCase):
 typedef void cdcacm_event_t;
 static char s_line[CDC_LINE_MAX];static size_t s_line_len;
 static bool s_line_overflow,s_rebooting;
+static bool s_binary_rx;
+static void (*s_binary_cb)(const uint8_t *,size_t,void *);
+static void *s_binary_ctx;
 static const char *input;static size_t remaining;
 static unsigned dispatched,downloads;
 static void dispatch_line(const char *s){dispatched++;if(!strcmp(s,"DOWNLOAD"))downloads++;}
@@ -132,7 +135,8 @@ int main(void){
 '''
         with tempfile.TemporaryDirectory() as d:
             c=Path(d)/'native.c';exe=Path(d)/'native.exe';c.write_text(harness,encoding='utf-8')
-            subprocess.run([cc,'-std=c11','-Wall','-Wextra','-Werror',str(c),'-o',str(exe)],check=True,capture_output=True)
+            compiled=subprocess.run([cc,'-std=c11','-Wall','-Wextra','-Werror',str(c),'-o',str(exe)],capture_output=True,text=True)
+            self.assertEqual(compiled.returncode,0,compiled.stderr)
             subprocess.run([str(exe)],check=True,capture_output=True)
 
 

@@ -55,6 +55,7 @@
 #include "soc/lp_system_reg.h"
 #include "bsp_power.h"
 #include "board_pins.h"
+#include "meo_link.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_cdc_acm.h"
@@ -76,20 +77,26 @@ static bool s_line_overflow;
 #define REPORT_ID_MOUSE     HID_ITF_PROTOCOL_MOUSE
 #define REPORT_ID_KEYBOARD  HID_ITF_PROTOCOL_KEYBOARD
 #define REPORT_ID_GESTURE   3
+/* 链路报告单独占用一个 ID：手势是 8 字节的即时事件，链路是 64 字节的
+ * 分片消息流。共用同一个 ID 会让主机无法区分"这是一次手势"还是"这是
+ * 某条消息的第 2 片"，而两者的载荷长度完全不同。 */
+#define REPORT_ID_LINK      4
 
 static const uint8_t s_hid_report_desc[] = {
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD)),
     TUD_HID_REPORT_DESC_GENERIC_INOUT(8, HID_REPORT_ID(REPORT_ID_GESTURE)),
+    TUD_HID_REPORT_DESC_GENERIC_INOUT(MEO_LINK_REPORT_SIZE, HID_REPORT_ID(REPORT_ID_LINK)),
 };
 
 #define CFG_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
 
-/* CDC = interface 0/1，HID = interface 2 */
+/* CDC = interface 0/1，HID = interface 2。HID 端点放大到 64 字节以容纳
+ * 链路报告；全速下 bInterval=5 (5 ms) 让一行回复的延迟保持在可感知阈值内。 */
 static const uint8_t s_fs_cfg_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 3, 0, CFG_DESC_TOTAL_LEN, 0, 100),
     TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 64),
-    TUD_HID_DESCRIPTOR(2, 5, false, sizeof(s_hid_report_desc), 0x83, 16, 10),
+    TUD_HID_DESCRIPTOR(2, 5, false, sizeof(s_hid_report_desc), 0x83, 64, 5),
 };
 
 #if TUD_OPT_HIGH_SPEED
@@ -97,7 +104,7 @@ static const uint8_t s_fs_cfg_desc[] = {
 static const uint8_t s_hs_cfg_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 3, 0, CFG_DESC_TOTAL_LEN, 0, 100),
     TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 512),
-    TUD_HID_DESCRIPTOR(2, 5, false, sizeof(s_hid_report_desc), 0x83, 16, 7),
+    TUD_HID_DESCRIPTOR(2, 5, false, sizeof(s_hid_report_desc), 0x83, 64, 7),
 };
 #endif
 
@@ -112,6 +119,12 @@ static const char *s_str_desc[6] = {
 
 static volatile bool s_rebooting;
 static bool          s_download_requested;
+/* Recovery must not allocate a new stack after display/Hosted exhaust the
+   internal heap. Reserve it before either subsystem starts. IDF task stack
+   sizes are bytes; the storage remains internal, including during restart. */
+static StackType_t s_reset_stack[4096 / sizeof(StackType_t)];
+static StaticTask_t s_reset_tcb;
+static TaskHandle_t s_reset_task;
 static uint32_t      s_boot_id;
 static volatile bool s_cdc_open;
 static volatile int  s_in_log;
@@ -123,6 +136,36 @@ static char s_line[CDC_LINE_MAX];
 static size_t s_line_len;
 static bsp_usb_line_cb_t s_line_cb;
 static void *s_line_ctx;
+static volatile bool s_binary_rx;
+static bsp_usb_binary_rx_cb_t s_binary_cb;
+static void *s_binary_ctx;
+
+/* ---------- 链路：HID 上行/下行适配 ---------- */
+
+/* meo_link 不直接认识 TinyUSB，这里只做三件事：报告端点是否可写、
+ * 把一个 64 字节报告塞进中断端点、把 HID 收到的命令行转给 CDC 同一个
+ * 回调。因此板级代码不需要知道自己正在被 CDC 还是 HID 驱动。 */
+static bool link_ready(void)
+{
+    return tud_mounted() && tud_hid_ready();
+}
+
+static bool link_send(const uint8_t *report, size_t len)
+{
+    return tud_hid_report(REPORT_ID_LINK, report, len);
+}
+
+static const meo_link_transport_t s_link_transport = {
+    .ready = link_ready,
+    .send = link_send,
+};
+
+/* HID 收到的行与 CDC 完全同构，直接复用已注册的分发器，业务侧零改动。 */
+static void link_dispatch(const char *line, void *ctx)
+{
+    (void)ctx;
+    if (s_line_cb) s_line_cb(line, s_line_ctx);
+}
 
 /* ---------- TinyUSB HID 回调 ---------- */
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
@@ -141,7 +184,11 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
-    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
+    (void)instance; (void)report_type;
+    if (report_id != REPORT_ID_LINK || !buffer || !bufsize) return;
+    /* 只入队，不解析：这条回调跑在 TinyUSB 任务里，任何阻塞都会拖慢
+     * 整个 USB 栈，包括 CDC 日志。 */
+    meo_link_on_report(buffer, bufsize);
 }
 
 /* ---------- 进入 ROM 下载模式 ---------- */
@@ -170,42 +217,41 @@ void __attribute__((weak)) bsp_platform_prepare_download(void) {}
 static void reboot_to_download_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(120));       /* 让 magic 发完、CDC 日志刷出 */
-    ESP_LOGW(TAG, "USB request -> %s", s_download_requested ? "ROM download" : "program restart");
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(120));       /* 让 magic 发完、CDC 日志刷出 */
+        ESP_LOGW(TAG, "USB request -> %s", s_download_requested ? "ROM download" : "program restart");
 
-    esp_err_t err = bsp_power_prepare_reset();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "reset refused: power hold not ready (%s)", esp_err_to_name(err));
-        s_rebooting = false;
-        s_download_requested = false;
-        vTaskDelete(NULL);
-        return;
+        esp_err_t err = bsp_power_prepare_reset();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "reset refused: power hold not ready (%s)", esp_err_to_name(err));
+            s_rebooting = false;
+            s_download_requested = false;
+            continue;
+        }
+
+        bsp_platform_prepare_download();      /* 卸掉屏/音频/雷达等大电流负载 */
+        /* 链路任务必须先停手：接下来 USB 栈会被拆掉，继续写端点会踩空。 */
+        meo_link_quiesce();
+        /* 主机必须看到断开，ROM 才会以 PID 0x0012 重新枚举 */
+        tud_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(250));
+
+        /* 在真正复位前把 PWR_HOLD 锁存到 always-on pad hold 寄存器，
+           让 3V3 跨过复位窗口；同时写 RTC_NOINIT 标记做掉电体检。 */
+        if (s_download_requested) set_force_download_boot();
+        else clear_force_download_boot();
+        esp_restart();
     }
-
-    bsp_platform_prepare_download();      /* 卸掉屏/音频/雷达等大电流负载 */
-    /* 主机必须看到断开，ROM 才会以 PID 0x0012 重新枚举 */
-    tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(250));
-
-    /* 在真正复位前把 PWR_HOLD 锁存到 always-on pad hold 寄存器，
-       让 3V3 跨过复位窗口；同时写 RTC_NOINIT 标记做掉电体检。 */
-    if (s_download_requested) set_force_download_boot();
-    else clear_force_download_boot();
-    esp_restart();
-    vTaskDelete(NULL);
 }
 
 static esp_err_t request_reboot(const char *why, bool download)
 {
-    if (s_rebooting) return ESP_ERR_INVALID_STATE;
+    if (s_rebooting || !s_reset_task) return ESP_ERR_INVALID_STATE;
     s_download_requested = download;
     s_rebooting = true;
     ESP_LOGW(TAG, "reboot requested via %s", why);
-    if (xTaskCreate(reboot_to_download_task, "usb_reset", 4096, NULL, 5, NULL) != pdPASS) {
-        s_rebooting = false;
-        s_download_requested = false;
-        return ESP_ERR_NO_MEM;
-    }
+    xTaskNotifyGive(s_reset_task);
     return ESP_OK;
 }
 
@@ -276,8 +322,16 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
     uint8_t buf[64];
     size_t n;
     while (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, sizeof(buf), &n) == ESP_OK && n > 0) {
-        for (size_t i = 0; i < n && !s_rebooting; i++) {
+        for (size_t i = 0; i < n && !s_rebooting;) {
+            if (s_binary_rx) {
+                /* A command and the first binary frame may share one USB
+                   packet.  Re-check the mode inside the loop so bytes after
+                   the newline are never fed to the ASCII parser. */
+                if (s_binary_cb) s_binary_cb(buf + i, n - i, s_binary_ctx);
+                break;
+            }
             uint8_t c = buf[i];
+            ++i;
             if (c == '\n' || c == '\r') {
                 /* Discard the WHOLE oversized line, never execute its tail as
                  * a new DOWNLOAD/SYS/OTA command. No partial command dispatch. */
@@ -298,7 +352,13 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
                     if (len) dispatch_line(s_line);
                     memset(s_line,0,sizeof(s_line));
                 }
-            } else if (!s_line_overflow && c >= 0x20 && c < 0x7F) {
+            } else if (!s_line_overflow && c >= 0x20 && c != 0x7F) {
+                /* Keep UTF-8 bytes in the bounded command line.  The wake
+                 * phrase is intentionally Chinese ("猫猫"); filtering all
+                 * bytes >= 0x80 here used to turn an otherwise valid
+                 * `AI WAKE 猫猫` request into an empty suffix.  Control bytes
+                 * remain excluded, and the existing line-size guard still
+                 * bounds the receive path. */
                 if (s_line_len < CDC_LINE_MAX - 1) {
                     s_line[s_line_len++] = (char)c;
                 } else {
@@ -346,7 +406,12 @@ static int usb_log_vprintf(const char *fmt, va_list args)
     int ret = s_orig_vprintf ? s_orig_vprintf(fmt, a) : vprintf(fmt, a);
     va_end(a);
 
-    if (!xPortInIsrContext() && s_cdc_open && tud_mounted() &&
+    /* CDC 与 HID 是两条独立通道：任意一条在线就应该格式化这行日志。
+     * 两条都不在线时提前返回，避免为没人看的日志付出 vsnprintf 的开销。 */
+    bool want_cdc = s_cdc_open && tud_mounted();
+    bool want_hid = meo_link_log_enabled() && meo_link_ready();
+
+    if (!xPortInIsrContext() && (want_cdc || want_hid) &&
         __sync_lock_test_and_set(&s_in_log, 1) == 0) {
         char buf[256];
         int len = vsnprintf(buf, sizeof(buf), fmt, b);
@@ -356,6 +421,7 @@ static int usb_log_vprintf(const char *fmt, va_list args)
              * of the next machine-readable response. UART keeps the original. */
             if (buf[n - 1] != '\n') buf[n++] = '\n';
             (void)bsp_usb_tx_record(buf, n, s_cdc_open);
+            (void)meo_link_log(buf);
         }
         __sync_lock_release(&s_in_log);
     }
@@ -370,6 +436,10 @@ esp_err_t bsp_usb_init(void)
     clear_force_download_boot();
     ESP_RETURN_ON_ERROR(esp_register_shutdown_handler(usb_shutdown_handler),
                         TAG, "register shutdown handler failed");
+    s_reset_task = xTaskCreateStatic(reboot_to_download_task, "usb_reset",
+                                    sizeof(s_reset_stack), NULL, 5,
+                                    s_reset_stack, &s_reset_tcb);
+    ESP_RETURN_ON_FALSE(s_reset_task, ESP_ERR_NO_MEM, TAG, "reserve USB recovery task failed");
 
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     tusb_cfg.descriptor.device = NULL;    /* 默认描述符：VID 0x303A / PID 0x4005 */
@@ -388,6 +458,15 @@ esp_err_t bsp_usb_init(void)
         .callback_line_state_changed = cdc_line_state_cb,
     };
     ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&cdc_cfg), TAG, "CDC ACM init failed");
+
+    /* 链路任务必须在 USB 栈就绪之后启动，否则会在 tud_mounted() 为假时
+     * 反复重试。失败不致命：CDC 仍然可用，HID 命令通道降级为不可用。 */
+    esp_err_t link_err = meo_link_init(&s_link_transport);
+    if (link_err == ESP_OK) {
+        meo_link_set_command_cb(link_dispatch, NULL);
+    } else {
+        ESP_LOGW(TAG, "HID link unavailable: %s", esp_err_to_name(link_err));
+    }
 
     /* 只允许安装一次：重复安装会让 s_orig_vprintf 指向自己，造成无限递归。 */
     if (!s_vprintf_hooked) {
@@ -431,10 +510,32 @@ void bsp_usb_set_line_callback(bsp_usb_line_cb_t cb, void *ctx)
     s_line_ctx = ctx;
 }
 
+void bsp_usb_set_binary_rx_callback(bsp_usb_binary_rx_cb_t cb, void *ctx)
+{
+    s_binary_cb = cb;
+    s_binary_ctx = ctx;
+}
+
+void bsp_usb_set_binary_rx(bool enabled)
+{
+    s_line_len = 0;
+    s_line_overflow = false;
+    s_binary_rx = enabled;
+}
+
+bool bsp_usb_binary_rx_enabled(void)
+{
+    return s_binary_rx;
+}
+
 esp_err_t bsp_usb_cdc_write(const char *text)
 {
     if (!text) return ESP_ERR_INVALID_ARG;
     size_t len = strlen(text);
+    /* 每条命令回复同时镜像到 HID。两条通道各自独立：CDC 未打开时 HID
+     * 仍必须收到回复，否则 WebHID 端看到的是"命令发出去了但没人应答"。
+     * 反过来 CDC 写满也不影响 HID——它们各有各的队列。 */
+    (void)meo_link_send(MEO_LINK_KIND_REPLY, text);
     return bsp_usb_tx_record(text, len, s_cdc_open);
 }
 
@@ -445,6 +546,9 @@ uint16_t bsp_usb_pid(void) { return USB_APP_PID; }
 esp_err_t bsp_usb_init(void) { return ESP_ERR_NOT_SUPPORTED; }
 bool bsp_usb_ready(void) { return false; }
 esp_err_t bsp_usb_request_download(void) { return ESP_ERR_NOT_SUPPORTED; }
+void bsp_usb_set_binary_rx_callback(bsp_usb_binary_rx_cb_t cb, void *ctx) { (void)cb; (void)ctx; }
+void bsp_usb_set_binary_rx(bool enabled) { (void)enabled; }
+bool bsp_usb_binary_rx_enabled(void) { return false; }
 esp_err_t bsp_usb_hid_mouse(int8_t dx, int8_t dy, uint8_t buttons)
 { (void)dx; (void)dy; (void)buttons; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t bsp_usb_hid_keyboard(uint8_t modifier, const uint8_t keycode[6])

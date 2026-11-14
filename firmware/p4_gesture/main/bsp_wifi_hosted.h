@@ -8,7 +8,8 @@
  * The transport is brought up in the background so a missing or unflashed C5
  * can never stall display/USB startup. Credentials live in NVS under "wifi";
  * the last successful SSID is re-joined on boot. Everything here is
- * non-blocking: requests are queued and serviced from the app task. */
+ * non-blocking: requests are queued to a radio worker. Startup/scan never
+ * reset C5 or drive GPIO6. */
 typedef enum {
     BSP_WIFI_OFF = 0,     /* transport not up yet */
     BSP_WIFI_STARTING,    /* Hosted bring-up in progress */
@@ -27,6 +28,10 @@ typedef struct {
     char ip[16];          /* dotted quad, "" when not online */
     unsigned ap_count;    /* cached scan results */
     unsigned ap_raw;      /* driver-reported count of the last scan */
+    bool scanning;        /* independent of an existing association */
+    bool radio_ready;
+    uint32_t scan_seq, scan_done_seq;
+    int scan_error, save_error;
 } bsp_wifi_status_t;
 
 void bsp_wifi_hosted_init(void);
@@ -34,6 +39,8 @@ void bsp_wifi_hosted_service(void);
 bool bsp_wifi_hosted_command(const char *line);
 
 bsp_wifi_status_t bsp_wifi_hosted_status(void);
+/* Atomically copy scan records and the status/generation identifying them. */
+unsigned bsp_wifi_snapshot(char ssid[][33], int rssi[], unsigned max, bsp_wifi_status_t *status);
 /* Queued requests; false when the radio is not ready for them yet. */
 bool bsp_wifi_scan(void);
 bool bsp_wifi_join_saved(const char *ssid);

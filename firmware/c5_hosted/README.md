@@ -114,6 +114,6 @@ python tools/meoave.py wifi --no-reset
 
 2026-11-10 新开发板UART已确认出厂C5v1.2/4MB正在运行Hosted2.12.9（IDF6.0.2），
 不是本目录2.12.13候选，尚未给新C5烧录。本候选修订号/Flash范围匹配，但互通/SDIO OTA待实测；
-优先保留出厂启动区，通过P4独立Hosted握手确认后再决定是否更新。详见根目录docs/C5_SDIO_OTA_BRINGUP.md。
+优先保留出厂启动区，通过P4独立Hosted握手确认后再决定是否更新。详见根目录docs/C5_MAINTENANCE.md。
 
 见 `UPSTREAM.md`。升级上游时重放其清单并执行回归测试。

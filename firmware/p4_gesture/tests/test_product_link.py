@@ -1,5 +1,6 @@
 """A successful compiler exit must not hide a discarded product UI."""
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -51,12 +52,22 @@ class ProductLinkTest(unittest.TestCase):
 
 
 class ProductBuildToolTest(unittest.TestCase):
+    def setUp(self):
+        wifi_verify = patch.object(workflow, "verify_product_wifi")
+        wifi_verify.start()
+        self.addCleanup(wifi_verify.stop)
+        # Even a mocked build writes its configuration signature. Keep that
+        # write away from the real firmware cache, or tests force a reconfigure.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.project = {"p4_dir": temp.name}
+
     def test_bounded_jobs_and_rom_environment(self):
         with patch.object(workflow, "run") as run, \
                 patch.object(workflow, "verify_product_ui") as verify, \
                 patch.object(workflow, "environment", return_value={}), \
                 patch.object(workflow, "esp_rom_elf_dir", return_value="tool/rom"):
-            workflow.build({}, "product")
+            workflow.build({"project": self.project}, "product")
         self.assertEqual(run.call_args.args[0][-2:], ["-j", "8"])
         self.assertEqual(run.call_args.args[2]["ESP_ROM_ELF_DIR"], "tool/rom")
         verify.assert_called_once()
@@ -64,7 +75,7 @@ class ProductBuildToolTest(unittest.TestCase):
     def test_configured_jobs(self):
         with patch.object(workflow, "run") as run, \
                 patch.object(workflow, "verify_product_ui"):
-            workflow.build({"build": {"jobs": 4}}, "product")
+            workflow.build({"project": self.project, "build": {"jobs": 4}}, "product")
         self.assertEqual(run.call_args.args[0][-2:], ["-j", "4"])
 
     def test_invalid_jobs_rejected_before_configure(self):
@@ -85,7 +96,7 @@ class ProductBuildToolTest(unittest.TestCase):
                 if rom:
                     env["ESP_ROM_ELF_DIR"] = rom
             sdkconfig = Path(td) / "sdkconfig.product"
-            defaults = "sdkconfig.defaults;sdkconfig.product.defaults"
+            defaults = "sdkconfig.defaults;sdkconfig.product.defaults;sdkconfig.hosted.defaults"
             sig = workflow.build_signature(cfg_dict, "product", build_dir, sdkconfig, defaults, env)
             (build_dir / ".meoave_build_sig").write_text(sig, encoding="utf-8")
             with patch.object(workflow, "run") as run,                     patch.object(workflow, "verify_product_ui") as verify:
@@ -107,7 +118,7 @@ class ProductBuildToolTest(unittest.TestCase):
                 if rom:
                     env["ESP_ROM_ELF_DIR"] = rom
             sdkconfig = Path(td) / "sdkconfig.product"
-            defaults = "sdkconfig.defaults;sdkconfig.product.defaults"
+            defaults = "sdkconfig.defaults;sdkconfig.product.defaults;sdkconfig.hosted.defaults"
             sig = workflow.build_signature(cfg_dict, "product", build_dir, sdkconfig, defaults, env)
             (build_dir / ".meoave_build_sig").write_text(sig, encoding="utf-8")
             with patch.object(workflow, "run") as run,                     patch.object(workflow, "verify_product_ui") as verify:
@@ -116,3 +127,51 @@ class ProductBuildToolTest(unittest.TestCase):
             self.assertEqual(run.call_args_list[0].args[3], "configure product")
             self.assertEqual(run.call_args_list[1].args[3], "build product")
             verify.assert_called_once()
+
+
+class ProductWifiPolicyTest(unittest.TestCase):
+    def test_real_generated_config_required(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(workflow,"verify_wifi_abi"):
+            build = Path(td)
+            path = build / "config/sdkconfig.json"
+            path.parent.mkdir()
+            values = {key: True for key in ("APP_MEOAVE_WIFI_HOSTED", "ESP_WIFI_REMOTE_ENABLED",
+                "ESP_HOSTED_ENABLED", "ESP_HOSTED_CP_TARGET_ESP32C5", "ESP_HOSTED_SDIO_HOST_INTERFACE")}
+            path.write_text(json.dumps(values))
+            workflow.verify_product_wifi(build)
+            for key in values:
+                path.write_text(json.dumps(dict(values, **{key: False})))
+                with self.subTest(key=key), self.assertRaises(RuntimeError):
+                    workflow.verify_product_wifi(build)
+            for key in ("APP_C5_SDIO_LOADER", "APP_C5_NATIVE_MAINTENANCE"):
+                path.write_text(json.dumps(dict(values, **{key: True})))
+                with self.subTest(key=key), self.assertRaises(RuntimeError):
+                    workflow.verify_product_wifi(build)
+
+    def test_legacy_migration_preserves_hardware_settings_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdk = Path(td)/"sdkconfig.product"
+            defaults = Path(__file__).resolve().parents[1]/"sdkconfig.hosted.defaults"
+            sdk.write_text("# CONFIG_APP_MEOAVE_WIFI_HOSTED is not set\nCONFIG_ESP_HOSTED_ENABLED=n\nCONFIG_PANEL_ROTATION=180\nCONFIG_AUDIO_GAIN=14\n")
+            workflow.migrate_product_wifi(sdk, defaults)
+            first = sdk.read_bytes()
+            self.assertIn(b"CONFIG_APP_MEOAVE_WIFI_HOSTED=y", first)
+            self.assertIn(b"CONFIG_ESP_HOSTED_ENABLED=y", first)
+            self.assertIn(b"CONFIG_PANEL_ROTATION=180", first)
+            self.assertIn(b"CONFIG_AUDIO_GAIN=14", first)
+            workflow.migrate_product_wifi(sdk, defaults)
+            self.assertEqual(first, sdk.read_bytes())
+
+    def test_dwarf_layout_mismatch_rejected_even_when_sizes_agree(self):
+        names=("bsp_wifi_hosted.c","rpc_rsp.c","rpc_wrap.c","esp_wifi_weak.c")
+        layouts={name:{"wifi_ap_record_t":{"size":96,"members":[["he_ap",84,None,None]]}} for name in names}
+        workflow.validate_wifi_abi(layouts)
+        layouts["bsp_wifi_hosted.c"]["wifi_ap_record_t"]={"size":92,"members":[["he_ap",80,None,None]]}
+        with self.assertRaisesRegex(RuntimeError,"ABI mismatch"):
+            workflow.validate_wifi_abi(layouts)
+        layouts["bsp_wifi_hosted.c"]["wifi_ap_record_t"]["size"]=96
+        with self.assertRaisesRegex(RuntimeError,"ABI mismatch"):
+            workflow.validate_wifi_abi(layouts)
+        del layouts["bsp_wifi_hosted.c"]
+        with self.assertRaisesRegex(RuntimeError,"missing DWARF"):
+            workflow.validate_wifi_abi(layouts)

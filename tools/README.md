@@ -1,5 +1,32 @@
 # Meoave 工具入口
 
+## UI 资产（可选重生成）
+
+普通编译/回归直接使用仓库的图标 C 数组和音乐 PCM，不需要下载或额外解码库。来源、SHA-256 和许可保留在 `firmware/p4_gesture/main/assets/`。
+只有改源资产时才安装 `tools/requirements-assets.txt`，分别运行 `python tools/build_icons.py`、`python tools/build_preview_audio.py`；不要为此清空 ESP-IDF 构建缓存。字体文案变更仍走现有 `build_fonts.py`。
+
+本轮小屏交互与离线/实屏边界见 `docs/UI_POLISH_20261113.md`。PowerShell 连续验证时必须在编译非零后立即停止，不能继续运行旧的测试二进制。
+
+## 产品 Wi-Fi 扫描回归（2026-11-13）
+
+`python tools/meoave.py build --profile product` 现在默认包含 Hosted Wi-Fi，一次性迁移旧离线配置，保留显示/触摸/电源/音频及构建缓存。构建核对最终 ELF 的 Wi-Fi 结构 ABI；不再手工加入原生 Wi-Fi 头文件路径。
+
+`python tools/wifi_acceptance.py --cycles 3 --report firmware/p4_gesture/test-results/wifi-scan-01.json`
+
+只走已核对身份的原生 USB，使用真实扫描代次及逐项 AP 回复；不刷机、不复位 C5、不发密码、不连接网络。丢失 SCAN 确认不重发变更命令，空结果不冒充射频验收通过。报告不覆盖旧文件。软件、桌面渲染、射频扫描、触摸和互联网验收分别记录；详见 `docs/WIFI_AUDIT_20261113.md`。
+
+2026-11-13 自制板实测：只更新 P4 后，3 轮扫描分别收到 28/29/29 条 AP 记录，每轮提供 6 个不同 SSID，中文名称正常；全程未刷写或主动复位 C5。用户确认无花屏、列表/滚动/密码页正常。另只读观察到 ONLINE/DHCP；用户暂不追加连接测试，DNS/HTTPS 与长期稳定性未验收，不能据扫描通过宣称完整联网通过。
+
+## 产品音频自动验收
+
+`python tools/audio_acceptance.py --report firmware/p4_gesture/test-results/audio-acceptance-01.json`
+
+只用已核对 VID/PID 和完整 ELF SHA 的原生 USB；复用 UI 真实设置/CC0 Kenney 拨弦音乐链路，测试 30%/0% 音量、防连点、麦克风进出和低音量声学回环。保留已校准的单端输入路由；不刷机、不复位、不操作 C5、不重新校准，失败不自动重发播放。只读状态允许有界重新查询。成功回到眼睛页并保留 30% 音量。报告要求新文件；串口成功不等于人耳音质/实屏触摸验收。
+
+交互音诊断：`UI CUE` 走与界面相同的请求路径，不绕过开关、静音或输出互斥；`UI` 返回的 `MEO:UI_AUDIO` 包含 `cue_enabled/requests/played/error`。这些计数只能确认软件请求及驱动返回，不能替代人耳听感；R2 三次返回成功但用户仍未听到的结果必须保留。具体证据与当前验收见 `docs/UI_POLISH_20261113.md`。
+
+2026-11-12：P4 两次下载及一次普通程序复位通过，试听/静音寄存器/防连点/麦克风进出子项通过，用户确认音乐听感正常、复位后无花屏。**声学回环未通过，整体验收报告仍为失败**；不能把 `controls_ok=true` 当作完整 PASS，见 `docs/UI_INTERACTION_20261112.md`。
+
 ## 新增：C5免引脚维护（开发板10轮升级及故障恢复验收通过）
 
 - `c5_provision.py`：首次UART识别C5、整片备份、原厂分区/应用验证，只写ota_1、回滚bootloader和otadata。
@@ -74,7 +101,7 @@ python tools/p4_bringup.py --profile hosted --port COM4 --capture 5 --command CO
 
 CONNECT含一次明确的C5复位/卡初始化，VERIFY做10轮实时版本/芯片查询；失败停机不盲重试。
 工具只在匹配本地P4 ELF后发操作命令，拒绝跨profile接管SDIO；缓存READY不是实机验收。
-新开发板C5现有出厂Hosted2.12.9已确认，不需要预先刷merged镜像；完整边界见`docs/C5_SDIO_OTA_BRINGUP.md`。
+新开发板C5现有出厂Hosted2.12.9已确认，不需要预先刷merged镜像；完整边界见`docs/C5_MAINTENANCE.md`。
 这不是SDIO OTA上传工具，也未实现C5应用失效恢复。
 
 所有机器相关路径放在未纳入 Git 的 `tools/config.toml`，不要把本机用户名、ESP-IDF
@@ -124,7 +151,7 @@ Hosted profile 不代表 C5 已烧录或 Wi-Fi 已联网，GPIO6 保留给音频
 
 2026-11-10 新接入的可切换 P4/C5 UART 开发板另行确认硬件，用户已授权该开发板串口；
 不要把旧板禁用 COM3 的约束误套到新 CH343/COM4，也不要给未知板型直接运行旧板 `hardware`。
-当前 C5 OTA 候选与待做实机步骤见 `docs/C5_SDIO_OTA_BRINGUP.md`。`c5` 只构建，不代表已烧录。
+当前 C5 OTA 候选与待做实机步骤见 `docs/C5_MAINTENANCE.md`。`c5` 只构建，不代表已烧录。
 
 开发板独立无屏 P4 程序（不写 C5；不能替代自制底板产品固件）：
 
@@ -267,3 +294,55 @@ python tools/meoave.py c5-minimal --observe --install --report firmware/p4_gestu
 level=null（未知），不能把寄存器零值当成真实低电平。
 无 `--reset-download` 的 CONNECT 不发送 C5 复位命令，但会上传/执行官方 RAM flasher stub；
 因此只读 Flash/寄存器不等于不改变 C5 RAM。不可在取证后仍声称保留原应用 RAM 现场。
+
+## 句子语音／表情（2026-11-13）
+
+- 目标、协议、TTS 选型与分层验收：`docs/AI_VOICE_PLAN.md`。
+- `python tools/voice_gateway.py validate --plan tools/voice_plan.example.json`：无依赖、无网络，逐句校验每句非空表情链。
+- `voice_gateway.py synthesize`：在独立 IndexTTS Python 环境中生成 PCM＋设备 JSON；本机路径／模型／音色配置在私有 `config.toml [voice]`。不是 WSS／ASR／LLM 服务，不自动下载模型。
+- `build_voice_fixture.py <句1.wav> <句2.wav> --provenance <真实来源>`：可选本地测试音频打包，输出到忽略的 build_ui_assets；不把它冒称生产 TTS。
+- `python tools/voice_acceptance.py --volume 50 --report <新的绝对路径.json>`：板上两句 PCM 完成、六 cue、重复启动／取消、恢复音量与同 boot；不刷写、不复位、不访问 C5。需要已烧入可选 fixture 的产品固件。临时音量默认 50%，`--volume` 范围 1..100；报告记录实际测试音量，结束／失败恢复原设置。50% 是本板已获听感确认的测试点，不代表声音响度校准或其他音量均已验收。
+- 软件门禁：`ctest --test-dir firmware/p4_gesture/tests/desktop/build -R 'conversation\.|ui\.|model.state|audio.adapter' --output-on-failure`；网关测试为 `python -m unittest discover -s firmware/p4_gesture/tests -p test_voice_gateway.py -v`。
+- 串口/DMA 通过不能替代用户听感／实屏验收；真实 GPU TTS、P4 WSS、录音／识别尚待接入。
+
+### 试听音乐素材电平（2026-11-14）
+
+`build_preview_audio.py` 使用已锁定的 CC0 原素材，生成峰值 22000 的 24 kHz PCM16（约 3.5 dB 采样余量），同时更新素材 manifest 的 PCM SHA／RMS／生成依赖版本。拒绝空白、非法或不符合电平约束的输出；不是提高全局音量或修改功放寄存器。`test_ui_assets.py` 与实际 C renderer 的 `audio.preview` 检查源完整性、响度电平下限、峰值上限、立体声、时长和静音尾部。实机修订范围与听感验收见 `docs/AUDIO_LOUDNESS_20261114.md`。
+
+### Edge-TTS 网络延迟探测（2026-11-14）
+
+用户确认无 Azure Speech 凭据，允许测试 Edge-TTS。此工具不是 Azure 正式 API、生产语音网关或设备端对话测试；不访问麦克风、USB、C5，不改固件／音量。
+
+```powershell
+python -m venv tools/.venv/tts-bench
+tools/.venv/tts-bench/Scripts/python.exe -m pip install -r tools/requirements-tts-bench.txt
+tools/.venv/tts-bench/Scripts/python.exe tools/benchmark_tts.py --out test-results/tts-new-run --repeats 3 --timeout 20
+python -m unittest discover -s firmware/p4_gesture/tests -p test_tts_benchmark.py -v
+```
+
+仅发送工具内三条合成测试文本，逐次请求、每次有总超时，两次连续失败停止；无应用层重试，SDK 内部行为计入耗时。首包只统计非空 audio 事件，另记最后音频与 stream 完成时间；落盘／MP3 检查在计时外。输出目录必须是新的，保留旧报告。报告与 MP3 位于 Git 忽略目录。
+
+本机首轮 9/9 合成收到有效音频：短／中／长文本首音频中位数约 1250／1406／1245 ms，stream 完成中位数约 1585／1881／1778 ms。仅代表本机当次网络，不含 ASR、LLM、设备传输、解码或播放；三次样本不建立 P95 或长期可靠性。设备当前完整句子协议不能直接以首音频时间宣称可开口时间。证据见 `test-results/edge-tts-latency-20261114/run-01/report.json`。
+
+## ESP-SR 声学唤醒（2026-11-14）
+
+目标与真实验收边界见 `docs/ESP_SR_WAKE.md`。`tools/config.toml [features].espsr=true` 启用官方 ESP-SR；`[espsr].diagnostic_preset="hi_miaomiao"` 为用户已同意的临时 Hi，喵喵 词，默认正式词仍为猫猫。定制资产使用本机 model_dir/model_name；验证元数据与 SHA，修改资产只使模型包失效，不无故触发全量重编。
+
+`python tools/wake_acceptance.py --listen-seconds 60 --min-detections 1 --report <新的绝对路径.json>` 只通过原生 USB 观察真实采集/推理进度与声学事件，返回眼睛页；不发文字唤醒、不播放音频、不复位、不访问 C5。默认 min-detections=0 仅验证软件链路；没有声学事件时仍明确标为待外部人声验收，不能声称已识别。
+## 免人工声学唤醒验收（2026-11-15）
+
+```powershell
+python tools/meoave.py wake-acoustic --flash --port COM10 --report firmware/p4_gesture/test-results/新的唤醒报告.json
+```
+
+- `--flash` 可选：复用已验证的 P4 原生 USB 下载与 CPU-only 启动，先校验四段 Hash，再核对运行 ELF/boot/供电；不重置 C5、不切下载脚、不触碰 COM3。
+- 默认先枚举并选择本机已启用的中文 Windows SAPI，离线生成“Hi，喵喵”与不含关键词的负例；这是测试音源，不是替换 Go/Edge-TTS 产品服务端，也不是“猫猫”定制模型。
+- 电脑默认扬声器→空气→板上真实麦克风→ESP-SR；不通过 USB 注入音频或 `AI WAKE`，不取消设备自身扬声器的防误唤醒保护。**板子必须已经上电、接着原生 USB，且处于电脑扬声器的可听范围。** 主机音量/默认音频设备均不擅自改动；静音或输出端点太远会真实失败，不伪造通过。
+- 播放为异步，USB 持续采样，避免错过 1.8 s 确认；每轮检查独立声学计数及事件、来源、无文本注入、好奇表情与实际 LVGL 琥珀提示、波形刷新。
+- 默认静默/非关键词负例、3 次正例、轮间冷却、420 s 持续推理；最终要求同 boot、正确 ELF、干净 fault、回到监听态。只允许有界的加载/模型重建暂态，永久失效/停推理/复位均失败。
+- `--wav 正例.wav --negative-wav 负例.wav` 可用自备单/双声道 PCM16 WAV，跳过 SAPI；每段 0.1–15 s。`--repeat 1..10` 控制轮数；`--soak-seconds 0` 只做短冒烟，不构成 7 分钟稳定性验收。
+- `queue_drops_delta/warnings` 单独报告队列掉块；连续推理恢复不等于零掉块通过，也不能将 7 分钟窗口推广为长期可靠性。
+- 报告及音源 SHA/WAV 在忽略的 `test-results` 中，必须使用新文件名；每阶段持久化，失败保留烧录和局部采样，不自动重刷/复位重试。
+- **软件回归、真实声学、LVGL 对象遥测、物理屏幕是不同验收层。** 没有摄像头时，不把遥测或桌面截图说成已目视检查实屏；该工具也不代表真实人声、距离/噪声识别率、ASR/AI 对话全部完成。
+
+详细本次结果与历史失败见 `docs/ESP_SR_WAKE.md`。

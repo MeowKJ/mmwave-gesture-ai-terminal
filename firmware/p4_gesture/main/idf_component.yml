@@ -1,5 +1,12 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  espressif/cjson:
+    version: "1.7.19~2"
+  # Adding a dependency must not silently upgrade the validated USB transport.
+  espressif/tinyusb:
+    version: "0.21.0~4"
+  espressif/usb:
+    version: "1.6.0"
   ## Required IDF version
   idf:
     version: ">=4.1.0"
@@ -17,3 +24,10 @@ dependencies:
   espressif/esp_tinyusb:
     version: "^2.0.1~1"
     public: true
+  # Only resolved when MEOAVE_USE_ESP_SR=1.  Keeping this opt-in preserves
+  # the validated offline build while the custom 猫猫 WakeNet asset is being
+  # prepared.
+  espressif/esp-sr:
+    version: "2.6.2"
+    rules:
+      - if: "$MEOAVE_USE_ESP_SR == 1"

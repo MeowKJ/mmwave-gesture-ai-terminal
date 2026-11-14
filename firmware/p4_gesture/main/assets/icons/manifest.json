@@ -1,0 +1,106 @@
+{
+  "library": "Lucide",
+  "version": "0.468.0",
+  "license": "ISC",
+  "source": "https://registry.npmjs.org/lucide-static/-/lucide-static-0.468.0.tgz",
+  "archive_sha256": "d87c47325f0b2ac3ad2d6f056889da32b8f1216eafe4ed6534bc02786effe8cc",
+  "icons": {
+    "chevron-left": {
+      "kind": "ICON_LEFT",
+      "sizes": [
+        32,
+        40
+      ],
+      "sha256": "a185985349089649d06747570c72f47fe1f5eb293a9a0f11278f6442b0b9d25c"
+    },
+    "chevron-right": {
+      "kind": "ICON_RIGHT",
+      "sizes": [
+        24,
+        40
+      ],
+      "sha256": "fea488a3b60fd7738bbbf8ca98826ef5c0381347c5fd1048d45ee70a75a51cfe"
+    },
+    "wifi": {
+      "kind": "ICON_WIFI",
+      "sizes": [
+        28,
+        30,
+        32
+      ],
+      "sha256": "133817fce3f8f7decbf6a38965242c35a372445c8afd8f10e30c75a913520347"
+    },
+    "sun": {
+      "kind": "ICON_SUN",
+      "sizes": [
+        32
+      ],
+      "sha256": "f067e7494a29d825168ef4285d1eb66ef3cd57c33778fd67528247e377a5ff89"
+    },
+    "eye": {
+      "kind": "ICON_EYE",
+      "sizes": [
+        32,
+        34
+      ],
+      "sha256": "7a23c549710b70c9eb1324540260943190190ef309e9f3604726a42c85f9b552"
+    },
+    "eye-off": {
+      "kind": "ICON_EYE_OFF",
+      "sizes": [
+        34
+      ],
+      "sha256": "e58f8907b5caf0b7fea682291844a2f65435f020b2ac1a9c8449b804e2333562"
+    },
+    "minus": {
+      "kind": "ICON_MINUS",
+      "sizes": [
+        28,
+        32
+      ],
+      "sha256": "116a64e7f95fe2c31490f084d4abbf49dc15af8e7fab4a29ed5b84bb3c26c00b"
+    },
+    "plus": {
+      "kind": "ICON_PLUS",
+      "sizes": [
+        28,
+        32
+      ],
+      "sha256": "b29207ee8f5cc0e829c0bab2e5b223fc88687599c6bd40b94ba35f52327615d6"
+    },
+    "settings": {
+      "kind": "ICON_GEAR",
+      "sizes": [
+        128
+      ],
+      "sha256": "ceea1a72d04b112291222ba9ad0779a12d47d816079fe4174900c724f360b55c"
+    },
+    "volume-2": {
+      "kind": "ICON_SPEAKER",
+      "sizes": [
+        32
+      ],
+      "sha256": "915b847fcee9bba25e4b5fbe8f78305ad3d22c903a51c239c57ca1c248c904e5"
+    },
+    "mic": {
+      "kind": "ICON_MIC",
+      "sizes": [
+        32
+      ],
+      "sha256": "6b7893c14bc1d1a9f839571ee2119dd8c5b96d7301c87cb6735e43278788f934"
+    },
+    "delete": {
+      "kind": "ICON_DELETE",
+      "sizes": [
+        32
+      ],
+      "sha256": "46bd1faa0ddc831830804f04ce3db28e77c7fd10c9deba878721f03f6ce38484"
+    }
+  },
+  "generator": {
+    "script": "tools/build_icons.py",
+    "resvg-py": "0.5.0",
+    "Pillow": "13.0.0",
+    "coverage": "4x SVG raster, Lanczos downsample, A8, exact native size"
+  }
+}

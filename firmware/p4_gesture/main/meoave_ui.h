@@ -13,13 +13,18 @@ typedef struct {
     /* Store the typed password and start connecting; false when the radio
        cannot accept it yet (the page keeps the text so nothing is lost). */
     bool (*wifi_connect)(const char *ssid, const char *pass);
-    /* Start/stop microphone capture; the settings switch is the only owner. */
+    /* Page-scoped capture: enter microphone starts it, leaving stops it. */
     void (*mic_test)(bool on);
-    /* Play one short test tone at the current speaker volume. Must return
+    /* The AI dial may keep a separate always-ready capture lease. Keeping this
+       callback distinct preserves the settings microphone test semantics. */
+    void (*ai_mic_test)(bool on);
+    /* Play one short CC0 music preview at the current speaker volume. Must return
        immediately (the adapter queues it); the UI never blocks on audio. */
-    void (*speaker_test)(void);
+    bool (*speaker_test)(void);
     /* Run the physical acoustic loopback self test. Non-blocking. */
     void (*audio_loop)(void);
+    /* Queue a short, nonblocking UI confirmation sound. */
+    void (*interaction_sound)(void);
 } meo_ui_config_t;
 
 /* Audio snapshot for the speaker page. The adapter pushes it only when a
@@ -32,16 +37,22 @@ typedef struct {
     uint8_t  route_l, route_r;
     bool     busy;
     bool     mic_running;
+    bool     playback_busy;
+    int      playback_error;
+    uint32_t playback_seq; /* Accepted request generation, including fast failures. */
 } meo_audio_view_t;
 
-/* Wi-Fi summary the home indicator and the network page can show without
+/* Wi-Fi summary the launcher indicator and the network page can show without
  * owning any network state themselves. */
-typedef enum { MEO_WIFI_OFF = 0, MEO_WIFI_CONNECTING, MEO_WIFI_ONLINE, MEO_WIFI_ERROR } meo_wifi_state_t;
+typedef enum { MEO_WIFI_OFF = 0, MEO_WIFI_CONNECTING, MEO_WIFI_ONLINE, MEO_WIFI_ERROR,
+               MEO_WIFI_READY, MEO_WIFI_STARTING, MEO_WIFI_UNAVAILABLE } meo_wifi_state_t;
 
 /* Call with the LVGL lock held; the existing port rotates pixels and LVGL
  * rotates raw pointer coordinates. Never additionally mirror CST820 input. */
 void meo_ui_create(const meo_ui_config_t *config);
 void meo_ui_navigate(meo_page_t page);
+/* Same setting change as the on-screen volume control; LVGL lock required. */
+void meo_ui_set_volume(int percent);
 void meo_ui_feed_gaze(meo_gaze_t sample);
 void meo_ui_feed_respiration(meo_resp_t sample);
 /* Compatibility hook: the product page accepts MEO_RADAR only. Feed normalized
@@ -52,12 +63,16 @@ void meo_ui_set_breath_mode(meo_breath_mode_t mode);
  * monotonic time; the UI boundary normalizes raw ticks across wrap. */
 void meo_ui_set_expression(meo_expression_t expression, uint32_t hold_ms);
 void meo_ui_auto_expression(void);
+void meo_ui_set_sentence_pose(meo_expression_t expression, float intensity,
+                              const meo_face_pose_t *pose);
 void meo_ui_settings_saved(bool success);
 /* Status inputs. Call with the LVGL lock held; they only touch cached labels
  * and never read hardware, block or allocate. percent < 0 hides the gauge. */
 void meo_ui_set_power(int percent, bool charging);
 void meo_ui_set_wifi(meo_wifi_state_t state, const char *ssid, int rssi);
-/* Scannable networks for the network page; count is clamped to 3 rows. */
+/* Scan state is independent of association; completion follows committed results. */
+void meo_ui_set_wifi_scan(bool active, int error, uint32_t completion_seq, int save_error);
+/* Scannable networks; all six cached results are reachable by vertical scroll. */
 void meo_ui_set_scan_list(const char ssid[][33], const int rssi[], unsigned count);
 /* Open the on-screen password page for a network that has no saved key. */
 void meo_ui_password_open(const char *ssid);
@@ -65,11 +80,23 @@ void meo_ui_password_open(const char *ssid);
  * Used by the USB health line so a stale font shows up as a number, not a bug
  * report about "a weird character". */
 bool meo_ui_font_has(const char *utf8);
-/* 0..5 shows the shutdown countdown, negative hides it. 0 means "powering off". */
+/* 0..3 shows the shutdown countdown, negative hides it. 0 means "powering off". */
 void meo_ui_set_shutdown(int seconds_left);
 /* Per-channel microphone level in 0..1 (0 = silence), [0] = left, [1] = right.
  * Driven from the app task; the page only animates the bars, never I2S. */
 void meo_ui_set_mic(const float level[2], bool running);
+/* AI/home capture feedback. The home dial stays visually quiet until the
+ * microphone is actually running; wake_detected changes the ring/accent for a
+ * short, unmistakable acknowledgement. */
+void meo_ui_set_wake_state(bool wake_detected);
+/* Actual LVGL object state, not a copy of the wake model. LVGL lock required.
+ * This diagnoses rendering inputs; it cannot inspect physical panel pixels. */
+typedef struct {
+    bool visible, ack;
+    uint32_t wave_seq, ink;
+    unsigned min_height, max_height;
+} meo_ui_capture_view_t;
+void meo_ui_capture_view(meo_ui_capture_view_t *out);
 /* Push a fresh audio snapshot; called with the LVGL lock held. */
 void meo_ui_set_audio(const meo_audio_view_t *view);
 /* Frame pacing probe. A window starts automatically on every page change and

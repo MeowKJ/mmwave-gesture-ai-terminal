@@ -50,7 +50,7 @@ P4 三段烧写 hash 验证通过，运行 ELF 为
 原状态及一次 C5RESET 请求后，均卡初始化成功，CIS=`0092:6666`，5次12字节均完整且为0；
 两轮清理成功。当前 headless 程序未运行 Hosted 握手，因此 Hosted/Wi-Fi/OTA 未验收。
 后续已采集 C5 UART 完整启动：v1.2/4MB，出厂 network_adapter/Hosted2.12.9/IDF6.0.2，
-SDIO stream初始化且统计持续至150秒；不再等待C5身份，暂不烧C5。见根目录docs/C5_SDIO_OTA_BRINGUP.md。
+SDIO stream初始化且统计持续至150秒；不再等待C5身份，暂不烧C5。验收边界见根目录docs/C5_MAINTENANCE.md。
 
 完整报告位于父工程忽略的 `test-results/new_devboard_*_20261110.json`，不提交备份或日志。
 

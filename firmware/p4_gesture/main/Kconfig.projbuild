@@ -37,6 +37,43 @@ config APP_MEOAVE_WIFI_HOSTED
       timing have been verified. GPIO6 is deliberately not used: it remains
       available for the ES8389 I2S DOUT path.
 
+config APP_MEOAVE_ESPSR
+    bool "Enable ESP-SR local wake-word adapter"
+    depends on APP_MEOAVE_UI
+    default y
+    help
+      Adds the ESP32-P4 WakeNet adapter and the single-reader 48 kHz stereo
+      to 16 kHz mono bridge. The official ESP-SR component is resolved only
+      when MEOAVE_USE_ESP_SR=1. A custom WakeNet model for the Chinese keyword
+      猫猫 is required; stock model names are never mislabeled as 猫猫.
+
+config APP_MEOAVE_ESPSR_WAKE_MODEL
+    string "ESP-SR WakeNet model name"
+    depends on APP_MEOAVE_ESPSR
+    default "wn9_maomao"
+    help
+      Name registered by the ESP-SR model asset. The product target is the
+      custom Chinese wake word 猫猫, normally packaged as wn9_maomao. If the
+      asset is absent or its metadata does not match 猫猫, the device reports
+      MODEL_MISSING or MODEL_WORD_MISMATCH and remains fail-closed.
+
+config APP_MEOAVE_ESPSR_MIC_CHANNEL
+    int "Microphone channel used by ESP-SR"
+    depends on APP_MEOAVE_ESPSR
+    range 0 1
+    default 0
+    help
+      Selects the already-calibrated ES8389 I2S channel used for WakeNet.
+
+config APP_MEOAVE_ESPSR_WAKE_WORD
+    string "Exact keyword expected in WakeNet metadata"
+    depends on APP_MEOAVE_ESPSR
+    default "猫猫"
+    help
+      Production target remains 猫猫. The explicit local diagnostic preset
+      hi_miaomiao uses Hi,喵喵 with wn9_himiaomiao_tts only after consent.
+      Never rename stock models or accept mismatched phrase metadata.
+
 config APP_C5_NATIVE_MAINTENANCE
     bool "Native USB C5 maintenance on the custom board"
     depends on APP_MEOAVE_WIFI_HOSTED

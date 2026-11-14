@@ -174,7 +174,8 @@ static void test_expressions(void)
             const meo_eye_shape_t *s = &m.eye_shape[i];
             assert(isfinite(s->half_x) && isfinite(s->half_y) && isfinite(s->arch));
             assert(isfinite(s->width) && isfinite(s->y));
-            assert(s->width >= 12 && s->width <= 90);
+            /* Focus/relief are narrower; surprise has a 3px micro-pulse. */
+            assert(s->width >= 8 && s->width <= 94);
         }
     }
     memcpy(&before, &m, sizeof(m));
@@ -224,6 +225,7 @@ int main(void)
     assert(meo_page_parent(MEO_HOME)==MEO_APPS && meo_page_parent(MEO_APPS)==MEO_APPS);
     assert(meo_page_parent(MEO_SETTINGS)==MEO_APPS && meo_page_parent(MEO_BREATHE)==MEO_APPS);
     assert(meo_page_parent(MEO_DISPLAY)==MEO_SETTINGS && meo_page_parent(MEO_ACCESSIBILITY)==MEO_SETTINGS);
+    assert(meo_page_parent(MEO_EXPRESSIONS)==MEO_SETTINGS);
     assert(meo_page_parent(MEO_WIFI)==MEO_SETTINGS && meo_page_parent(MEO_PAGE_COUNT)==MEO_HOME);
     assert(!meo_default_settings().app_list_view);
     test_mode_idempotence();

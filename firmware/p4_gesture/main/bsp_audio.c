@@ -10,7 +10,10 @@
  *   sound/soc/codecs/es8389.h。芯片工作在 slave 模式，时钟由 P4 提供。
  */
 #include "bsp_audio.h"
+#include "audio_preview.h"
+#include "audio_click.h"
 #include "audio_selftest.h"
+#include "meoave_pcm.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -20,7 +23,9 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_private/gpio.h"
@@ -36,15 +41,33 @@
 #include "bsp_common.h"
 #include "bsp_usb.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 
 static const char *TAG = "BSP_AUDIO";
 static i2c_master_dev_handle_t s_codec;
 static i2s_chan_handle_t s_tx_chan;
 static i2s_chan_handle_t s_rx_chan;
+static portMUX_TYPE s_audio_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_output_leased;
+/* Do not reserve ~12KiB BSS before the display/PPA/Hosted startup peak.
+ * Allocate internal SRAM only while a sentence owns output; ISR never reads PSRAM. */
+static meo_pcm_t *s_voice;
+static bool s_voice_owned;
+
+static bool IRAM_ATTR voice_sent(i2s_chan_handle_t handle,i2s_event_data_t *event,void *ctx)
+{
+    (void)handle;(void)ctx;
+    portENTER_CRITICAL_ISR(&s_audio_lock);
+    if (s_voice) meo_pcm_sent(s_voice,event->dma_buf,event->size);
+    portEXIT_CRITICAL_ISR(&s_audio_lock);
+    return false;
+}
 static bool s_present;
 static int s_init_error;      /* first failing step of bsp_audio_init() */
 static uint32_t s_i2c_acks;   /* bit N set when 7-bit address N answered */
 static uint8_t s_addr;
+static uint8_t s_chip_id[2];
+static unsigned s_codec_attempts;
 /* Runtime state. One place for every consumer (UI, shell, self test) to read;
  * no one reaches into the codec/I2S internals any more. */
 static int  s_mclk_duty;                 /* last measured MCLK pad duty, % */
@@ -65,7 +88,7 @@ static uint32_t s_mclk_pre_lpiomux;
  * first candidate list did not contain, so audio silently stayed disabled.
  * The board scan (acks=0x00040000) is what identified it. */
 static const uint8_t s_addr_candidates[] = {
-    0x12, ES8389_I2C_ADDR, 0x11, 0x20, 0x22,
+    0x12, ES8389_I2C_ADDR, 0x11, 0x13,
 };
 
 /* {reg, val} —— 官方驱动 es8389_init() 的完整写入序列 */
@@ -179,6 +202,73 @@ static esp_err_t codec_write_table(const uint8_t table[][2], size_t n)
     }
     return ESP_OK;
 }
+
+/* ACK alone is not an identity check: a failed warm start has reported a
+ * phantom 0x10 with FF register data. Never configure that candidate. Keep
+ * the verified board pin mapping and require the ES8389 silicon ID twice. */
+static esp_err_t codec_identify(i2c_master_bus_handle_t bus)
+{
+    s_present = false;
+    s_addr = 0;
+    s_i2c_acks = 0;
+    memset(s_chip_id, 0, sizeof(s_chip_id));
+    for (size_t i = 0; i < sizeof(s_addr_candidates); ++i) {
+        uint8_t addr = s_addr_candidates[i];
+        if (i2c_master_probe(bus, addr, 30) != ESP_OK) continue;
+        s_i2c_acks |= 1u << addr;
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 100000,
+        };
+        esp_err_t err = i2c_master_bus_add_device(bus, &cfg, &s_codec);
+        if (err != ESP_OK) return err;
+        for (unsigned pass = 0; pass < 2 && err == ESP_OK; ++pass) {
+            uint8_t reg = 0xFD, id0 = 0, id1 = 0;
+            err = i2c_master_transmit_receive(s_codec, &reg, 1, &id0, 1, 100);
+            reg = 0xFE;
+            if (err == ESP_OK)
+                err = i2c_master_transmit_receive(s_codec, &reg, 1, &id1, 1, 100);
+            if (err == ESP_OK && (id0 != 0x83 || id1 != 0x89))
+                err = ESP_ERR_INVALID_RESPONSE;
+        }
+        if (err == ESP_OK) {
+            s_addr = addr;
+            s_chip_id[0] = 0x83;
+            s_chip_id[1] = 0x89;
+            s_present = true;
+            ESP_LOGI(TAG, "ES8389 @0x%02X verified CHIP_ID=83 89", addr);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "reject codec ACK @0x%02X: %s", addr, esp_err_to_name(err));
+        esp_err_t remove = i2c_master_bus_rm_device(s_codec);
+        if (remove != ESP_OK) return remove;
+        s_codec = NULL;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+#if CONFIG_APP_AUDIO_CODEC_INIT
+static esp_err_t codec_verify_config(void)
+{
+    /* Check stable registers, not the auto-changing CSM state machine. */
+    static const uint8_t expected[][2] = {
+        {0xFD, 0x83}, {0xFE, 0x89}, {0x01, 0x08}, {0x02, 0x00},
+        {0x20, 0x60}, {0x40, 0x60}, {0x72, 0x64}, {0x73, 0x54},
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        uint8_t reg = expected[i][0], value = 0;
+        esp_err_t err = i2c_master_transmit_receive(s_codec, &reg, 1, &value, 1, 100);
+        if (err != ESP_OK) return err;
+        if (value != expected[i][1]) {
+            ESP_LOGW(TAG, "codec reg %02X: read %02X, expected %02X",
+                     reg, value, expected[i][1]);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    return ESP_OK;
+}
+#endif
 
 /* ---------------- shared numeric helpers ----------------
  * A 512-entry Q15 sine and integer-only mixing replace the old
@@ -351,84 +441,42 @@ esp_err_t bsp_audio_init(void)
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus), TAG, "i2c bus");
 
-    /* 扫一遍这条总线，把实际 ACK 的地址都打出来（便于核对 BSS138 与 CE 电平） */
-    s_i2c_acks = 0;
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        if (i2c_master_probe(bus, addr, 20) == ESP_OK) {
-            ESP_LOGI(TAG, "  codec bus ACK 0x%02X", addr);
-            if (addr < 32) s_i2c_acks |= (1u << addr);
+    esp_err_t cfg_err = ESP_FAIL;
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        s_codec_attempts = attempt;
+        if (attempt > 1) {
+            if (s_codec) {
+                esp_err_t remove = i2c_master_bus_rm_device(s_codec);
+                if (remove != ESP_OK) { s_init_error = remove; return remove; }
+                s_codec = NULL;
+            }
+            s_present = false;
+            bsp_gpio_out(PIN_AUDIO_PWR_EN, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            bsp_gpio_out(PIN_AUDIO_PWR_EN, 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-    }
-
-    /* 只有真正 probe 到 codec 才认为存在；i2c_master_bus_add_device() 本身
-       永远返回成功，不能拿它当探测结果。 */
-    bool found = false;
-    for (size_t i = 0; i < sizeof(s_addr_candidates) / sizeof(s_addr_candidates[0]); i++) {
-        if (i2c_master_probe(bus, s_addr_candidates[i], 50) == ESP_OK) {
-            s_addr = s_addr_candidates[i];
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        ESP_LOGW(TAG, "no ES8389 ACK on I2C%d (SDA=%d SCL=%d); audio disabled",
-                 ES_I2C_PORT, PIN_ES_I2C_SDA, PIN_ES_I2C_SCL);
-        s_init_error = ESP_ERR_NOT_FOUND;
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    const i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = s_addr,
-        .scl_speed_hz = 100000,
-    };
-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_codec), TAG, "add device");
-    s_present = true;
-
-    /* 读 CHIP_ID0/1 (0xFD/0xFE) 只作为日志，读不到不判失败 */
-    uint8_t id0 = 0, id1 = 0;
-    esp_err_t id_err = bsp_audio_read_reg(0xFD, &id0);
-    if (id_err == ESP_OK) id_err = bsp_audio_read_reg(0xFE, &id1);
-    ESP_LOGI(TAG, "ES8389 @0x%02X ACK, CHIP_ID=%02X %02X (%s)",
-             s_addr, id0, id1, id_err == ESP_OK ? "ok" : "read failed");
-
+        cfg_err = i2c_master_bus_reset(bus);
+        if (cfg_err == ESP_OK) cfg_err = codec_identify(bus);
 #if CONFIG_APP_AUDIO_CODEC_INIT
-    /* The register sequence can fail right after a soft restart (the bus or
-       the codec can be in a half-hung state even after the power pulse; the
-       RESET register writes mid-table also make the chip briefly deaf). One
-       retry with a fresh power pulse recovers it; if it still fails, give up
-       on the codec but keep going so the I2S buses still come up. */
-    esp_err_t cfg_err = codec_write_table(s_es8389_init,
-                            sizeof(s_es8389_init) / sizeof(s_es8389_init[0]));
-    if (cfg_err == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        cfg_err = codec_write_table(s_es8389_on,
-                    sizeof(s_es8389_on) / sizeof(s_es8389_on[0]));
-    }
-    if (cfg_err != ESP_OK) {
-        ESP_LOGW(TAG, "codec table write failed (0x%x), power-pulse and retry", cfg_err);
-        bsp_gpio_out(PIN_AUDIO_PWR_EN, 0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        bsp_gpio_out(PIN_AUDIO_PWR_EN, 1);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        cfg_err = codec_write_table(s_es8389_init,
-                    sizeof(s_es8389_init) / sizeof(s_es8389_init[0]));
+        if (cfg_err == ESP_OK) cfg_err = codec_write_table(s_es8389_init,
+                                        sizeof(s_es8389_init) / sizeof(s_es8389_init[0]));
         if (cfg_err == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(10));
             cfg_err = codec_write_table(s_es8389_on,
-                        sizeof(s_es8389_on) / sizeof(s_es8389_on[0]));
+                                        sizeof(s_es8389_on) / sizeof(s_es8389_on[0]));
         }
-    }
-    if (cfg_err == ESP_OK) {
-        ESP_LOGI(TAG, "ES8389 initialized: slave I2S 48k/16bit, DAC+ADC on, PA muted");
-    } else {
-        /* A half-configured codec is useless but the I2S buses and the MIC/SPK
-           debug commands should still exist, so log loudly and continue. */
-        ESP_LOGE(TAG, "ES8389 register init failed twice (0x%x), audio will be silent", cfg_err);
-    }
-#else
-    ESP_LOGW(TAG, "ES8389 register init disabled by CONFIG_APP_AUDIO_CODEC_INIT");
+        if (cfg_err == ESP_OK) cfg_err = codec_verify_config();
 #endif
+        if (cfg_err == ESP_OK) break;
+        ESP_LOGW(TAG, "codec startup attempt %u/3: %s", attempt, esp_err_to_name(cfg_err));
+    }
+    s_init_error = cfg_err;
+    if (cfg_err != ESP_OK) {
+        ESP_LOGE(TAG, "audio unavailable after verified startup attempts: %s", esp_err_to_name(cfg_err));
+        return cfg_err;
+    }
+    ESP_LOGI(TAG, "ES8389 initialized and verified; startup attempts=%u", s_codec_attempts);
 
     /* I2S0 主模式全双工；MCLK 默认 256*fs = 12.288MHz，与 ES8389 CLK_MUL 配置一致 */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -465,6 +513,8 @@ esp_err_t bsp_audio_init(void)
      * out_sel=26 (I2S0_MCLK_PAD_OUT_IDX) brings the 12.288 MHz clock back
      * and the codec ADC immediately produces data. */
     if (err == ESP_OK && s_rx_chan) err = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    const i2s_event_callbacks_t callbacks={.on_sent=voice_sent};
+    if (err == ESP_OK) err = i2s_channel_register_event_callback(s_tx_chan,&callbacks,NULL);
     if (err == ESP_OK) err = i2s_channel_enable(s_tx_chan);
     if (err == ESP_OK && s_rx_chan) err = i2s_channel_enable(s_rx_chan);
     /* RX init left the MCLK pad clock source on the RX branch - see
@@ -531,6 +581,7 @@ esp_err_t bsp_audio_init(void)
     ESP_LOGI(TAG, "I2S0 48k/16bit stereo full-duplex: %s (mclk_pad=TX, mclk=%d%%, vol=%d, route=%u/%u)",
              err == ESP_OK ? "ready" : esp_err_to_name(err), s_mclk_duty,
              s_volume, s_mic_route.left_sel, s_mic_route.right_sel);
+    s_init_error = err;
     return err;
 }
 
@@ -573,8 +624,29 @@ esp_err_t bsp_audio_set_mute(bool mute)
 }
 
 /* Frame-oriented primitives: one frame = one stereo sample pair. */
+bool bsp_audio_output_try_acquire(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    bool acquired = !s_output_leased && !s_voice_owned;
+    if (acquired) s_output_leased = true;
+    portEXIT_CRITICAL(&s_audio_lock);
+    return acquired;
+}
+
+void bsp_audio_output_release(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    s_output_leased = false;
+    portEXIT_CRITICAL(&s_audio_lock);
+}
+
 esp_err_t bsp_audio_tx_write(const int16_t *stereo, size_t frames, size_t *written_frames)
 {
+    if (written_frames) *written_frames=0;
+    portENTER_CRITICAL(&s_audio_lock);
+    bool voice_owned=s_voice_owned;
+    portEXIT_CRITICAL(&s_audio_lock);
+    if (voice_owned) return ESP_ERR_INVALID_STATE;
     if (!s_tx_chan || !stereo || !frames) return ESP_ERR_INVALID_ARG;
     size_t bytes = 0;
     esp_err_t err = i2s_channel_write(s_tx_chan, stereo,
@@ -582,6 +654,71 @@ esp_err_t bsp_audio_tx_write(const int16_t *stereo, size_t frames, size_t *writt
                                       pdMS_TO_TICKS(200));
     if (written_frames) *written_frames = bytes / BSP_AUDIO_FRAME_BYTES;
     return err;
+}
+
+esp_err_t bsp_audio_voice_open(uint32_t total_frames)
+{
+    if (!s_tx_chan) return ESP_ERR_INVALID_STATE;
+    meo_pcm_t *buffer=heap_caps_calloc(1,sizeof(meo_pcm_t),MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (!buffer) return ESP_ERR_NO_MEM;
+    portENTER_CRITICAL(&s_audio_lock);
+    bool ok=s_output_leased && !s_voice_owned && !s_voice && meo_pcm_open(buffer,total_frames);
+    if (ok) {s_voice=buffer;s_voice_owned=true;}
+    portEXIT_CRITICAL(&s_audio_lock);
+    if (!ok) heap_caps_free(buffer);
+    return ok ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+bool bsp_audio_voice_push(const int16_t *stereo,size_t frames)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    bool ok=s_voice_owned && s_voice && meo_pcm_push(s_voice,stereo,frames);
+    portEXIT_CRITICAL(&s_audio_lock);
+    return ok;
+}
+
+void bsp_audio_voice_pause(bool pause)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    if (s_voice) s_voice->paused=pause;
+    portEXIT_CRITICAL(&s_audio_lock);
+}
+
+void bsp_audio_voice_status(bsp_audio_voice_status_t *out)
+{
+    if (!out) return;
+    portENTER_CRITICAL(&s_audio_lock);
+    if (s_voice) {
+        *out=(bsp_audio_voice_status_t){.completed_frames=s_voice->completed,.submitted_frames=s_voice->submitted,
+            .underruns=s_voice->underruns,.queued_blocks=s_voice->count,.envelope=s_voice->envelope,
+            .active=s_voice->active,.paused=s_voice->paused,.draining=s_voice->draining,
+            .fault=s_voice->fault,.audible=s_voice->audible};
+    } else memset(out,0,sizeof(*out));
+    portEXIT_CRITICAL(&s_audio_lock);
+}
+
+esp_err_t bsp_audio_voice_close(void)
+{
+    esp_err_t err=bsp_audio_speaker(false);
+    portENTER_CRITICAL(&s_audio_lock);
+    bool owned=s_voice_owned && s_voice;
+    if (owned) meo_pcm_cancel(s_voice);
+    portEXIT_CRITICAL(&s_audio_lock);
+    if (!owned) return ESP_ERR_INVALID_STATE;
+    for (unsigned wait=0;wait<100;++wait) {
+        bsp_audio_voice_status_t state;bsp_audio_voice_status(&state);
+        if (!state.draining) {
+            portENTER_CRITICAL(&s_audio_lock);
+            meo_pcm_t *finished=s_voice;s_voice=NULL;s_voice_owned=false;
+            portEXIT_CRITICAL(&s_audio_lock);
+            heap_caps_free(finished);
+            return state.fault ? ESP_FAIL : err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    /* Fail closed: keep ownership on a missing DMA clock; a later legacy
+       writer must not replay unaccounted/stale voice buffers. */
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t bsp_audio_rx_read(int16_t *stereo, size_t frames, size_t *got_frames)
@@ -613,7 +750,7 @@ esp_err_t bsp_audio_record(int16_t *samples, size_t len, size_t *read)
 
 void bsp_audio_beep(uint32_t ms)
 {
-    if (!s_tx_chan) return;
+    if (!s_tx_chan || !bsp_audio_output_try_acquire()) return;
     enum { N = 48 };
     int16_t buf[N * 2];
     uint32_t phase = 0;
@@ -630,24 +767,56 @@ void bsp_audio_beep(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(20));
     (void)bsp_audio_speaker(false);
     (void)bsp_audio_set_volume(saved);
+    bsp_audio_output_release();
 }
 
 bool bsp_audio_codec_present(void) { return s_present; }
 
 /* ---------------- 麦克风电平 ---------------- */
 #define MIC_BLOCK_FRAMES 480            /* 10 ms stereo @ 48 kHz */
-static volatile int s_mic_rms[2], s_mic_peak[2];   /* L / R */
-static volatile bool s_mic_running;
-static volatile bool s_mic_pause;
+static int s_mic_rms[2], s_mic_peak[2];   /* L / R, protected by s_audio_lock */
+static bool s_mic_running, s_mic_pause, s_mic_reading;
 static TaskHandle_t s_mic_task;
+static StaticSemaphore_t s_mic_control_storage;
+static SemaphoreHandle_t s_mic_control;
+static bsp_audio_mic_frame_cb_t s_mic_frame_cb;
+static void *s_mic_frame_ctx;
+
+/* Serialize control requests, including first-worker creation. The worker
+ * never takes this mutex, so waiting for its read cannot deadlock it. */
+static void mic_control_take(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    if (!s_mic_control)
+        s_mic_control = xSemaphoreCreateMutexStatic(&s_mic_control_storage);
+    portEXIT_CRITICAL(&s_audio_lock);
+    xSemaphoreTake(s_mic_control, portMAX_DELAY);
+}
+
+static void mic_wait_idle(void)
+{
+    for (;;) {
+        portENTER_CRITICAL(&s_audio_lock);
+        bool reading = s_mic_reading;
+        portEXIT_CRITICAL(&s_audio_lock);
+        if (!reading) return;
+        vTaskDelay(1);
+    }
+}
 
 static void mic_task(void *arg)
 {
     (void)arg;
     static int16_t buf[MIC_BLOCK_FRAMES * 2];
-    unsigned blocks = 0;
     for (;;) {
-        if (s_mic_pause) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        portENTER_CRITICAL(&s_audio_lock);
+        bool capture = s_mic_running && !s_mic_pause;
+        s_mic_reading = capture;
+        portEXIT_CRITICAL(&s_audio_lock);
+        if (!capture) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
         size_t got = 0;   /* BYTES: i2s_channel_read reports bytes, not samples */
         esp_err_t err = bsp_audio_record(buf, MIC_BLOCK_FRAMES * 2, &got);
         size_t samples = got / sizeof(int16_t);
@@ -665,66 +834,136 @@ static void mic_task(void *arg)
                 if (v > peak[ch]) peak[ch] = v;
                 ++per_ch[ch];
             }
+            int rms[2] = {0, 0};
             for (int ch = 0; ch < 2; ++ch) {
                 if (!per_ch[ch]) continue;
-                int rms = (int)sqrt((double)energy[ch] / (double)per_ch[ch]);
+                rms[ch] = (int)sqrt((double)energy[ch] / (double)per_ch[ch]);
+            }
+            portENTER_CRITICAL(&s_audio_lock);
+            for (int ch = 0; ch < 2 && s_mic_running && !s_mic_pause; ++ch) {
                 /* A 10 ms block is noisy frame to frame; follow rises fast and
                    decay slowly so the meter reads like a VU needle. */
-                if (rms > s_mic_rms[ch]) s_mic_rms[ch] = rms;
-                else s_mic_rms[ch] = s_mic_rms[ch] - (s_mic_rms[ch] - rms) / 4;
+                if (rms[ch] > s_mic_rms[ch]) s_mic_rms[ch] = rms[ch];
+                else s_mic_rms[ch] = s_mic_rms[ch] - (s_mic_rms[ch] - rms[ch]) / 4;
                 s_mic_peak[ch] = peak[ch] > s_mic_peak[ch]
                     ? peak[ch] : s_mic_peak[ch] - s_mic_peak[ch] / 8;
             }
-            if (++blocks == 200) { blocks = 0; }   /* keep the counter bounded */
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            portEXIT_CRITICAL(&s_audio_lock);
+
+            /* Feed the wake-word engine from this same reader.  The callback
+             * is intentionally synchronous: its input points at the worker's
+             * reusable block and must not escape this call. */
+            bsp_audio_mic_frame_cb_t cb;
+            void *ctx;
+            portENTER_CRITICAL(&s_audio_lock);
+            cb = s_mic_frame_cb;
+            ctx = s_mic_frame_ctx;
+            portEXIT_CRITICAL(&s_audio_lock);
+            if (cb) cb(buf, samples / 2u,
+                       (uint64_t)(esp_timer_get_time() / 1000), ctx);
         }
+        portENTER_CRITICAL(&s_audio_lock);
+        s_mic_reading = false;
+        portEXIT_CRITICAL(&s_audio_lock);
+        if (err != ESP_OK || !samples) vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 esp_err_t bsp_audio_mic_start(void)
 {
     if (!s_rx_chan) return ESP_ERR_INVALID_STATE;
-    if (s_mic_task) return ESP_OK;
-    if (xTaskCreate(mic_task, "mic_level", 4096, NULL, 3, &s_mic_task) != pdPASS) {
+    mic_control_take();
+    if (!s_mic_task && xTaskCreate(mic_task, "mic_level", 4096, NULL, 3, &s_mic_task) != pdPASS) {
         s_mic_task = NULL;
+        xSemaphoreGive(s_mic_control);
         return ESP_ERR_NO_MEM;
     }
+    portENTER_CRITICAL(&s_audio_lock);
     s_mic_running = true;
+    portEXIT_CRITICAL(&s_audio_lock);
+    xTaskNotifyGive(s_mic_task);
+    xSemaphoreGive(s_mic_control);
     ESP_LOGI(TAG, "mic capture started (I2S RX, 48 kHz stereo)");
     return ESP_OK;
 }
 
 void bsp_audio_mic_stop(void)
 {
-    if (!s_mic_task) return;
-    TaskHandle_t task = s_mic_task;
-    s_mic_task = NULL;
+    mic_control_take();
+    portENTER_CRITICAL(&s_audio_lock);
     s_mic_running = false;
+    portEXIT_CRITICAL(&s_audio_lock);
+    mic_wait_idle();
+    portENTER_CRITICAL(&s_audio_lock);
     s_mic_rms[0] = s_mic_rms[1] = s_mic_peak[0] = s_mic_peak[1] = 0;
-    vTaskDelete(task);
+    portEXIT_CRITICAL(&s_audio_lock);
+    xSemaphoreGive(s_mic_control);
 }
 
-bool bsp_audio_mic_active(void) { return s_mic_running; }
+bool bsp_audio_mic_active(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    bool running = s_mic_running;
+    portEXIT_CRITICAL(&s_audio_lock);
+    return running;
+}
+
+bool bsp_audio_mic_capturing(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    bool capture = s_mic_running && !s_mic_pause;
+    portEXIT_CRITICAL(&s_audio_lock);
+    return capture;
+}
+
+esp_err_t bsp_audio_mic_set_frame_callback(bsp_audio_mic_frame_cb_t cb, void *ctx)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    s_mic_frame_cb = cb;
+    s_mic_frame_ctx = ctx;
+    portEXIT_CRITICAL(&s_audio_lock);
+    return ESP_OK;
+}
 
 esp_err_t bsp_audio_speaker(bool on)
 {
     if (!s_tx_chan) return ESP_ERR_INVALID_STATE;
     ESP_ERROR_CHECK(gpio_set_level(PIN_PA_CTRL, on ? 1 : 0));
+    portENTER_CRITICAL(&s_audio_lock);
     s_pa_on = on;
-    /* The amp needs a moment to leave shutdown; muting before it is ready is
-       what makes the first milliseconds of playback disappear. */
-    if (on) vTaskDelay(pdMS_TO_TICKS(25));
+    portEXIT_CRITICAL(&s_audio_lock);
+    /* NS4150B Mar. 2021 V1.1 specifies Tst = 120 ms typical (section 7).
+       The old 25 ms delay let a 120 ms decaying cue play almost entirely
+       during startup. Keep the verified pins/clocks/DMA and wait 150 ms
+       before submitting content: typical startup plus 30 ms board margin.
+       This is a worker/app-task API, never called from LVGL callbacks. */
+    if (on) vTaskDelay(pdMS_TO_TICKS(150));
     return ESP_OK;
 }
 
-bool bsp_audio_speaker_on(void) { return s_pa_on; }
+bool bsp_audio_speaker_on(void)
+{
+    portENTER_CRITICAL(&s_audio_lock);
+    bool on = s_pa_on;
+    portEXIT_CRITICAL(&s_audio_lock);
+    return on;
+}
 
-void bsp_audio_mic_pause(bool pause) { s_mic_pause = pause; }
+void bsp_audio_mic_pause(bool pause)
+{
+    mic_control_take();
+    portENTER_CRITICAL(&s_audio_lock);
+    s_mic_pause = pause;
+    portEXIT_CRITICAL(&s_audio_lock);
+    if (pause) mic_wait_idle();
+    else if (s_mic_task) xTaskNotifyGive(s_mic_task);
+    xSemaphoreGive(s_mic_control);
+}
 
 #define TONE_BLOCK_FRAMES 480         /* 10 ms @ 48 kHz */
 
-esp_err_t bsp_audio_tone(int freq_hz, int ms)
+/* Internal playback: the caller already owns the output lease. */
+static esp_err_t tone_play(int freq_hz, int ms)
 {
     if (!s_tx_chan || ms <= 0 || freq_hz <= 0) return ESP_ERR_INVALID_ARG;
     if (ms > 30000) ms = 30000;
@@ -745,13 +984,66 @@ esp_err_t bsp_audio_tone(int freq_hz, int ms)
     return ESP_OK;
 }
 
+esp_err_t bsp_audio_tone(int freq_hz, int ms)
+{
+    if (!bsp_audio_output_try_acquire()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = tone_play(freq_hz, ms);
+    bsp_audio_output_release();
+    return err;
+}
+
+esp_err_t bsp_audio_click(void)
+{
+    if (!s_tx_chan || !bsp_audio_output_try_acquire()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err=bsp_audio_speaker(true);
+    static int16_t buf[TONE_BLOCK_FRAMES * 2];
+    meo_click_t click={0};
+    tone_lut_init();
+    size_t count;
+    while (err==ESP_OK && (count=meo_click_render(&click,buf,TONE_BLOCK_FRAMES,s_tone_lut))) {
+        size_t written=0;
+        err=bsp_audio_tx_write(buf,count,&written);
+        if (err==ESP_OK && written!=count) err=ESP_FAIL;
+    }
+    memset(buf, 0, sizeof(buf));
+    /* write() queues DMA, it does not mean the last frame reached the DAC.
+       Default I2S ring is 6*240=1440 frames (30ms). Four silent blocks move
+       all cue samples past that ring before PA shutdown, without changing
+       the verified clock or DMA configuration. */
+    for (int i = 0; i < 4 && err == ESP_OK; ++i)
+        err = bsp_audio_tx_write(buf, TONE_BLOCK_FRAMES, NULL);
+    esp_err_t off = bsp_audio_speaker(false);
+    bsp_audio_output_release();
+    return err != ESP_OK ? err : off;
+}
+
 esp_err_t bsp_audio_test_tone(int freq_hz, int ms)
 {
+    if (!bsp_audio_output_try_acquire()) return ESP_ERR_INVALID_STATE;
     const int saved = bsp_audio_get_volume();
     esp_err_t e = bsp_audio_set_volume(BSP_AUDIO_TEST_VOLUME_PCT);
-    esp_err_t t = bsp_audio_tone(freq_hz, ms);
+    esp_err_t t = tone_play(freq_hz, ms);
     (void)bsp_audio_set_volume(saved);
+    bsp_audio_output_release();
     return e != ESP_OK ? e : t;
+}
+
+esp_err_t bsp_audio_preview_music(void)
+{
+    if (!s_tx_chan) return ESP_ERR_INVALID_STATE;
+    meo_preview_t preview={0};
+    int16_t buffer[TONE_BLOCK_FRAMES*2];
+    esp_err_t err=bsp_audio_speaker(true);
+    size_t count;
+    while (err==ESP_OK && (count=meo_preview_render(&preview,buffer,TONE_BLOCK_FRAMES))) {
+        size_t written=0;
+        err=bsp_audio_tx_write(buffer,count,&written);
+        if (err==ESP_OK && written!=count) err=ESP_FAIL;
+    }
+    memset(buffer,0,sizeof(buffer));
+    if (err==ESP_OK) err=bsp_audio_tx_write(buffer,TONE_BLOCK_FRAMES,NULL);
+    esp_err_t off=bsp_audio_speaker(false);
+    return err!=ESP_OK ? err : off;
 }
 
 /* Payload packs (ms | pct<<16) so one worker can cover both the USB shell
@@ -764,8 +1056,9 @@ static void tone_worker(void *arg)
     if (pct <= 0 || pct > 100) pct = BSP_AUDIO_TEST_VOLUME_PCT;
     const int saved = bsp_audio_get_volume();
     (void)bsp_audio_set_volume(pct);
-    (void)bsp_audio_tone(1000, ms);
+    (void)tone_play(1000, ms);
     (void)bsp_audio_set_volume(saved);
+    bsp_audio_output_release();
     vTaskDelete(NULL);
 }
 
@@ -799,10 +1092,12 @@ int bsp_audio_get_volume(void) { return s_volume; }
 
 void bsp_audio_mic_level(int rms[2], int peak[2])
 {
+    portENTER_CRITICAL(&s_audio_lock);
     for (int ch = 0; ch < 2; ++ch) {
         if (rms) rms[ch] = s_mic_rms[ch];
         if (peak) peak[ch] = s_mic_peak[ch];
     }
+    portEXIT_CRITICAL(&s_audio_lock);
 }
 
 void bsp_audio_status(bsp_audio_status_t *out)
@@ -818,13 +1113,32 @@ void bsp_audio_status(bsp_audio_status_t *out)
     out->pa_on         = s_pa_on;
     out->tx_ready      = s_tx_chan != NULL;
     out->rx_ready      = s_rx_chan != NULL;
-    out->mic_running   = s_mic_running;
+    out->mic_running   = bsp_audio_mic_active();
     out->i2c_acks      = s_i2c_acks;
     out->route         = s_mic_route;
 }
 
 bool bsp_audio_command(const char *line)
 {
+    if (line && strncmp(line, "AUDIO HEALTH ", 13) == 0) {
+        char token[17] = {0};
+        if (sscanf(line + 13, "%16s", token) != 1) return true;
+        static const uint8_t regs[] = {0xFD, 0xFE, 0x02, 0x20, 0x40, 0x46, 0x47, 0x72, 0x73};
+        uint8_t values[sizeof(regs)];
+        unsigned errors = 0;
+        for (size_t i = 0; i < sizeof(regs); ++i) {
+            values[i] = 0xFF;
+            if (bsp_audio_read_reg(regs[i], &values[i]) != ESP_OK) ++errors;
+        }
+        char out[240];
+        snprintf(out, sizeof(out),
+                 "MEO:AUDIO_HEALTH token=%s addr=0x%02X chip=%02X%02X init_error=%d attempts=%u "
+                 "errors=%u clk=%02X adc=%02X dac=%02X vol=%02X/%02X mux=%02X/%02X\n",
+                 token, s_addr, values[0], values[1], s_init_error, s_codec_attempts,
+                 errors, values[2], values[3], values[4], values[5], values[6], values[7], values[8]);
+        (void)bsp_usb_cdc_write(out);
+        return true;
+    }
     if (line && strncmp(line, "AUDIO ", 6) == 0)
         return audio_selftest_command(line);
     if (line && strncmp(line, "SPK ", 4) == 0) {
@@ -842,8 +1156,12 @@ bool bsp_audio_command(const char *line)
                 if (sscanf(line, "SPK %*s %*d %d", &pct) != 1 || pct < 0 || pct > 100)
                     pct = BSP_AUDIO_TEST_VOLUME_PCT;
                 uint32_t payload = (uint32_t)arg | ((uint32_t)pct << 16);
-                bool ok = xTaskCreate(tone_worker, "tone", 4096,
-                                      (void *)(uintptr_t)payload, 3, NULL) == pdPASS;
+                bool ok = bsp_audio_output_try_acquire();
+                if (ok && xTaskCreate(tone_worker, "tone", 4096,
+                                     (void *)(uintptr_t)payload, 3, NULL) != pdPASS) {
+                    bsp_audio_output_release();
+                    ok = false;
+                }
                 snprintf(out, sizeof(out), "MEO:SPK op=TONE ms=%d vol=%d queued=%d\n",
                          arg, pct, ok);
             } else if (strcmp(verb, "VOL") == 0) {
@@ -910,8 +1228,7 @@ bool bsp_audio_command(const char *line)
            callers abort the driver. Stop it for the duration of the dump. */
         /* Ask the level task to stand down instead of deleting it: deleting a
            task that is blocked inside i2s_channel_read leaves the driver locked. */
-        s_mic_pause = true;
-        vTaskDelay(pdMS_TO_TICKS(40));
+        bsp_audio_mic_pause(true);
         esp_err_t e = bsp_audio_record(buf, 32, &got);
         size_t samples = got / sizeof(int16_t);
         if (samples > 32) samples = 32;
@@ -922,7 +1239,7 @@ bool bsp_audio_command(const char *line)
             n += snprintf(line + n, sizeof(line) - n, "%04x ", (uint16_t)buf[i]);
         snprintf(line + n, sizeof(line) - n, "\n");
         (void)bsp_usb_cdc_write(line);
-        s_mic_pause = false;
+        bsp_audio_mic_pause(false);
         return true;
     } else if (strcmp(verb, "SEL") == 0) {
         /* MIC SEL <token> <left> <right> [gain]: left/right are the 0x72/0x73
@@ -1185,7 +1502,7 @@ bool bsp_audio_command(const char *line)
         snprintf(reply, sizeof(reply),
                  "MEO:MIC token=%s running=%d l_rms=%d r_rms=%d l_db=%d r_db=%d "
                  "l_peak=%d r_peak=%d codec=%d init_error=%d acks=0x%08lx rx=%d\n",
-                 token, s_mic_running, rms[0], rms[1], db[0], db[1],
+                 token, bsp_audio_mic_active(), rms[0], rms[1], db[0], db[1],
                  peak[0], peak[1], s_present, s_init_error,
                  (unsigned long)s_i2c_acks, s_rx_chan != NULL);
     } else {

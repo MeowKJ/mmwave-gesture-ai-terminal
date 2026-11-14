@@ -6,23 +6,38 @@
  * Calls must be serialized by the UI thread (or its platform LVGL lock). */
 typedef enum { MEO_HOME, MEO_APPS, MEO_SETTINGS, MEO_WIFI, MEO_BREATHE,
                MEO_DISPLAY, MEO_ACCESSIBILITY, MEO_PASSWORD, MEO_MIC, MEO_SPEAKER,
-               MEO_PAGE_COUNT } meo_page_t;
+               MEO_EXPRESSIONS, MEO_PAGE_COUNT } meo_page_t;
 typedef enum { MEO_GUIDED, MEO_RADAR } meo_breath_mode_t;
 typedef enum { MEO_EYE_CALM, MEO_EYE_HAPPY, MEO_EYE_CURIOUS, MEO_EYE_SLEEPY,
-               MEO_EYE_SURPRISED, MEO_EYE_WINK, MEO_EYE_SAD, MEO_EYE_COUNT } meo_expression_t;
+               MEO_EYE_SURPRISED, MEO_EYE_WINK, MEO_EYE_SAD,
+               MEO_EYE_EXCITED, MEO_EYE_SHY, MEO_EYE_LOVE, MEO_EYE_PROUD,
+               MEO_EYE_CONFUSED, MEO_EYE_WORRIED, MEO_EYE_ANGRY,
+               MEO_EYE_FOCUSED, MEO_EYE_RELIEVED, MEO_EYE_COUNT } meo_expression_t;
 
 /* A single rounded white stroke per eye, not an eyeball/pupil hierarchy.
  * Normalized path t=-1..1: x=half_x*t, y=half_y*t+arch*(t*t-.5)+y. */
 typedef struct { float half_x, half_y, arch, width, y; } meo_eye_shape_t;
+typedef struct { float half_x, curve, aperture, tilt; } meo_mouth_shape_t;
+typedef struct { meo_eye_shape_t eye[2]; meo_mouth_shape_t mouth; } meo_face_pose_t;
+
+const char *meo_expression_name(meo_expression_t expression);
+/* intensity=0 is exactly neutral; animated phase is supplied by the caller,
+ * so voice expressions can use completed PCM frames, never a wall timer. */
+bool meo_expression_pose(meo_expression_t expression, float intensity,
+                         uint32_t phase_ms, bool animate, meo_face_pose_t *out);
+void meo_face_blend(const meo_face_pose_t *a, const meo_face_pose_t *b,
+                    float mix, meo_face_pose_t *out);
 typedef struct {
     uint8_t brightness, guide_bpm;
     /* Speaker output level 0..100 (0 = mute, 100 = 0 dB). Persisted so the
        next boot restores the same loudness. */
     uint8_t volume;
     bool reduced_motion, app_list_view;
-    /* Microphone test switch: capture only runs while this is on, so the radio
-       and the meter stay idle (and silent) until someone asks for them. */
+    /* Legacy layout compatibility only; capture is now microphone-page scoped. */
     bool mic_test;
+    uint8_t mic_gain; /* ES8389 PGA step 0..14; persisted independently of capture. */
+    /* Short tactile-style audio feedback for committed UI actions. */
+    bool interaction_sound;
 } meo_settings_t;
 typedef struct {
     float x, y;
@@ -47,6 +62,9 @@ typedef struct {
     uint32_t rng;
     meo_expression_t expression;
     meo_eye_shape_t eye_shape[2];
+    meo_mouth_shape_t mouth_shape;
+    float expression_intensity;
+    bool expression_media;
     uint64_t expression_clock_ms, expression_at_ms;
     uint32_t expression_hold_ms;
     bool expression_override;
@@ -65,6 +83,12 @@ void meo_model_set_rate(meo_model_t *m, int rate);
 /* UI thread/LVGL lock, like gaze. hold_ms=0 holds until explicitly released.
  * Invalid expressions are ignored. Timed holds expire even off the home page. */
 void meo_model_set_expression(meo_model_t *m, meo_expression_t expression, uint32_t hold_ms);
+bool meo_model_set_expression_level(meo_model_t *m, meo_expression_t expression,
+                                    float intensity, uint32_t hold_ms);
+/* A validated sentence scheduler owns this pose until auto_expression() or
+ * another explicit expression. No wall-clock morphing while media is stalled. */
+void meo_model_set_media_pose(meo_model_t *m, meo_expression_t expression,
+                             float intensity, const meo_face_pose_t *pose);
 void meo_model_auto_expression(meo_model_t *m);
 meo_page_t meo_page_parent(meo_page_t page);
 void meo_rotate_touch_180(int raw_x, int raw_y, int *x, int *y);

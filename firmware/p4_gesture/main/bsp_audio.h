@@ -65,6 +65,13 @@ esp_err_t bsp_audio_mic_route_set(const bsp_audio_mic_route_t *route);
 void      bsp_audio_mic_route_get(bsp_audio_mic_route_t *route);
 
 /* ---------------- 3. streams ---------------- */
+/* Fast, non-blocking output reservation. Reserve before queuing a playback
+ * worker; that worker releases once after restoring PA/volume, or the caller
+ * releases if task creation fails. Transfer across tasks is allowed; this is
+ * not a recursive mutex. Low-level TX/PA/volume functions do not acquire it. */
+bool bsp_audio_output_try_acquire(void);
+void bsp_audio_output_release(void);
+
 /* len is in int16 samples for the legacy helpers (kept for callers). */
 esp_err_t bsp_audio_play(const int16_t *samples, size_t len);
 esp_err_t bsp_audio_record(int16_t *samples, size_t len, size_t *read);
@@ -73,29 +80,63 @@ esp_err_t bsp_audio_record(int16_t *samples, size_t len, size_t *read);
 esp_err_t bsp_audio_tx_write(const int16_t *stereo, size_t frames, size_t *written_frames);
 esp_err_t bsp_audio_rx_read(int16_t *stereo, size_t frames, size_t *got_frames);
 
+/* Sentence playback uses a separate, bounded producer ring and the SAME I2S
+ * channel. Caller holds the output lease throughout open->close and must not
+ * call legacy tx_write in parallel. No pins, rates or codec settings change. */
+typedef struct {
+    uint32_t completed_frames, submitted_frames, underruns;
+    unsigned queued_blocks;
+    uint16_t envelope; /* 0..1000, derived from the completed PCM block */
+    bool active, paused, draining, fault, audible;
+} bsp_audio_voice_status_t;
+esp_err_t bsp_audio_voice_open(uint32_t total_frames);
+bool bsp_audio_voice_push(const int16_t *stereo,size_t frames);
+void bsp_audio_voice_pause(bool pause);
+void bsp_audio_voice_status(bsp_audio_voice_status_t *out);
+/* Disable PA, scrub descriptors and release media ownership, not the lease. */
+esp_err_t bsp_audio_voice_close(void);
+
 /* Lookup-table sine, phase in Q16 (0..65535 = one cycle). No double, no sin()
  * per sample - safe to call from a 48 kHz streaming task. */
 void bsp_audio_fill_tone(int16_t *stereo, size_t frames, int freq_hz,
                          int16_t amplitude, uint32_t *phase_q16);
 
-/* Blocking tone; call from a worker task, never from the USB/UI path. */
+/* Blocking tone; call from a worker task, never from the USB/UI path.
+ * Acquires/releases the output lease itself; busy returns INVALID_STATE. */
 esp_err_t bsp_audio_tone(int freq_hz, int ms);
+/* Short decaying confirmation cue used by committed UI actions. */
+esp_err_t bsp_audio_click(void);
 /* Same tone at BSP_AUDIO_TEST_VOLUME_PCT, restoring the user's listening
  * volume afterwards. Used by every "test / self-test" trigger so bench runs
  * never blast at 0 dB. */
 esp_err_t bsp_audio_test_tone(int freq_hz, int ms);
+/* CC0 Kenney pizzicato music. Uses the current user volume unchanged.
+ * Low level: caller must already hold the output lease and release afterwards. */
+esp_err_t bsp_audio_preview_music(void);
 void      bsp_audio_beep(uint32_t ms);
 
 /* Amplifier (PA_CTRL = GPIO24), high = on. */
 esp_err_t bsp_audio_speaker(bool on);
 bool      bsp_audio_speaker_on(void);
 
-/* Continuous level meter. The self test pauses it so RX has a single owner. */
+/* A lazily created, permanent level worker sleeps while capture is stopped.
+ * Control calls belong on app/engineering workers, never the GUI task.
+ * Stop/pause(true) wait cooperatively for any I2S read to return; no task is
+ * deleted. Pause preserves the latest start/stop intent for resume. */
 esp_err_t bsp_audio_mic_start(void);
 void      bsp_audio_mic_stop(void);
 void      bsp_audio_mic_pause(bool pause);
 void      bsp_audio_mic_level(int rms[2], int peak[2]);
 bool      bsp_audio_mic_active(void);
+/* Actual capture state, excluding temporary self-test/playback pauses. */
+bool      bsp_audio_mic_capturing(void);
+
+/* Synchronous tap on the already-owned I2S RX stream.  The callback runs on
+ * the permanent microphone worker after a block has been read; registering a
+ * tap never creates a second i2s_channel_read() consumer. */
+typedef void (*bsp_audio_mic_frame_cb_t)(const int16_t *stereo, size_t frames,
+                                         uint64_t now_ms, void *ctx);
+esp_err_t bsp_audio_mic_set_frame_callback(bsp_audio_mic_frame_cb_t cb, void *ctx);
 
 /* ---------------- 4. status snapshot ---------------- */
 typedef struct {

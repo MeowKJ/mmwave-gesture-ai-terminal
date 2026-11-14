@@ -1,0 +1,5 @@
+# Optional generators only. NOT needed for firmware builds or offline tests.
+Pillow==13.0.0
+resvg-py==0.5.0
+numpy==2.5.4
+soundfile==0.14.0

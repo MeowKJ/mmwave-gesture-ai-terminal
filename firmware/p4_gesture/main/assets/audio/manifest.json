@@ -1,0 +1,20 @@
+{
+  "title": "Music Jingles / jingles_PIZZI07",
+  "author": "Kenney Vleugels",
+  "license": "CC0-1.0",
+  "source": "https://kenney.nl/assets/music-jingles",
+  "archive_path": "Audio/Pizzicato jingles/jingles_PIZZI07.ogg",
+  "source_sha256": "91870588924e0e498c6eb8d4f4ccf8595c9e7dc51fb553797b551062e642ce7c",
+  "archive_sha256": "b729ba57959bd58793d2c5cafa348aaf2655d354f3da35ec4729e03ec77197b8",
+  "generation": "tools/build_preview_audio.py; mono 24kHz PCM16, peak 22000, 10ms edge fades",
+  "generator": {
+    "script": "tools/build_preview_audio.py",
+    "soundfile": "0.14.0",
+    "numpy": "2.5.4"
+  },
+  "pcm_sha256": "4902838d954e2b3d1224ba03b9c5eb927433b1f1e6ff769a679d7268bd12c946",
+  "pcm_sample_rate": 24000,
+  "pcm_frames": 31777,
+  "pcm_peak": 22000,
+  "pcm_rms": 5762.353
+}

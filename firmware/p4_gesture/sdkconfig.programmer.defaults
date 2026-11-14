@@ -1,4 +1,7 @@
 # Product UI and native USB remain available while programming the C5.
+# Programmer owns SDIO exclusively; never run the product radio worker.
+# CONFIG_APP_MEOAVE_WIFI_HOSTED is not set
+# CONFIG_ESP_HOSTED_ENABLED is not set
 CONFIG_APP_C5_SDIO_LOADER=y
 # Custom manual-entry SDIO port: no built-in reset/boot GPIO operations.
 CONFIG_SERIAL_FLASHER_PORT_UART=n

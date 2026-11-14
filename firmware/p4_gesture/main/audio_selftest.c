@@ -96,13 +96,13 @@ static void measure(uint32_t out[2], int ms, bool play_tone, uint32_t *phase_q16
 
 static uint32_t best_ch(const uint32_t v[2]) { return v[0] > v[1] ? v[0] : v[1]; }
 
-static void restore_state(int volume, bool pa_on, bool mic_running)
+static void restore_state(int volume, bool pa_on)
 {
     (void)bsp_audio_set_volume(volume);
     (void)bsp_audio_dac_mute(false);
     (void)bsp_audio_adc_mute(false);
     (void)bsp_audio_speaker(pa_on);
-    if (!mic_running) (void)bsp_audio_mic_stop();
+    /* Only release our pause: page changes during the test own capture intent. */
     bsp_audio_mic_pause(false);
 }
 
@@ -117,7 +117,6 @@ static void loopback_task(void *arg)
 
     bsp_audio_status_t saved;
     bsp_audio_status(&saved);
-    const bool mic_running = saved.mic_running;
 
     memset(&s_result, 0, sizeof(s_result));
     s_result.state = AUDIO_LOOP_RUNNING;
@@ -126,7 +125,6 @@ static void loopback_task(void *arg)
     /* RX must have exactly one reader. The level meter stands down, but the
        task object stays alive so nothing deletes a task blocked in I2S. */
     bsp_audio_mic_pause(true);
-    vTaskDelay(pdMS_TO_TICKS(50));
 
     (void)bsp_audio_adc_mute(false);
     (void)bsp_audio_dac_mute(false);
@@ -154,7 +152,7 @@ static void loopback_task(void *arg)
 
     measure(s_result.restore, 250, true, &phase);
 
-    restore_state(saved.volume, saved.pa_on, mic_running);
+    restore_state(saved.volume, saved.pa_on);
     s_result.elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000 - t0);
 
     const uint32_t tone = best_ch(s_result.tone);
@@ -209,6 +207,7 @@ static void loopback_task(void *arg)
          saved.volume, BSP_AUDIO_TEST_VOLUME_PCT, s_result.reason);
 
     s_busy = false;
+    bsp_audio_output_release();
     vTaskDelete(NULL);
 }
 
@@ -222,10 +221,8 @@ static void calibrate_task(void *arg)
 
     bsp_audio_status_t saved;
     bsp_audio_status(&saved);
-    const bool mic_running = saved.mic_running;
 
     bsp_audio_mic_pause(true);
-    vTaskDelay(pdMS_TO_TICKS(50));
     (void)bsp_audio_adc_mute(false);
     (void)bsp_audio_dac_mute(false);
     (void)bsp_audio_set_volume(BSP_AUDIO_TEST_VOLUME_PCT);
@@ -262,13 +259,14 @@ static void calibrate_task(void *arg)
                                     .gain = saved.route.gain,
                                     .swap = saved.route.swap};
     (void)bsp_audio_mic_route_set(&chosen);
-    restore_state(saved.volume, saved.pa_on, mic_running);
+    restore_state(saved.volume, saved.pa_on);
 
     s_result.best_left_sel = best_l;
     s_result.best_right_sel = best_r;
     emit(token, "cal verdict=BEST lsel=%u rsel=%u score=%lu", best_l, best_r,
          (unsigned long)best_score);
     s_busy = false;
+    bsp_audio_output_release();
     vTaskDelete(NULL);
 }
 
@@ -281,7 +279,7 @@ void audio_selftest_result(audio_loop_result_t *out)
 
 void audio_selftest_start(const char *token, int ms)
 {
-    if (s_busy) {
+    if (!bsp_audio_output_try_acquire()) {
         emit(token, "verdict=BUSY");
         return;
     }
@@ -298,13 +296,14 @@ void audio_selftest_start(const char *token, int ms)
     if (xTaskCreate(loopback_task, "audio_loop", LOOP_TASK_STACK, payload, 3, NULL)
         != pdPASS) {
         s_busy = false;
+        bsp_audio_output_release();
         emit(token, "verdict=FAIL reason=no-task");
     }
 }
 
 void audio_selftest_calibrate(const char *token)
 {
-    if (s_busy) {
+    if (!bsp_audio_output_try_acquire()) {
         emit(token, "verdict=BUSY");
         return;
     }
@@ -314,6 +313,7 @@ void audio_selftest_calibrate(const char *token)
     if (xTaskCreate(calibrate_task, "audio_cal", LOOP_TASK_STACK, cal_token, 3, NULL)
         != pdPASS) {
         s_busy = false;
+        bsp_audio_output_release();
         emit(token, "verdict=FAIL reason=no-task");
     }
 }

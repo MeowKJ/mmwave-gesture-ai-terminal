@@ -168,6 +168,18 @@ static unsigned assert_art_pixels(lv_obj_t *art)
     return changed;
 }
 
+static bool artwork_fully_visible(lv_obj_t *art)
+{
+    lv_area_t area;lv_obj_get_coords(art,&area);
+    if (area.x1<0 || area.x2>459 || area.y1<0 || area.y2>459) return false;
+    for (lv_obj_t *p=lv_obj_get_parent(art);p;p=lv_obj_get_parent(p)) {
+        if (lv_obj_has_flag(p,LV_OBJ_FLAG_OVERFLOW_VISIBLE)) continue;
+        lv_area_t clip;lv_obj_get_coords(p,&clip);
+        if (area.x1<clip.x1 || area.x2>clip.x2 || area.y1<clip.y1 || area.y2>clip.y2) return false;
+    }
+    return true;
+}
+
 static unsigned assert_native_icon_pixels(lv_obj_t *parent)
 {
     unsigned count=0;
@@ -175,6 +187,9 @@ static unsigned assert_native_icon_pixels(lv_obj_t *parent)
     lv_area_t viewport; lv_obj_get_coords(parent,&viewport);
     if (viewport.x1>459 || viewport.x2<0 || viewport.y1>459 || viewport.y2<0) return 0;
     if (lv_obj_has_flag(parent,LV_OBJ_FLAG_USER_1)) {
+        /* Scroll viewports clip edge rows by design. Test every complete
+           icon's real pixels, not artwork outside an ancestor's viewport. */
+        if (!artwork_fully_visible(parent)) return 0;
         assert(!lv_obj_has_flag(parent,LV_OBJ_FLAG_CLICKABLE));
         assert(lv_obj_get_style_transform_scale_x(parent,0)==256);
         assert(lv_obj_get_style_transform_scale_y(parent,0)==256);
@@ -194,6 +209,23 @@ static unsigned assert_native_icon_pixels(lv_obj_t *parent)
     return count;
 }
 
+static lv_obj_t *find_wifi_mark(lv_obj_t *parent)
+{
+    if (lv_obj_has_flag(parent, LV_OBJ_FLAG_HIDDEN)) return NULL;
+    if (lv_obj_has_flag(parent, LV_OBJ_FLAG_USER_1)) {
+        lv_area_t area; lv_obj_get_coords(parent, &area);
+        /* The scan action is now text-only. Verify actual network/status
+           signal artwork, not an icon that merely decorates the action. */
+        if (area.x1 == 42 && area.y1 >= 82 && lv_obj_get_width(parent) == 32)
+            return parent;
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_count(parent); ++i) {
+        lv_obj_t *found = find_wifi_mark(lv_obj_get_child(parent, (int32_t)i));
+        if (found) return found;
+    }
+    return NULL;
+}
+
 static void assert_icons(unsigned expected)
 {
     lv_obj_t *screen=lv_screen_active();
@@ -208,10 +240,15 @@ static void assert_icons(unsigned expected)
            zero-length rounded line is discarded by the SW renderer. Probe a
            small window because the dot is antialiased at this size. */
         bool found=false;
-        for (int y=164; y<=178 && !found; ++y)
-            for (int x=54; x<=74 && !found; ++x) {
+        lv_obj_t *wifi_mark=find_wifi_mark(screen);
+        if (!wifi_mark) { assert(actual==1); return; } /* empty active scan: back only */
+        lv_color_t ink=lv_obj_get_style_line_color(wifi_mark,0);
+        lv_area_t mark;lv_obj_get_coords(wifi_mark,&mark);
+        int cx=(mark.x1+mark.x2)/2;
+        for (int y=mark.y2-7; y<=mark.y2 && !found; ++y)
+            for (int x=cx-5; x<=cx+5 && !found; ++x) {
                 const unsigned char *p=framebuffer+(y*460+x)*3;
-                if (p[0]==0xFF && p[1]==0xB5 && p[2]==0x78) found=true; /* BGR accent blue */
+                if (p[0]==ink.blue && p[1]==ink.green && p[2]==ink.red) found=true;
             }
         assert(found);
     }
@@ -268,6 +305,8 @@ static unsigned assert_settings_labels(lv_obj_t *parent)
                 fprintf(stderr,"Small settings text: %s\n",lv_label_get_text(child));
             assert(font==&meo_font_28 || font==&meo_font_44);
             count++;
+            if(lv_obj_get_height(child)!=font->line_height)
+                fprintf(stderr,"Wrapped settings text page=%s text=%s h=%ld line=%d\n",meo_ui_page_name(meo_ui_model()->page),text,(long)lv_obj_get_height(child),font->line_height);
             assert(lv_obj_get_height(child)==font->line_height); /* no wrapping */
             lv_area_t text_area; lv_obj_get_coords(child,&text_area);
             assert(text_area.x1>=bounds.x1 && text_area.x2<=bounds.x2);
@@ -313,9 +352,10 @@ static void assert_monochrome_home(bool open)
 {
     assert(meo_ui_model()->page == MEO_HOME);
     lv_refr_now(NULL);
-    /* Home starts with the two eye objects (pupils are their children); the
-       status strip (Wi-Fi, percentage, gauge) follows them. */
-    assert(lv_obj_get_child_count(lv_screen_active()) >= 2);
+    /* Status lives on the launcher, never on the AI dial. */
+    assert(lv_obj_get_child_count(lv_screen_active()) == 4);
+    for (int i=2;i<4;++i)
+        assert(lv_obj_has_flag(lv_obj_get_child(lv_screen_active(),i),LV_OBJ_FLAG_HIDDEN));
     unsigned whites[2] = {0, 0};
     for (int i = 0; i < 2; ++i) {
         lv_obj_t *eye = lv_obj_get_child(lv_screen_active(), i);
@@ -326,13 +366,14 @@ static void assert_monochrome_home(bool open)
     for (int y = 0; y < 460; ++y) for (int x = 0; x < 460; ++x) {
         const unsigned char *p = framebuffer + (y * 460 + x) * 3;
         assert(p[0] == p[1] && p[1] == p[2]);
-        /* The face area stays pure black apart from the eyes. The status band
-           at the top is the single place where UI ink may appear. */
+        /* Every pixel outside the eyes stays black, including the top band. */
         bool eye_region = x >= 65 && x <= 395 && y >= 125 && y <= 325;
-        bool status_band = y <= 120 && x >= 200;
-        if (!eye_region && !status_band) assert(p[0] == 0);
+        if (!eye_region) assert(p[0] == 0);
         if (p[0] == 255 && y < 275) whites[x >= 230]++;
     }
+    if (!(whites[0] > (open ? 450u : 100u) && whites[1] > (open ? 450u : 100u)))
+        fprintf(stderr,"eye coverage: expression=%s open=%d whites=%u,%u\n",
+                meo_expression_name(meo_ui_model()->expression),open,whites[0],whites[1]);
     assert(whites[0] > (open ? 450u : 100u) && whites[1] > (open ? 450u : 100u));
 }
 
@@ -360,7 +401,7 @@ static void assert_launcher(void)
     assert(meo_ui_model()->page==MEO_APPS);
     lv_obj_t *screen=lv_screen_active(), *rail=gallery_rail();
     lv_obj_update_layout(screen);
-    assert(lv_obj_get_child_count(screen)==6); /* rail, 2 captions, 3 indicators; no header */
+    assert(lv_obj_get_child_count(screen)==10); /* gallery + launcher-only status */
     assert(lv_obj_get_scroll_dir(rail)==LV_DIR_HOR);
     assert(lv_obj_get_scroll_snap_x(rail)==LV_SCROLL_SNAP_START);
     assert(lv_obj_get_child_count(rail)==9); /* 3 real apps, cloned for seamless wrap */
@@ -893,12 +934,11 @@ static void test_expression_visuals(const char *folder)
     meo_ui_navigate(MEO_HOME); advance(250);
     advance(2000);
     uint32_t hashes[MEO_EYE_COUNT];
-    static const char *names[] = {"17-calm", "18-happy", "19-curious", "20-sleepy",
-                                  "21-surprised", "22-wink", "23-sad"};
     for (int e = 0; e < MEO_EYE_COUNT; ++e) {
         meo_ui_set_expression((meo_expression_t)e, 0); advance(80);
         assert(meo_ui_model()->expression == (meo_expression_t)e);
-        assert_monochrome_home(true); snapshot(folder, names[e]);
+        char name[64];snprintf(name,sizeof(name),"face-%02d-%s",e,meo_expression_name((meo_expression_t)e));
+        assert_monochrome_home(true); snapshot(folder,name);
         hashes[e] = home_hash();
         for (int previous = 0; previous < e; ++previous) assert(hashes[previous] != hashes[e]);
         advance(1000); lv_refr_now(NULL); assert(home_hash() == hashes[e]);
@@ -1012,18 +1052,24 @@ static int real_main(int argc, char **argv)
     launcher_open(0,MEO_SETTINGS);
     snapshot(argv[1], "03-settings");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    swipe(230,400,230,160);assert(meo_ui_model()->page==MEO_SETTINGS);
+    snapshot(argv[1],"03a-settings-scrolled");
+    assert_settings_typography();
+    assert_icons(7); /* Includes the now-reachable speaker and microphone. */
+    swipe(230,180,230,420);assert(meo_ui_model()->page==MEO_SETTINGS);
+    assert_icons(7);
     meo_ui_navigate(MEO_DISPLAY);
     meo_ui_navigate(MEO_WIFI); assert(meo_ui_model()->page==MEO_DISPLAY); /* transition guard */
     advance(230); meo_ui_navigate(MEO_SETTINGS); advance(230);
-    tap(230,237); assert(meo_ui_model()->page==MEO_DISPLAY);
+    tap(230,248); assert(meo_ui_model()->page==MEO_DISPLAY);
     snapshot(argv[1],"15-display-brightness");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(375,235); assert(meo_ui_model()->settings.brightness==90);
     tap(375,235); assert(meo_ui_model()->settings.brightness==100);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     snapshot(argv[1],"26-display-brightness-100");
     unsigned boundary_saves=saves;
     tap(375,235); assert(saves==boundary_saves);
@@ -1034,10 +1080,10 @@ static int real_main(int argc, char **argv)
     /* Return from the display subpage through the large header hit area before
        opening the accessibility row. */
     tap(230,50); assert(meo_ui_model()->page==MEO_SETTINGS);
-    tap(230,280); assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
+    tap(230,348); assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
     snapshot(argv[1],"16-accessibility");
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(360,193); assert(meo_ui_model()->settings.reduced_motion); assert(saves > 0);
     advance(250); snapshot(argv[1],"30-accessibility-enabled");
     lv_obj_t *old_screen=lv_screen_active();
@@ -1045,10 +1091,10 @@ static int real_main(int argc, char **argv)
     meo_ui_navigate(MEO_ACCESSIBILITY); /* immediate next navigation remains usable */
     assert(meo_ui_model()->page==MEO_ACCESSIBILITY);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     tap(94,86); assert(meo_ui_model()->page==MEO_SETTINGS);
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
     snapshot(argv[1],"27-settings-reduced");
     tap(230,151); assert(meo_ui_model()->page == MEO_WIFI);
     snapshot(argv[1], "04-wifi-unavailable");
@@ -1060,11 +1106,12 @@ static int real_main(int argc, char **argv)
         meo_ui_set_scan_list((const char (*)[33])aps, rssi, 3);
         advance(50);
         snapshot(argv[1], "04a-wifi-scan-list");
+        assert_icons(4); /* back + three signal marks; scan is a text action */
         meo_ui_set_wifi(MEO_WIFI_CONNECTING, "MEOWPAS", 0);
         advance(900);                    /* past the notice pulse valley */
         snapshot(argv[1], "04i-wifi-connecting-state");
         color_check_disabled = true;
-        meo_ui_set_shutdown(5);
+        meo_ui_set_shutdown(3);
         advance(60);
         snapshot(argv[1], "04b0-shutdown-fade-in");   /* mid fade: proves the entry */
         advance(400);
@@ -1081,12 +1128,16 @@ static int real_main(int argc, char **argv)
     }
     {   /* Taps must dispatch: entering the page scans, the button scans again,
            and a row tap joins exactly the SSID that was rendered. */
+        meo_ui_set_wifi_scan(false,0,20,0); /* finish earlier simulated auto-scan */
         unsigned scans = wifi_scan_calls, joins = wifi_join_calls;
         meo_ui_navigate(MEO_HOME); advance(250);
         meo_ui_navigate(MEO_WIFI); advance(300);
         assert(meo_ui_model()->page == MEO_WIFI);
         assert(wifi_scan_calls == scans + 1);          /* auto-scan on entry */
-        tap(230, 258);
+        tap(380,44);
+        assert(wifi_scan_calls==scans+1); /* accepted scan latched before poll */
+        meo_ui_set_wifi_scan(false,0,21,0);
+        tap(380, 44);
         assert(wifi_scan_calls == scans + 2);          /* explicit scan button */
         advance(640);                                  /* pulse valley */
         snapshot(argv[1], "04h-notice-dim");
@@ -1094,13 +1145,18 @@ static int real_main(int argc, char **argv)
         const int one_rssi[3] = {-58, 0, 0};
         meo_ui_set_scan_list((const char (*)[33])one, one_rssi, 1);
         advance(60);
-        tap(230, 331);
+        meo_ui_set_wifi_scan(false,0,22,0);
+        tap(230, 164);
         assert(wifi_join_calls == joins + 1);
         assert(strcmp(wifi_join_ssid, "MEOWPAS") == 0);
         advance(60);
         snapshot(argv[1], "04d-wifi-tap-joined");
         wifi_join_result = false;                      /* no saved password path */
-        tap(230, 331);
+        tap(230, 164);
+        assert(wifi_join_calls == joins + 1);          /* busy is not 'no saved key' */
+        assert(meo_ui_model()->page == MEO_WIFI);
+        meo_ui_set_wifi(MEO_WIFI_ERROR, "MEOWPAS", 0); /* accepted join has failed */
+        tap(230, 164);
         assert(wifi_join_calls == joins + 2);
         advance(60);
         snapshot(argv[1], "04e-wifi-tap-no-password");
@@ -1111,31 +1167,31 @@ static int real_main(int argc, char **argv)
     {   /* On-screen password entry: a row tap with no saved key must open it,
            multi-tap must build "AB", 123 mode must append digits, and OK must
            hand the exact SSID and password to the adapter. */
-        /* keys: 99x64 at (24,240), 10 px gaps -> row y 272/348/424,
-           col x 73/182/291/400; OK is the last key at (400,424). */
+        /* Real pointer input on the 3-column 132x64 keypad: 1/2/3 on
+           the first row, mode at bottom left, connection at top right. */
         const char one[3][33] = {"MEOWPAS", "", ""};
         const int one_rssi[3] = {-58, 0, 0};
         meo_ui_set_scan_list((const char (*)[33])one, one_rssi, 1);
         advance(60);
         unsigned connects = wifi_connect_calls;
         wifi_join_result = false;
-        tap(230, 331);
+        tap(230, 164);
         assert(meo_ui_model()->page == MEO_PASSWORD);
         advance(200);
-        tap(380, 72);                      /* abc -> ABC */
-        tap(182, 272);                     /* 2 -> A */
+        tap(90,418);                       /* abc -> ABC */
+        tap(230,208);                     /* 2 -> A */
         advance(200);
         snapshot(argv[1], "04g-password-letters");
         advance(600);                      /* commit */
-        tap(182, 272);                     /* A again */
-        tap(182, 272);                     /* same key quickly -> B */
+        tap(230,208);                     /* A again */
+        tap(230,208);                     /* same key quickly -> B */
         advance(800);
-        tap(380, 72);                      /* ABC -> 123 */
-        tap(73, 272);                      /* 1 */
-        tap(182, 272);                     /* 2 */
+        tap(90,418);                       /* ABC -> 123 */
+        tap(90,208);                      /* 1 */
+        tap(230,208);                     /* 2 */
         advance(200);
         snapshot(argv[1], "04f-password-entry");
-        tap(400, 424);                     /* OK */
+        tap(380,44);                       /* connect */
         assert(wifi_connect_calls == connects + 1);
         assert(strcmp(wifi_connect_ssid, "MEOWPAS") == 0);
         assert(strcmp(wifi_connect_pass, "AB12") == 0);
@@ -1161,9 +1217,9 @@ static int real_main(int argc, char **argv)
         meo_ui_navigate(MEO_WIFI); advance(250);
     }
     assert_settings_typography();
-    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 10 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
-    tap(94, 86); assert(meo_ui_model()->page == MEO_SETTINGS);
-    tap(230,280); tap(360,193); assert(!meo_ui_model()->settings.reduced_motion);
+    assert_icons(meo_ui_model()->page==MEO_SETTINGS ? 7 : meo_ui_model()->page==MEO_DISPLAY ? 3 : meo_ui_model()->page==MEO_WIFI ? 2 : 1);
+    tap(160, 44); assert(meo_ui_model()->page == MEO_SETTINGS);
+    tap(230,348); tap(360,193); assert(!meo_ui_model()->settings.reduced_motion);
     tap(94,86); assert(meo_ui_model()->page==MEO_SETTINGS);
     swipe(24,230,38,230); assert(meo_ui_model()->page==MEO_SETTINGS); /* cancel */
     swipe(24,230,70,310); assert(meo_ui_model()->page==MEO_SETTINGS); /* vertical/diagonal */
@@ -1223,7 +1279,7 @@ static int real_main(int argc, char **argv)
     swipe(100,230,260,230); advance(2100); launcher_open(2,MEO_BREATHE);
     assert(!meo_ui_model()->rate_live && lv_obj_has_flag(breath_rate(),LV_OBJ_FLAG_HIDDEN));
     swipe(100,230,260,230); launcher_open(0,MEO_SETTINGS);
-    tap(230,280); tap(348,188); assert(meo_ui_model()->settings.reduced_motion);
+    tap(230,348); tap(348,188); assert(meo_ui_model()->settings.reduced_motion);
     tap(94,86); tap(94,86); launcher_open(2,MEO_BREATHE);
     meo_ui_feed_respiration((meo_resp_t){.waveform=-1,.rate_bpm=12,.at_ms=lv_tick_get(),.valid=true,.rate_valid=true});
     advance(200); snapshot(argv[1],"12-reduced-motion");

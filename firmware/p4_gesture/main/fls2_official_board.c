@@ -17,10 +17,14 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #ifdef CONFIG_APP_MEOAVE_UI
 #include "meoave_app.h"
+#include "meoave_ui.h"
+#include "esp_lvgl_port.h"
+#include "meoave_voice_link.h"
 #include "bsp_wifi_probe.h"
 #include "bsp_c5_diag.h"
 #ifdef CONFIG_APP_C5_SDIO_LOADER
@@ -188,14 +192,65 @@ static void on_command(const char *line, void *ctx)
         return;
     }
 #endif
+#ifdef CONFIG_APP_MEOAVE_UI
+    if (meo_voice_link_command(line)) return;
+#endif
     if (bsp_audio_command(line)) return;
     if (bsp_c5_diag_command(line)) return;
     if (bsp_wifi_probe_command(line)) return;
     if (strcmp(line, "UI") == 0) { meoave_app_request_status(); return; }
+    if (strcmp(line, "UI CUE") == 0) {
+        (void)bsp_usb_cdc_write(meoave_app_request_interaction_sound()
+            ? "MEO:CUE queued=1\n" : "MEO:CUE queued=0\n");
+        return;
+    }
+    if (strcmp(line, "UI PREVIEW") == 0) {
+        (void)bsp_usb_cdc_write(meoave_app_request_preview()
+            ? "MEO:PREVIEW queued=1\n" : "MEO:PREVIEW queued=0\n");
+        return;
+    }
+    if (strncmp(line, "UI VOLUME ", 10) == 0) {
+        int percent = -1;
+        char tail;
+        bool valid = sscanf(line + 10, "%d%c", &percent, &tail) == 1 &&
+                     percent >= 0 && percent <= 100;
+        if (valid) meoave_app_request_volume(percent);
+        (void)bsp_usb_cdc_write(valid
+            ? "MEO:UI_VOLUME queued=1\n" : "MEO:UI_VOLUME queued=0\n");
+        return;
+    }
     if (strncmp(line, "UI GO ", 6) == 0) { meoave_app_request_page(line + 6); return; }
     if (strncmp(line, "UI FPS", 6) == 0) { meoave_app_request_fps(atoi(line + 6)); return; }
     if (strncmp(line, "UI SHUTDOWN", 11) == 0) {
         meoave_app_request_shutdown(atoi(line + 11));
+        return;
+    }
+    if (strcmp(line, "AI VOICE DEMO") == 0) {
+        (void)bsp_usb_cdc_write(meoave_app_request_voice_demo()
+            ? "MEO:VOICE_DEMO queued=1 offline=1\n"
+            : "MEO:VOICE_DEMO queued=0 reason=BUSY_NOT_READY_OR_NO_FIXTURE\n");
+        return;
+    }
+    if (strcmp(line, "AI DEMO") == 0) {
+        (void)bsp_usb_cdc_write(meoave_app_request_ai_demo()
+            ? "MEO:AI_DEMO queued=1 offline=1\n"
+            : "MEO:AI_DEMO queued=0 reason=BUSY_OR_NOT_READY\n");
+        return;
+    }
+    if (strcmp(line, "AI CANCEL") == 0) {
+        (void)bsp_usb_cdc_write(meoave_app_request_ai_cancel()
+            ? "MEO:AI_CANCEL queued=1\n"
+            : "MEO:AI_CANCEL queued=0 reason=IDLE_OR_NOT_READY\n");
+        return;
+    }
+    if (strcmp(line, "AI STATUS") == 0) {
+        meoave_app_request_ai_status();
+        return;
+    }
+    if (strncmp(line, "AI WAKE ", 8) == 0) {
+        bool ok=meoave_app_request_wake_text(line+8);
+        (void)bsp_usb_cdc_write(ok ? "MEO:WAKE queued=1\n" :
+                                 "MEO:WAKE queued=0 reason=BUSY_NOT_READY\n");
         return;
     }
     if (strcmp(line, "LOOP ON") == 0 || strcmp(line, "DISPLAY BARS") == 0 ||
@@ -267,22 +322,29 @@ void app_main(void)
     fls2_test_loop_init(&s_test_loop, FLS2_AUTO_BOOT);
     ESP_ERROR_CHECK(bsp_usb_init());
     bsp_usb_set_line_callback(on_command, NULL);
+#ifdef CONFIG_APP_MEOAVE_UI
+    meo_voice_link_init();
+#endif
 #ifdef CONFIG_APP_MEOAVE_WIFI_HOSTED
 #ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
     bsp_c5_maintenance_init();
 #else
+#ifndef CONFIG_APP_MEOAVE_UI
     bsp_wifi_hosted_init();
+#endif
 #endif
 #endif
     fls2_touch_diag_init();
 
     /* Product audio: ES8389 power, register tables and the full-duplex I2S
        channel. Failure is not fatal - the mic app simply reports no device. */
-    /* Codec power (GPIO26 = AUDIO_PWR_EN) and register init only. Capture is
-       started by the settings switch, not at boot. */
+    /* Capture follows entry/exit of the microphone page, not boot. */
     if (bsp_audio_init() != ESP_OK) {
         ESP_LOGW("FLS2", "audio codec not available");
     }
+    ESP_LOGI("FLS2", "pre-display internal_free=%lu largest=%lu",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     /* VCI_EN has a pull-up, as on the official adapter. Do not power-cycle it.
        Display startup holds GPIO12 low while normalizing DSI, then the
@@ -303,6 +365,9 @@ void app_main(void)
     /* No LVGL locks here: USB/heartbeat must not block on a stalled GUI task. */
     int64_t next_report_us = 0;
     int64_t next_touch_live_us = 0;
+#if defined(CONFIG_APP_MEOAVE_UI) && defined(CONFIG_APP_MEOAVE_WIFI_HOSTED) && !defined(CONFIG_APP_C5_NATIVE_MAINTENANCE)
+    bool wifi_started = false;
+#endif
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(20));
         fls2_touch_diag_service();
@@ -321,6 +386,24 @@ void app_main(void)
 #endif
         if (s_demo_ready) meoave_app_service();
         if (s_demo_ready) meoave_app_key_tick();   /* 20 ms power-key sampling */
+#if defined(CONFIG_APP_MEOAVE_WIFI_HOSTED) && !defined(CONFIG_APP_C5_NATIVE_MAINTENANCE)
+        /* PPA/DMA has hard internal-memory requirements. Do not race its
+           creation with 18 KiB of Wi-Fi worker stacks and Hosted allocation.
+           The temporary 16 KiB display-builder task is gone by this point.
+           Keep all proven display/pin/rotation and codec settings unchanged. */
+        bool warmed = false;
+        if (s_demo_ready && !wifi_started && lvgl_port_lock(5)) {
+            warmed = !meo_ui_warmup_active();
+            lvgl_port_unlock();
+        }
+        if (warmed) {
+            wifi_started = true;
+            ESP_LOGI("FLS2", "UI ready; starting Wi-Fi internal_free=%lu largest=%lu",
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            bsp_wifi_hosted_init();
+        }
+#endif
 #endif
         if (s_display_report_requested) {
             s_display_report_requested = false;

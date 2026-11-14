@@ -14,7 +14,7 @@ meo_page_t meo_page_parent(meo_page_t page)
     case MEO_HOME: case MEO_APPS: case MEO_SETTINGS: case MEO_BREATHE: return MEO_APPS;
     case MEO_WIFI: case MEO_DISPLAY: case MEO_ACCESSIBILITY: return MEO_SETTINGS;
     case MEO_PASSWORD: return MEO_WIFI;
-    case MEO_MIC: case MEO_SPEAKER: return MEO_SETTINGS;
+    case MEO_MIC: case MEO_SPEAKER: case MEO_EXPRESSIONS: return MEO_SETTINGS;
     default: return MEO_HOME;
     }
 }
@@ -29,7 +29,79 @@ static const meo_eye_shape_t expressions[MEO_EYE_COUNT][2] = {
     [MEO_EYE_SURPRISED] = {{0,8,0,90,-4}, {0,8,0,90,-4}},
     [MEO_EYE_WINK]      = {{31,0,6,12,2}, {0,1,0,76,0}},
     [MEO_EYE_SAD]       = {{30,0,-24,16,3}, {30,0,-24,16,3}},
+    [MEO_EYE_EXCITED]   = {{30,-5,37,18,-9}, {30,5,37,18,-9}},
+    [MEO_EYE_SHY]       = {{24,9,19,13,9}, {24,-9,19,13,9}},
+    [MEO_EYE_LOVE]      = {{29,-3,32,22,2}, {29,3,32,22,2}},
+    [MEO_EYE_PROUD]     = {{27,-11,12,19,-6}, {27,11,12,19,-6}},
+    [MEO_EYE_CONFUSED]  = {{22,-16,-12,20,-10}, {0,5,0,66,9}},
+    [MEO_EYE_WORRIED]   = {{26,14,-17,19,4}, {26,-14,-17,19,4}},
+    [MEO_EYE_ANGRY]     = {{29,17,2,18,0}, {29,-17,2,18,0}},
+    [MEO_EYE_FOCUSED]   = {{25,3,0,11,-1}, {25,-3,0,11,-1}},
+    [MEO_EYE_RELIEVED]  = {{31,0,13,10,8}, {31,0,13,10,8}},
 };
+
+static const meo_mouth_shape_t mouths[MEO_EYE_COUNT] = {
+    {17,5,0,0}, {22,11,0,0}, {14,3,0,3}, {10,0,0,0},
+    {9,0,11,0}, {20,8,0,-2}, {18,-7,0,0},
+    {22,9,9,0}, {12,5,0,2}, {21,12,2,0}, {20,5,0,-5},
+    {14,-1,0,5}, {13,-5,1,0}, {17,-4,0,0}, {12,0,0,0}, {20,7,1,0},
+};
+
+const char *meo_expression_name(meo_expression_t e)
+{
+    static const char *const names[MEO_EYE_COUNT] = {
+        "CALM", "HAPPY", "CURIOUS", "SLEEPY", "SURPRISED", "WINK", "SAD",
+        "EXCITED", "SHY", "LOVE", "PROUD", "CONFUSED", "WORRIED", "ANGRY",
+        "FOCUSED", "RELIEVED",
+    };
+    return e >= 0 && e < MEO_EYE_COUNT ? names[e] : "INVALID";
+}
+
+void meo_face_blend(const meo_face_pose_t *a, const meo_face_pose_t *b,
+                    float mix, meo_face_pose_t *out)
+{
+    for (int i=0; i<2; ++i) {
+#define BLEND_EYE(f) out->eye[i].f=a->eye[i].f+(b->eye[i].f-a->eye[i].f)*mix
+        BLEND_EYE(half_x); BLEND_EYE(half_y); BLEND_EYE(arch); BLEND_EYE(width); BLEND_EYE(y);
+#undef BLEND_EYE
+    }
+#define BLEND_MOUTH(f) out->mouth.f=a->mouth.f+(b->mouth.f-a->mouth.f)*mix
+    BLEND_MOUTH(half_x); BLEND_MOUTH(curve); BLEND_MOUTH(aperture); BLEND_MOUTH(tilt);
+#undef BLEND_MOUTH
+}
+
+bool meo_expression_pose(meo_expression_t e, float intensity, uint32_t phase_ms,
+                         bool animate, meo_face_pose_t *out)
+{
+    if (!out || e < 0 || e >= MEO_EYE_COUNT || !isfinite(intensity) ||
+        intensity < 0 || intensity > 1) return false;
+    meo_face_pose_t neutral={.eye={expressions[0][0],expressions[0][1]},.mouth=mouths[0]};
+    meo_face_pose_t target={.eye={expressions[e][0],expressions[e][1]},.mouth=mouths[e]};
+    if (animate && e != MEO_EYE_CALM) {
+        float t=(float)(phase_ms%12000)/1000.f, a=sinf(t*3.14159265f);
+        /* Distinct, restrained micro-actions. Gaze and blinks remain separate. */
+        switch (e) {
+        case MEO_EYE_HAPPY: target.eye[0].arch+=a*3; target.eye[1].arch+=a*3; break;
+        case MEO_EYE_CURIOUS: target.eye[0].y-=a*4; target.eye[1].half_y+=a*2; break;
+        case MEO_EYE_SLEEPY: target.eye[0].y+=a*2; target.eye[1].y+=a*2; break;
+        case MEO_EYE_SURPRISED: target.eye[0].width+=a*3; target.eye[1].width+=a*3; break;
+        case MEO_EYE_WINK: target.eye[0].arch+=a*4; target.mouth.tilt+=a*2; break;
+        case MEO_EYE_SAD: target.eye[0].arch-=a*3; target.eye[1].arch-=a*3; break;
+        case MEO_EYE_EXCITED: target.eye[0].y-=fabsf(sinf(t*7))*7; target.eye[1].y=target.eye[0].y; break;
+        case MEO_EYE_SHY: target.eye[0].half_y+=a*3; target.eye[1].half_y-=a*3; break;
+        case MEO_EYE_LOVE: target.eye[0].arch+=a*5; target.eye[1].arch+=a*5; break;
+        case MEO_EYE_PROUD: target.eye[0].y-=a*2; target.mouth.tilt-=a*2; break;
+        case MEO_EYE_CONFUSED: target.eye[0].y-=a*5; target.eye[1].y+=a*3; break;
+        case MEO_EYE_WORRIED: target.eye[0].half_y+=a*3; target.eye[1].half_y-=a*3; break;
+        case MEO_EYE_ANGRY: target.eye[0].half_y+=a*2; target.eye[1].half_y-=a*2; break;
+        case MEO_EYE_FOCUSED: target.eye[0].width+=a*1.5f; target.eye[1].width+=a*1.5f; break;
+        case MEO_EYE_RELIEVED: target.eye[0].y+=a*3; target.eye[1].y+=a*3; break;
+        default: break;
+        }
+    }
+    meo_face_blend(&neutral,&target,intensity,out);
+    return true;
+}
 
 /* Long neutral rests; brief accents, not a flashing expression slideshow.
  * Sadness is available to AI but is not invented as an idle mood. */
@@ -43,22 +115,44 @@ static const struct { meo_expression_t expression; uint32_t duration; } idle[] =
 
 void meo_model_set_expression(meo_model_t *m, meo_expression_t expression, uint32_t hold_ms)
 {
-    if (expression < MEO_EYE_CALM || expression >= MEO_EYE_COUNT) return;
+    (void)meo_model_set_expression_level(m, expression, 1, hold_ms);
+}
+
+bool meo_model_set_expression_level(meo_model_t *m, meo_expression_t expression,
+                                    float intensity, uint32_t hold_ms)
+{
+    if (expression < MEO_EYE_CALM || expression >= MEO_EYE_COUNT ||
+        !isfinite(intensity) || intensity < 0 || intensity > 1) return false;
+    m->expression_media = false;
+    m->expression_intensity = intensity;
     m->expression = expression;
     m->expression_override = true;
     m->expression_at_ms = m->now_ms;
     m->expression_hold_ms = hold_ms;
+    return true;
+}
+
+void meo_model_set_media_pose(meo_model_t *m, meo_expression_t e,
+                             float intensity, const meo_face_pose_t *pose)
+{
+    if (!pose || !meo_model_set_expression_level(m,e,intensity,0)) return;
+    memcpy(m->eye_shape,pose->eye,sizeof(m->eye_shape));
+    m->mouth_shape=pose->mouth;
+    m->expression_media=true;
 }
 
 void meo_model_auto_expression(meo_model_t *m)
 {
     m->expression_override = false;
+    m->expression_media = false;
+    m->expression_intensity = 1;
     m->expression_clock_ms = 0;
     m->expression = MEO_EYE_CALM;
 }
 
 static void update_expression(meo_model_t *m, uint64_t elapsed, float mix)
 {
+    if (m->expression_media) return;
     if (m->expression_override && m->expression_hold_ms &&
         m->now_ms - m->expression_at_ms >= m->expression_hold_ms) {
         uint64_t after_expiry = m->now_ms - m->expression_at_ms - m->expression_hold_ms;
@@ -79,13 +173,12 @@ static void update_expression(meo_model_t *m, uint64_t elapsed, float mix)
     }
     /* Reduce Motion still accepts explicit AI expressions, without tweening. */
     if (m->settings.reduced_motion) mix = 1;
-    for (int i = 0; i < 2; ++i) {
-        meo_eye_shape_t *s = &m->eye_shape[i];
-        const meo_eye_shape_t *target = &expressions[m->expression][i];
-#define MORPH(field) s->field += (target->field - s->field) * mix
-        MORPH(half_x); MORPH(half_y); MORPH(arch); MORPH(width); MORPH(y);
-#undef MORPH
-    }
+    meo_face_pose_t target, current={.eye={m->eye_shape[0],m->eye_shape[1]},.mouth=m->mouth_shape};
+    uint32_t phase=(uint32_t)(m->now_ms-m->expression_at_ms);
+    meo_expression_pose(m->expression,m->expression_intensity,phase,!m->settings.reduced_motion,&target);
+    meo_face_blend(&current,&target,mix,&current);
+    memcpy(m->eye_shape,current.eye,sizeof(m->eye_shape));
+    m->mouth_shape=current.mouth;
 }
 static void reset_session(meo_model_t *m)
 {
@@ -97,13 +190,15 @@ static void reset_session(meo_model_t *m)
 }
 
 meo_settings_t meo_default_settings(void)
-{ return (meo_settings_t){.brightness=80, .guide_bpm=6, .volume=50, .reduced_motion=false}; }
+{ return (meo_settings_t){.brightness=80, .guide_bpm=6, .volume=50, .mic_gain=4,
+                          .reduced_motion=false, .interaction_sound=true}; }
 
 void meo_validate_settings(meo_settings_t *s)
 {
     if (s->brightness < 15 || s->brightness > 100) s->brightness = 80;
     if (s->guide_bpm < 4 || s->guide_bpm > 12) s->guide_bpm = 6;
     if (s->volume > 100) s->volume = 50;
+    if (s->mic_gain > 14) s->mic_gain = 4;
 }
 
 void meo_model_init(meo_model_t *m, uint64_t now, const meo_settings_t *settings)
@@ -117,6 +212,8 @@ void meo_model_init(meo_model_t *m, uint64_t now, const meo_settings_t *settings
     m->now_ms = m->last_ms = now;
     m->next_blink_ms = now + 3200;
     m->openness = 1;
+    m->expression_intensity = 1;
+    m->mouth_shape = mouths[0];
     m->rng = 0x6d656f31;
     memcpy(m->eye_shape, expressions[MEO_EYE_CALM], sizeof(m->eye_shape));
 }
