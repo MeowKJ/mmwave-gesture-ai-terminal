@@ -5,5 +5,3 @@ CONFIG_APP_MEOAVE_ESPSR=y
 # tools/meoave.py composes this with sdkconfig.hosted.defaults.
 # The product's network UI must not be linked to disabled callbacks.
 CONFIG_APP_MEOAVE_WIFI_HOSTED=y
-CONFIG_APP_SELFTEST_COLORS=n
-CONFIG_APP_AUDIO_BEEP=n

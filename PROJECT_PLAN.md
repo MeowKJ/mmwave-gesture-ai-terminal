@@ -2,7 +2,25 @@
 
 更新时间：2026-11-15
 
-## 当前：免人工声学唤醒验收（2026-11-15）
+## 当前：电脑本地 Go 服务部署（2026-11-15）
+
+- [x] 本机后台服务、一键 Start/Status/Test/Stop 和 Git 忽略的私有配置；仅监听回环地址，原生 USB 自动识别。
+- [x] 生产 `/v1/chat` 接通模型、每句表情链、Go TTS 和可选设备播放；新增离线回归与取消生命周期修订。
+- [x] 实际 HTTP Edge-TTS 合成与 PCM 帧数／SHA 校验通过；详细耗时和证据见 `docs/LOCAL_SERVER_20261115.md`。
+- [x] 用户提供有效官方 API Key 后，DeepSeek `/models` 鉴权200；真实 `deepseek-flash` 两句回复、逐句表情链和 Go TTS／PCM 校验通过，整轮不播音合成约5.3秒。凭据只留本机，不进Git；保留旧403/401失败证据。
+- [ ] 完整一轮设备实测未通过：Go 服务下发等待 `VOICE_OPEN` 回执超时；释放串口后的短命令 CDC 隔离检查成功，但不代表实际播音成功。早期META_REJECTED也仍需定位；不以排队成功或合成成功替代实际播音。
+- [ ] 麦克风上传／ASR和真实语音交互仍未接通；本轮不改固件、不刷C5、不操作下载引脚。
+
+## 当前：移除产品 Demo，保留真实链路（2026-11-15）
+
+- [x] 移除固定对话状态机、内置双句语音及其生成/验收工具；桌面命令目录不再提供演示指令。
+- [x] 移除旧 Demo #1 入口与其独占的重复显示/触摸/雷达实现；未选择已审计管线时明确拒绝构建，不偷偷回退旧程序。
+- [x] 保留 `AI STATUS`、`AI CANCEL`、`VOICE OPEN`、句子表情链、真实 PCM/DMA 播放及唯一 Go 服务端。
+- [x] 保留生产回归、硬件维护和第三方来源证据；不因名称带 test/example 就删除仍在使用的依赖。
+- [x] 清理后 278 项项目测试、7 项 HID 协议测试、13 项桌面 CTest、Go 单测/vet 及产品构建通过。
+- [x] 最终镜像已通过原生 USB 烧录并核验：P4 ELF SHA `f35746ed…`; HID safe 16/16、full 26/26；结束恢复眼睛主页和麦克风监听。详见 `docs/PRODUCTION_CLEANUP_20261115.md`。
+
+## 历史：免人工声学唤醒验收（2026-11-15）
 
 - [x] 一键入口 `tools/meoave.py wake-acoustic`：电脑离线中文声源→真实麦克风→ESP-SR→眼睛/琥珀监听提示；不注入文本，不要求用户发声/按键/切引脚。
 - [x] 异步播放并同步采样；独立正例、静默/非关键词负例、冷却、最终身份/boot/fault检查；报告失败也保留局部证据，不盲目复位重刷。
@@ -42,10 +60,11 @@
 - [x] 每句必须携带非空时间线；设备有界 JSON 解析、强度／时间校验、generation／sentence_id 隔离。
 - [x] 实际 DMA 完成帧推进表情，欠载／暂停不空跑；真实 PCM 包络口型、取消关 PA 并清理 DMA。
 - [x] 本地 IndexTTS2 适配器与句子编译工具；部署目录／权重／音色在本机 TOML，不进 Git。
-- [x] 本轮产品烧写、两句实音频／六个 cue 板上验证；用户在 50% 对比测试中确认能听到语音、表情和嘴巴联动正常。结束恢复自动眼睛与原音量，同一 boot、零欠载。
+- [x] 生产语音流协议、DMA 播放与句子表情链已落地；设备不再内置固定语音或状态 demo。
+- [x] AI 首页监听提示改为“有效说话输入才显示”的右下角 32px 小麦克风；胶囊内部随输入 RMS 填充，静音隐藏，不遮挡眼睛／嘴巴。局部音频活动门限不冒充语音分类；自身播音及 300ms 尾窗抑制提示。验收见 `docs/LISTENING_INDICATOR_20261115.md`。
 - [ ] 16 种预览及 30/60/100% 强度的逐项实屏验收；两句语音样例通过不等于全部视觉细节通过。
 - [ ] 独立音频未决项：2026-11-14 试听素材峰值由 7000 规范到 22000，离线、增量构建、烧录及 60%／静音／100% 板上软件验收通过；用户确认显示无花屏、音乐变大但仍偏小。按用户「就这样吧，别改了」停止继续调整，保留增强版及原 100% 音量；不将响度标记通过。首轮 30% 无语音根因仍未确定。见 `docs/AUDIO_LOUDNESS_20261114.md`。
-- [ ] GPU 权重部署与同机 TTS 延迟／显存实测（用户选择先完成设备端，当前暂缓，不下载模型；不将 Windows SAPI fixture 当 IndexTTS2）。
+- [ ] GPU 权重部署与同机 TTS 延迟／显存实测（用户选择先完成设备端，当前暂缓，不下载模型）。
 - [ ] P4 真实录音→ASR／LLM→TTS→WSS 一轮对话。当前仅有本地音频同步切片，未完成联网 AI。
 
 待机仍只有黑白眼睛；说话小嘴巴与音频同步，不在 AI 页显示电量／Wi-Fi。
@@ -122,11 +141,11 @@ python tools/meoave.py wifi
 python tools/meoave.py c5
 ```
 
-AI 离线垂直切片的桌面回归：
+生产语音链路的桌面回归：
 
 ```powershell
-cmake --build firmware/p4_gesture/tests/desktop/build --target meoave_conversation_test
-ctest --test-dir firmware/p4_gesture/tests/desktop/build -R conversation.state --output-on-failure
+ctest --test-dir firmware/p4_gesture/tests/desktop/build -R 'conversation\.sentence|conversation\.voice_worker|audio\.adapter' --output-on-failure
+& $go -C server test ./...
 ```
 
 C5 从机固件是独立工程 `firmware/c5_hosted`（esp-hosted-mcu v2.12.13，与 P4 侧 host 版本一致），

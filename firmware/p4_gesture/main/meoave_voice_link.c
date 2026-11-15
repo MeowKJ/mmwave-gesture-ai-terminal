@@ -174,10 +174,18 @@ static void handle_frame(void)
         if (flags & VOICE_FLAG_LAST) {
             meo_sentence_t sentence;
             s_meta[s_meta_len] = '\0';
-            ok = meo_sentence_parse(s_meta, s_meta_len, &sentence) &&
-                 sentence.generation == s_generation && sentence.sentence_id == s_sentence_id &&
-                 meo_voice_stream_begin_sentence(&sentence);
-            if (!ok) { reject("META_REJECTED"); return; }
+            bool parsed = meo_sentence_parse(s_meta, s_meta_len, &sentence);
+            if (!parsed) { reject("META_PARSE"); return; }
+            if (sentence.generation != s_generation || sentence.sentence_id != s_sentence_id) {
+                reject("META_ID"); return;
+            }
+            ok = meo_voice_stream_begin_sentence(&sentence);
+            if (!ok) {
+                char reason[64];
+                snprintf(reason, sizeof(reason), "META_%s", meo_voice_stream_start_error());
+                reject(reason);
+                return;
+            }
             s_sentence_ready = true;
         } else {
             ok = true;
@@ -275,7 +283,7 @@ void meo_voice_link_init(void)
     meo_voice_stream_init();
     if (!s_rx_stream) s_rx_stream = xStreamBufferCreate(4096, 1);
     if (s_rx_stream && !s_rx_task)
-        (void)xTaskCreate(voice_link_task, "voice_link", 8192, NULL, 5, &s_rx_task);
+        (void)xTaskCreate(voice_link_task, "voice_link", 4096, NULL, 5, &s_rx_task);
     bsp_usb_set_binary_rx_callback(on_bytes, NULL);
 }
 

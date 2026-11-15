@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,7 +44,14 @@ type Device struct {
 	portName string
 	baud     int
 	mu       sync.Mutex
-	serial   *serialPort
+	serial   transport
+	reader   *replyReader
+}
+
+type transport interface {
+	ReadContext(context.Context, []byte) (int, error)
+	WriteContext(context.Context, []byte) error
+	Close() error
 }
 
 func Open(port string, baud int) (*Device, error) {
@@ -54,7 +62,11 @@ func Open(port string, baud int) (*Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Device{portName: port, baud: baud, serial: serial}, nil
+	return newDevice(port, baud, serial), nil
+}
+
+func newDevice(port string, baud int, serial transport) *Device {
+	return &Device{portName: port, baud: baud, serial: serial, reader: newReplyReader(serial)}
 }
 
 func (d *Device) Close() error {
@@ -66,13 +78,16 @@ func (d *Device) Close() error {
 	if d.serial == nil {
 		return nil
 	}
+	// ReadContext has a bounded OS timeout. Stop its sole reader before closing
+	// the handle so Close cannot race another thread's ReadFile.
+	d.reader.close()
 	err := d.serial.Close()
 	d.serial = nil
 	return err
 }
 
 func (d *Device) Play(ctx context.Context, response protocol.SentenceResponse) (Receipt, error) {
-	if d == nil || d.serial == nil {
+	if d == nil {
 		return Receipt{}, fmt.Errorf("device transport is not configured")
 	}
 	pcm, err := base64.StdEncoding.DecodeString(response.AudioBase64)
@@ -97,10 +112,17 @@ func (d *Device) Play(ctx context.Context, response protocol.SentenceResponse) (
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	// The firmware stores the token in a 16-byte buffer including the NUL.
-	// Keep the complete token at <=15 printable bytes so replies can be matched
-	// exactly instead of silently matching a truncated firmware token.
-	token := fmt.Sprintf("m%014x", uint64(time.Now().UnixNano())&0x0fffffffffffffff)
+	if d.serial == nil {
+		return Receipt{}, errors.New("device transport is closed")
+	}
+	// Subscribe before writing: replies may arrive in the same USB read as
+	// logs. The background reader must keep draining CDC even during cloud TTS.
+	if err := d.reader.begin(); err != nil {
+		return Receipt{}, err
+	}
+	defer d.reader.end()
+	// Reserve a byte below the firmware's 16-character token limit.
+	token := fmt.Sprintf("m%014x", uint64(time.Now().UnixNano())&0x00ffffffffffffff)
 	if err := d.writeLine(ctx, fmt.Sprintf("VOICE OPEN %s\n", token)); err != nil {
 		return Receipt{}, fmt.Errorf("send VOICE OPEN: %w", err)
 	}
@@ -221,38 +243,7 @@ func (d *Device) writeLine(ctx context.Context, line string) error {
 }
 
 func (d *Device) waitLineText(ctx context.Context, predicate func(string) bool) (string, error) {
-	var line []byte
-	buf := make([]byte, 256)
-	for {
-		n, err := d.serial.ReadContext(ctx, buf)
-		if err != nil {
-			return "", err
-		}
-		if n == 0 {
-			continue
-		}
-		line = append(line, buf[:n]...)
-		for {
-			idx := -1
-			for i, b := range line {
-				if b == '\n' {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
-				if len(line) > 4096 {
-					return "", fmt.Errorf("device line exceeds 4096 bytes")
-				}
-				break
-			}
-			text := strings.TrimSpace(string(line[:idx]))
-			line = line[idx+1:]
-			if predicate(text) {
-				return text, nil
-			}
-		}
-	}
+	return d.reader.wait(ctx, predicate)
 }
 
 func lineUint(line, key string) (uint64, bool) {

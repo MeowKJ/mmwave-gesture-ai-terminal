@@ -7,13 +7,14 @@
  * 队列、限流与统计。这样同一份实现可以搬到别的板子上，也可以用单元测试
  * 直接驱动。
  *
- * 报告格式（HID Report ID 3，共 64 字节）
+ * 报告格式（HID Report ID 4，共 63 字节；加 1 字节 Report ID 后恰好
+ * 落在 USB HID 64 字节端点包内）
  *
  *   byte 0        类型      'R' 命令回复 / 'L' 日志 / 'E' 事件 / 'C' 命令
  *   byte 1        msg_id    每条消息自增，主机据此发现丢消息
  *   byte 2        frag_idx  从 0 开始
  *   byte 3        frag_total
- *   byte 4..63    载荷      最多 60 字节，不要求 NUL 结尾
+ *   byte 4..62    载荷      最多 59 字节，不要求 NUL 结尾
  *
  * 为什么带 msg_id 而不是当成纯字节流：HID 中断端点只有很浅的缓冲，
  * 主机来不及取时 tud_hid_report() 会失败，消息只能丢弃。有了 msg_id 和
@@ -32,14 +33,15 @@
 extern "C" {
 #endif
 
-#define MEO_LINK_REPORT_ID    3
-#define MEO_LINK_REPORT_SIZE  64
+#define MEO_LINK_REPORT_ID    4
+#define MEO_LINK_REPORT_SIZE  63
 #define MEO_LINK_HEADER_SIZE  4
-#define MEO_LINK_PAYLOAD_SIZE (MEO_LINK_REPORT_SIZE - MEO_LINK_HEADER_SIZE)  /* 60 */
+#define MEO_LINK_PAYLOAD_SIZE (MEO_LINK_REPORT_SIZE - MEO_LINK_HEADER_SIZE)  /* 59 */
 
 /* 单条消息上限。WIFI_SCAN 的整行结果在十几个 AP 时会超过 400 字节，
  * 512 留出的余量刚好覆盖它而不会让发送队列占太多内部 RAM。 */
 #define MEO_LINK_MESSAGE_MAX  512
+#define MEO_LINK_MAX_FRAGMENTS ((MEO_LINK_MESSAGE_MAX + MEO_LINK_PAYLOAD_SIZE - 1) / MEO_LINK_PAYLOAD_SIZE)
 
 typedef enum {
     MEO_LINK_KIND_REPLY = 'R',   /* 命令回复，对应 CDC 上同一行文本 */
@@ -51,7 +53,7 @@ typedef enum {
 typedef struct {
     /* 设备已配置且端点可写。返回 false 时库会短暂等待而不是丢消息。 */
     bool (*ready)(void);
-    /* 发送一个完整的 64 字节报告（不含 Report ID，由 USB 栈补）。 */
+    /* 发送一个完整的 63 字节报告（不含 Report ID，由 USB 栈补）。 */
     bool (*send)(const uint8_t *report, size_t len);
 } meo_link_transport_t;
 

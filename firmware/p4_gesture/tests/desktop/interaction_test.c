@@ -624,28 +624,66 @@ int main(int argc,char **argv)
     assert(saves>0);
     puts("PASS: microphone capture scoped to page including swipe-back; real gain slider and +/- bounds; independent stereo meters");
 
-    /* The AI dial also owns the live microphone indicator.  Its face update
-       must not starve the independent waveform/VU tick. */
-    navigate(MEO_HOME); meo_ui_set_mic((float[2]){0.02f,0.02f}, true);
-    advance_ms(120);
-    int quiet_height = ui.home_wave_height[3];
-    meo_ui_set_mic((float[2]){0.95f,0.75f}, true);
-    advance_ms(120);
-    assert(ui.home_capture_active && !lv_obj_has_flag(ui.home_capture_ring, LV_OBJ_FLAG_HIDDEN));
-    assert(ui.home_wave_height[3] > quiet_height);
+    /* Exercise the actual 10Hz input boundary, not an always-on fake wave. */
+    navigate(MEO_HOME);meo_ui_set_wake_state(false);meo_ui_set_capture_blocked(false);
+    const bool reduced=ui.model.settings.reduced_motion;
+    ui.model.settings.reduced_motion=true;
+    for (int i=0;i<4;++i) {meo_ui_set_mic((float[2]){.02f,.09f},true);advance_ms(100);}
     meo_ui_capture_view_t capture;
-    meo_ui_capture_view(&capture);
-    assert(capture.visible && !capture.ack && capture.wave_seq>0);
-    uint32_t old_wave_seq=capture.wave_seq;
-    snapshot("wake-listening");
-    meo_ui_set_wake_state(true);advance_ms(120);meo_ui_capture_view(&capture);
-    assert(capture.visible && capture.ack && capture.ink==ACCENT_AMBER);
-    assert(capture.wave_seq>old_wave_seq);
-    snapshot("wake-ack");
+    meo_ui_capture_view(&capture);assert(!capture.visible && capture.fill_height==0);
+    snapshot("listening-quiet");
+    meo_ui_set_wake_state(true);advance_ms(40);
+    meo_ui_capture_view(&capture);assert(!capture.visible && !capture.ack);
     meo_ui_set_wake_state(false);
-    meo_ui_set_mic((float[2]){0.0f,0.0f}, false); advance_ms(120);
-    assert(lv_obj_has_flag(ui.home_capture_ring, LV_OBJ_FLAG_HIDDEN));
-    puts("PASS: AI home microphone indicator remains visible and waveform animates independently of eyes");
+    /* A single click must not turn into listening. */
+    meo_ui_set_mic((float[2]){.9f,.8f},true);advance_ms(50);
+    meo_ui_set_mic((float[2]){0,0},true);advance_ms(100);
+    meo_ui_capture_view(&capture);assert(!capture.visible);
+    /* One live microphone is sufficient; the other need not carry speech. */
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.38f,.02f},true);advance_ms(100);}
+    meo_ui_capture_view(&capture);
+    assert(capture.visible && !capture.ack && capture.fill_height>0 && capture.level<45);
+    unsigned quiet_fill=capture.fill_height;uint32_t quiet_seq=capture.seq;
+    assert(!lv_obj_has_flag(ui.home_capture_mic,LV_OBJ_FLAG_CLICKABLE));
+    lv_area_t badge;lv_obj_get_coords(ui.home_capture_mic,&badge);
+    assert(badge.x1==400 && badge.y1==396 && badge.x2<460 && badge.y2<460);
+    assert(lv_obj_get_width(ui.home_capture_mic)==32 && lv_obj_get_height(ui.home_capture_mic)==32);
+    /* Identical expression rendering outside the 32px indicator footprint. */
+    lv_refr_now(NULL);uint8_t face_pixels[sizeof(framebuffer)];memcpy(face_pixels,framebuffer,sizeof(framebuffer));
+    snapshot("listening-soft");
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.95f,.75f},true);advance_ms(100);}
+    meo_ui_capture_view(&capture);
+    assert(capture.visible && capture.fill_height>quiet_fill && capture.seq>quiet_seq);
+    lv_refr_now(NULL);
+    for (int y=0;y<460;++y) for (int x=0;x<460;++x)
+        if (x<badge.x1 || x>badge.x2 || y<badge.y1 || y>badge.y2)
+            assert(!memcmp(face_pixels+(y*460+x)*3,framebuffer+(y*460+x)*3,3));
+    snapshot("wake-listening");
+    meo_ui_set_wake_state(true);advance_ms(20);meo_ui_capture_view(&capture);
+    assert(capture.visible && capture.ack && capture.ink==ACCENT_AMBER);
+    snapshot("wake-ack");
+    meo_ui_set_mic((float[2]){0,0},true);advance_ms(260);
+    meo_ui_capture_view(&capture);assert(!capture.visible && capture.level==0);
+    snapshot("listening-silent-ack");
+    meo_ui_set_wake_state(false);
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.8f,.7f},true);advance_ms(100);}
+    assert(ui.home_voice_active);
+    meo_ui_set_capture_blocked(true);meo_ui_capture_view(&capture);assert(!capture.visible);
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){1,1},true);advance_ms(100);}
+    meo_ui_capture_view(&capture);assert(!capture.visible);
+    meo_ui_set_capture_blocked(false);advance_ms(80);
+    meo_ui_capture_view(&capture);assert(!capture.visible); /* old output cannot resurface */
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.8f,.7f},true);advance_ms(100);}
+    advance_ms(400);meo_ui_capture_view(&capture);assert(!capture.visible); /* stale input */
+    meo_ui_set_mic((float[2]){NAN,INFINITY},true);advance_ms(100);
+    meo_ui_capture_view(&capture);assert(!capture.visible);
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.8f,.7f},true);advance_ms(100);}
+    navigate(MEO_APPS);meo_ui_capture_view(&capture);assert(!capture.visible);
+    navigate(MEO_HOME);meo_ui_capture_view(&capture);assert(!capture.visible);
+    for (int i=0;i<3;++i) {meo_ui_set_mic((float[2]){.8f,.7f},true);advance_ms(100);}
+    meo_ui_set_mic((float[2]){.8f,.7f},false);meo_ui_capture_view(&capture);assert(!capture.visible);
+    ui.model.settings.reduced_motion=reduced;
+    puts("PASS: input-only compact capsule fill; silence/wake-only/click/output/stale/invalid/page-exit hide; expression pixels unchanged");
 
     navigate(MEO_SPEAKER);
     tap_at(386,244);assert(ui.model.settings.volume==60);

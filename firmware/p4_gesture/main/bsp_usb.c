@@ -65,7 +65,7 @@
 static const char *TAG = "BSP_USB";
 
 /* 主机侧 flash_usb.py 发送的下载请求；可打印、不容易被普通日志误触发。
-   CDC 按行解析，DL_CMD 之外的行交给应用回调（demo 测试指令）。 */
+   CDC 按行解析，DL_CMD 之外的行交给产品命令回调。 */
 #define DL_CMD              "MEOAVE-DOWNLOAD"
 #ifdef CONFIG_APP_C5_NATIVE_MAINTENANCE
 #define CDC_LINE_MAX        1400
@@ -77,10 +77,10 @@ static bool s_line_overflow;
 #define REPORT_ID_MOUSE     HID_ITF_PROTOCOL_MOUSE
 #define REPORT_ID_KEYBOARD  HID_ITF_PROTOCOL_KEYBOARD
 #define REPORT_ID_GESTURE   3
-/* 链路报告单独占用一个 ID：手势是 8 字节的即时事件，链路是 64 字节的
+/* 链路报告单独占用一个 ID：手势是 8 字节的即时事件，链路是 63 字节的
  * 分片消息流。共用同一个 ID 会让主机无法区分"这是一次手势"还是"这是
  * 某条消息的第 2 片"，而两者的载荷长度完全不同。 */
-#define REPORT_ID_LINK      4
+#define REPORT_ID_LINK      MEO_LINK_REPORT_ID
 
 static const uint8_t s_hid_report_desc[] = {
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
@@ -143,7 +143,7 @@ static void *s_binary_ctx;
 /* ---------- 链路：HID 上行/下行适配 ---------- */
 
 /* meo_link 不直接认识 TinyUSB，这里只做三件事：报告端点是否可写、
- * 把一个 64 字节报告塞进中断端点、把 HID 收到的命令行转给 CDC 同一个
+ * 把一个 63 字节报告塞进中断端点、把 HID 收到的命令行转给 CDC 同一个
  * 回调。因此板级代码不需要知道自己正在被 CDC 还是 HID 驱动。 */
 static bool link_ready(void)
 {
@@ -160,11 +160,16 @@ static const meo_link_transport_t s_link_transport = {
     .send = link_send,
 };
 
+/* CDC and HID must enter the same dispatcher.  Calling s_line_cb directly
+ * would bypass SYS/ DOWNLOAD handling, which made the desktop HID path look
+ * complete while system commands silently did nothing. */
+static void dispatch_line(const char *line);
+
 /* HID 收到的行与 CDC 完全同构，直接复用已注册的分发器，业务侧零改动。 */
 static void link_dispatch(const char *line, void *ctx)
 {
     (void)ctx;
-    if (s_line_cb) s_line_cb(line, s_line_ctx);
+    dispatch_line(line);
 }
 
 /* ---------- TinyUSB HID 回调 ---------- */
@@ -185,7 +190,17 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
     (void)instance; (void)report_type;
-    if (report_id != REPORT_ID_LINK || !buffer || !bufsize) return;
+    if (!buffer || !bufsize) return;
+    /* TinyUSB reports interrupt OUT transfers as report_id=0 and leaves the
+     * actual Report ID in byte 0. Control SET_REPORT transfers strip that
+     * byte and pass report_id=4. Accept both forms. */
+    if (report_id == 0) {
+        if (buffer[0] != REPORT_ID_LINK || bufsize <= 1) return;
+        ++buffer;
+        --bufsize;
+    } else if (report_id != REPORT_ID_LINK) {
+        return;
+    }
     /* 只入队，不解析：这条回调跑在 TinyUSB 任务里，任何阻塞都会拖慢
      * 整个 USB 栈，包括 CDC 日志。 */
     meo_link_on_report(buffer, bufsize);

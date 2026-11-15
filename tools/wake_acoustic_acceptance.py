@@ -220,8 +220,8 @@ def check_sample(state, baseline, tracker):
     for key in ('chunks','acoustic','resets','drops'):
         if int(w[key])<int(baseline['wake'][key]):
             raise RuntimeError('Counter regressed/reset: '+key)
-    if state['audio'].get('mic_running')!='1' or state['capture'].get('visible')!='1':
-        raise RuntimeError('Microphone capture/actual LVGL indicator is not active')
+    if state['audio'].get('mic_running')!='1':
+        raise RuntimeError('Microphone capture is not active')
     if not ready(w):
         if w.get('error')!='MODEL_REBUILDING':
             raise RuntimeError('ESP-SR lost readiness: '+str(w))
@@ -281,6 +281,8 @@ def assess(record, baseline, positive):
     if not positive:
         if count or record['events']:
             errors.append('false wake in quiet/negative control')
+        if record.get('kind') in ('quiet','cooldown') and samples[-1]['capture'].get('visible')!='0':
+            errors.append('listening indicator did not hide in silence')
         return errors
     if count!=1:
         errors.append(f'expected exactly one acoustic detection, got {count}')
@@ -289,12 +291,15 @@ def assess(record, baseline, positive):
         errors.append('missing/unexpected acoustic event')
     if events and int(events[-1].get('count','-1'))!=int(samples[-1]['audio'].get('wake_detections','-2')):
         errors.append('event/UI generation mismatch')
-    if not any(s['audio'].get('wake_detected')=='1' and s['capture'].get('ack')=='1'
-               and s['ui'].get('eye')=='2' for s in samples):
+    if not any(s['audio'].get('wake_detected')=='1' and s['ui'].get('eye')=='2' for s in samples):
         # CURIOUS enum is checked against source below by tests; no text injection.
-        errors.append('LVGL amber acknowledgement/curious eyes not observed together')
-    if int(samples[-1]['capture'].get('wave_seq','0'))<=int(baseline['capture'].get('wave_seq','0')):
-        errors.append('waveform did not animate')
+        errors.append('wake acknowledgement/curious eyes not observed together')
+    if not any(s['capture'].get('visible')=='1' and int(s['capture'].get('fill_h','0'))>0 for s in samples):
+        errors.append('input-driven microphone fill not observed during speech')
+    if int(samples[-1]['capture'].get('seq','0'))<=int(baseline['capture'].get('seq','0')):
+        errors.append('microphone fill did not respond')
+    if samples[-1]['capture'].get('visible')!='0':
+        errors.append('microphone mark did not hide after speech')
     return errors
 
 
@@ -377,6 +382,8 @@ def run(args, report):
         check_sample(report['final'],initial,{})
         if report['final']['capture'].get('ack')!='0':
             failures.append('wake acknowledgement did not return to listening')
+        if report['final']['capture'].get('visible')!='0':
+            failures.append('listening mark did not hide in final silence')
     report['after']=usb.check_application(identity['elf_sha'],timeout=5)
     if report['after']['boot_id']!=before['boot_id']:
         failures.append('unexpected reset/boot ID change')

@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:8787",
+  "go": "",
+  "device_port": "auto",
+  "device_baud": 460800,
+  "tts_voice": "zh-CN-XiaoxiaoNeural",
+  "llm_base_url": "https://api.deepseek.com",
+  "llm_model": "deepseek-flash",
+  "llm_reasoning_effort": "none",
+  "llm_json_output": true,
+  "llm_api_key": ""
+}

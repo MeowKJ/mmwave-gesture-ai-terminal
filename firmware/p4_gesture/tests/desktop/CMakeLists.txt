@@ -30,12 +30,6 @@ target_include_directories(meoave_model_test PRIVATE ../../main)
 target_link_libraries(meoave_model_test PRIVATE m)
 target_compile_options(meoave_model_test PRIVATE -Wall -Wextra -Werror)
 
-add_executable(meoave_conversation_test ../test_conversation.c
-               ../../main/meoave_conversation.c ../../main/meoave_model.c)
-target_include_directories(meoave_conversation_test PRIVATE ../../main)
-target_compile_options(meoave_conversation_test PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(meoave_conversation_test PRIVATE m)
-
 set(CJSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../managed_components/espressif__cjson/cJSON")
 add_executable(meoave_sentence_test ../test_sentence.c ../../main/meoave_model.c
                ../../main/meoave_sentence.c ../../main/meoave_sentence_json.c
@@ -57,7 +51,6 @@ add_test(NAME ui.visual COMMAND meoave_visual_test "${CMAKE_CURRENT_BINARY_DIR}/
 add_test(NAME ui.interaction COMMAND meoave_interaction_test "${CMAKE_CURRENT_BINARY_DIR}/artifacts/interaction")
 add_test(NAME audio.preview COMMAND meoave_audio_preview_test)
 add_test(NAME model.state COMMAND meoave_model_test)
-add_test(NAME conversation.state COMMAND meoave_conversation_test)
 
 add_executable(meoave_wake_test ../test_wake.c ../../main/meoave_wake.c)
 target_include_directories(meoave_wake_test PRIVATE ../app_adapter/stubs ../../main)
@@ -66,7 +59,7 @@ add_test(NAME wake.keyword COMMAND meoave_wake_test)
 set_tests_properties(ui.visual ui.interaction PROPERTIES TIMEOUT 120)
 
 add_executable(meoave_audio_adapter_test ../audio_adapter/test_audio_adapter.c
-               ../../main/meoave_model.c ../../main/meoave_conversation.c
+               ../../main/meoave_model.c
                ../../main/meoave_wake.c ../../main/meoave_espsr.c)
 target_include_directories(meoave_audio_adapter_test PRIVATE ../audio_adapter/stubs ../app_adapter/stubs ../../main)
 target_compile_options(meoave_audio_adapter_test PRIVATE -Wall -Wextra -Werror)

@@ -1,7 +1,7 @@
 menu "Gesture Board Bring-up"
 
 config APP_FLS2_OFFICIAL_BASELINE
-    bool "Build the FLS2 official widgets demo with custom-board power/USB only"
+    bool "Use the audited FLS2 display/touch pipeline and custom-board power/USB"
     default n
     help
       Selects the checked-in OSPTEK-derived display source. Keep the audited
@@ -22,7 +22,7 @@ config APP_MEOAVE_UI
     select LV_FONT_MONTSERRAT_26
     default n
     help
-      Replaces only lv_demo_widgets with eyes, apps, settings and breathing.
+      Selects eyes, apps, settings and breathing on the audited display path.
       Keeps the audited panel/touch init and native USB recovery path.
       Use a separate build_meoave directory, never overwrite the baseline.
 
@@ -95,19 +95,6 @@ config APP_C5_SDIO_LOADER
       user holding download straps. No automatic reset/retry fallback.
       Built separately using tools/meoave.py build --profile programmer.
 
-config APP_COLOR_CYCLE_SEC
-    int "Seconds per solid color in display self test"
-    default 1
-    range 1 30
-
-config APP_AUDIO_BEEP
-    bool "Play a 1 kHz beep at startup (enables PA)"
-    default n
-
-config APP_RADAR_HEXDUMP
-    bool "Hex-dump radar UART data"
-    default y
-
 config APP_USB_HID_ENABLE
     bool "TinyUSB composite CDC + HID on USB_DM/DP"
     default y
@@ -116,10 +103,6 @@ config APP_USB_HID_ENABLE
       device. The CDC line-state callback reboots the chip into ROM download
       mode so flashing needs no BOOT/EN button.
 
-config APP_SELFTEST_COLORS
-    bool "Run solid-color panel self test before LVGL UI"
-    default y
-
 config APP_AUDIO_CODEC_INIT
     bool "Program the ES8389 register tables at startup"
     default y
@@ -127,15 +110,5 @@ config APP_AUDIO_CODEC_INIT
       Writes the official Linux ES8389 init / power-on / unmute sequence.
       Turn this off if you only want bus probing and I2S clocks, e.g. when
       bringing up a new codec revision with an unverified register map.
-
-config APP_USB_DOWNLOAD_ON_LONG_KEY
-    bool "Hold power key 3 s to enter USB download mode (ON-only power key when off)"
-    default n
-    help
-      OFF by default: the power key only powers the board on. This build has
-      no long-press action and no software power-off.
-      Enable only as a host-free fallback to re-enter ROM USB download mode.
-      It disconnects USB and reboots the chip; with R13 pulling PWR_HOLD low,
-      the reset window can brown out the 3V3 rail.
 
 endmenu

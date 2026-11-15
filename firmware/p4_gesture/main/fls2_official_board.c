@@ -219,22 +219,26 @@ static void on_command(const char *line, void *ctx)
             ? "MEO:UI_VOLUME queued=1\n" : "MEO:UI_VOLUME queued=0\n");
         return;
     }
-    if (strncmp(line, "UI GO ", 6) == 0) { meoave_app_request_page(line + 6); return; }
-    if (strncmp(line, "UI FPS", 6) == 0) { meoave_app_request_fps(atoi(line + 6)); return; }
+    if (strncmp(line, "UI GO ", 6) == 0) {
+        bool queued = meoave_app_request_page(line + 6);
+        (void)bsp_usb_cdc_write(queued ? "MEO:UI_GO queued=1\n" :
+                                "MEO:UI_GO queued=0 reason=unknown_page\n");
+        return;
+    }
+    if (strncmp(line, "UI FPS", 6) == 0) {
+        int ms = atoi(line + 6);
+        bool queued = ms > 0;
+        meoave_app_request_fps(ms);
+        (void)bsp_usb_cdc_write(queued ? "MEO:UIFPS queued=1\n" :
+                                "MEO:UIFPS queued=0 reason=bad_ms\n");
+        return;
+    }
     if (strncmp(line, "UI SHUTDOWN", 11) == 0) {
-        meoave_app_request_shutdown(atoi(line + 11));
-        return;
-    }
-    if (strcmp(line, "AI VOICE DEMO") == 0) {
-        (void)bsp_usb_cdc_write(meoave_app_request_voice_demo()
-            ? "MEO:VOICE_DEMO queued=1 offline=1\n"
-            : "MEO:VOICE_DEMO queued=0 reason=BUSY_NOT_READY_OR_NO_FIXTURE\n");
-        return;
-    }
-    if (strcmp(line, "AI DEMO") == 0) {
-        (void)bsp_usb_cdc_write(meoave_app_request_ai_demo()
-            ? "MEO:AI_DEMO queued=1 offline=1\n"
-            : "MEO:AI_DEMO queued=0 reason=BUSY_OR_NOT_READY\n");
+        int seconds = atoi(line + 11);
+        bool queued = seconds >= 0 && seconds <= 3;
+        if (queued) meoave_app_request_shutdown(seconds);
+        (void)bsp_usb_cdc_write(queued ? "MEO:UI_SHUTDOWN queued=1\n" :
+                                "MEO:UI_SHUTDOWN queued=0 reason=seconds_0_to_3\n");
         return;
     }
     if (strcmp(line, "AI CANCEL") == 0) {

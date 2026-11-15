@@ -5,6 +5,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -12,7 +13,7 @@ static portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;
 static meo_voice_view_t view;
 static meo_sentence_player_t player;
 static const int16_t *source;
-static bool cancel_requested,demo;
+static bool cancel_requested;
 
 typedef struct {
     uint16_t bytes;
@@ -21,14 +22,12 @@ typedef struct {
 
 #define STREAM_QUEUE_DEPTH 64u
 static QueueHandle_t stream_queue;
+static StaticQueue_t stream_queue_control;
+static uint8_t *stream_queue_storage;
 static bool stream_mode;
 static volatile bool stream_end;
 static uint32_t stream_received_frames;
-#ifdef MEO_VOICE_FIXTURE
-static uint32_t demo_generation;
-#include "voice_fixture.h"
-extern const uint8_t fixture_start[] asm("_binary_voice_fixture_pcm_start");
-#endif
+static const char *stream_start_error = "NONE";
 
 static void publish(const meo_sentence_frame_t *frame,const bsp_audio_voice_status_t *audio)
 {
@@ -96,48 +95,16 @@ static esp_err_t play_sentence(void)
     return err;
 }
 
-#ifdef MEO_VOICE_FIXTURE
-static bool fixture_sentence(unsigned id,meo_sentence_t *s)
-{
-    /* Deliberately exercise the SAME bounded JSON parser as a future gateway. */
-    const char *text=id==1 ? "你好，我在这里。" : "今天也陪着你。";
-    unsigned frames=id==1 ? MEO_FIXTURE_FRAMES_1 : MEO_FIXTURE_FRAMES_2;
-    char json[1024];
-    int n=snprintf(json,sizeof(json),
-        "{\"v\":1,\"generation\":%lu,\"sentence_id\":%u,\"sample_rate\":48000,\"channels\":1,\"format\":\"pcm_s16le\",\"frames\":%u,\"text\":\"%s\",\"expressions\":["
-        "{\"at_ms\":0,\"expression\":\"%s\",\"intensity\":0.6,\"transition_ms\":160},"
-        "{\"at_ms\":600,\"expression\":\"%s\",\"intensity\":0.85,\"transition_ms\":180},"
-        "{\"at_ms\":1400,\"expression\":\"%s\",\"intensity\":0.65,\"transition_ms\":200}]}",
-        (unsigned long)demo_generation,id,frames,text,id==1 ? "CURIOUS" : "LOVE",
-        id==1 ? "HAPPY" : "WINK",id==1 ? "EXCITED" : "RELIEVED");
-    return n>0 && (size_t)n<sizeof(json) && meo_sentence_parse(json,(size_t)n,s);
-}
-#endif
-
 static void voice_task(void *arg)
 {
     (void)arg;
     esp_err_t error=play_sentence();
-#ifdef MEO_VOICE_FIXTURE
-    if (error==ESP_OK && demo && !canceled()) {
-        meo_sentence_t second;
-        if (!fixture_sentence(2,&second) || !meo_sentence_begin(&player,&second)) error=ESP_FAIL;
-        else {
-            source=(const int16_t*)fixture_start+MEO_FIXTURE_FRAMES_1;
-            portENTER_CRITICAL(&lock);
-            view.sentence_id=2;view.total_frames=second.frames;view.has_frame=false;++view.sequence;
-            portEXIT_CRITICAL(&lock);
-            error=play_sentence();
-        }
-    }
-#endif
     if (error!=ESP_OK) meo_sentence_cancel(&player);
     bsp_audio_output_release();
     portENTER_CRITICAL(&lock);
     view.error=error;view.busy=false;
     if (error!=ESP_OK) view.has_frame=false;
     ++view.sequence;
-    demo=false;
     portEXIT_CRITICAL(&lock);
     vTaskDelete(NULL);
 }
@@ -251,12 +218,12 @@ static void stream_voice_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static bool start(const meo_sentence_t *s,const int16_t *mono,size_t frames,bool is_demo)
+static bool start(const meo_sentence_t *s,const int16_t *mono,size_t frames)
 {
     if (!s || !mono || frames!=s->frames || !meo_sentence_valid(s) || !bsp_audio_output_try_acquire()) return false;
     portENTER_CRITICAL(&lock);
     bool ok=!view.busy;
-    if (ok) {view.busy=true;cancel_requested=false;demo=is_demo;}
+    if (ok) {view.busy=true;cancel_requested=false;}
     portEXIT_CRITICAL(&lock);
     if (!ok) {bsp_audio_output_release();return false;}
     if (s->generation!=player.generation && !meo_sentence_turn(&player,s->generation)) ok=false;
@@ -272,14 +239,14 @@ static bool start(const meo_sentence_t *s,const int16_t *mono,size_t frames,bool
     if (!ok) {
         /* A failed generation/sentence cannot accidentally launch later. */
         meo_sentence_cancel(&player);
-        portENTER_CRITICAL(&lock);view.busy=false;demo=false;portEXIT_CRITICAL(&lock);
+        portENTER_CRITICAL(&lock);view.busy=false;portEXIT_CRITICAL(&lock);
         bsp_audio_output_release();
     }
     return ok;
 }
 
 bool meo_voice_start(const meo_sentence_t *s,const int16_t *mono,size_t frames)
-{ return start(s,mono,frames,false); }
+{ return start(s,mono,frames); }
 
 bool meo_voice_cancel(void)
 {
@@ -292,12 +259,34 @@ bool meo_voice_cancel(void)
 
 void meo_voice_stream_init(void)
 {
-    if (!stream_queue) stream_queue=xQueueCreate(STREAM_QUEUE_DEPTH,sizeof(stream_block_t));
+    if (stream_queue) return;
+    /* The PCM staging queue is task-to-task data, never ISR data. Keep its
+       ~62 KiB payload in PSRAM so the display, ESP-SR and the runtime voice
+       task can still obtain contiguous internal SRAM. Fall back only on
+       boards without usable PSRAM; the product profile requires PSRAM. */
+    stream_queue_storage = heap_caps_malloc(sizeof(stream_block_t) * STREAM_QUEUE_DEPTH,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stream_queue_storage) {
+        stream_queue = xQueueCreateStatic(STREAM_QUEUE_DEPTH, sizeof(stream_block_t),
+                                          stream_queue_storage, &stream_queue_control);
+    }
+    if (!stream_queue) {
+        stream_queue = xQueueCreate(STREAM_QUEUE_DEPTH, sizeof(stream_block_t));
+        if (stream_queue) stream_start_error = "PSRAM_QUEUE_FALLBACK";
+    }
+}
+
+const char *meo_voice_stream_start_error(void)
+{
+    return stream_start_error;
 }
 
 bool meo_voice_stream_begin_sentence(const meo_sentence_t *s)
 {
-    if (!s || !meo_sentence_valid(s) || !stream_queue || !bsp_audio_output_try_acquire()) return false;
+    stream_start_error = "NONE";
+    if (!s || !meo_sentence_valid(s)) { stream_start_error = "SENTENCE_INVALID"; return false; }
+    if (!stream_queue) { stream_start_error = "STREAM_QUEUE"; return false; }
+    if (!bsp_audio_output_try_acquire()) { stream_start_error = "AUDIO_BUSY"; return false; }
     portENTER_CRITICAL(&lock);
     bool ok=!view.busy && !stream_mode;
     if (ok) {
@@ -307,11 +296,14 @@ bool meo_voice_stream_begin_sentence(const meo_sentence_t *s)
         cancel_requested=false;
     }
     portEXIT_CRITICAL(&lock);
-    if (!ok) { bsp_audio_output_release(); return false; }
+    if (!ok) { stream_start_error = "VOICE_BUSY"; bsp_audio_output_release(); return false; }
     (void)xQueueReset(stream_queue);
     if (s->generation!=player.generation) ok=meo_sentence_turn(&player,s->generation);
+    if (!ok) stream_start_error = "GENERATION";
     if (ok) ok=meo_sentence_begin(&player,s);
-    if (ok) ok=xTaskCreate(stream_voice_task,"voice_stream",8192,NULL,6,NULL)==pdPASS;
+    if (!ok && !strcmp(stream_start_error, "NONE")) stream_start_error = "SENTENCE_BEGIN";
+    if (ok) ok=xTaskCreate(stream_voice_task,"voice_stream",4096,NULL,6,NULL)==pdPASS;
+    if (!ok && !strcmp(stream_start_error, "NONE")) stream_start_error = "TASK_NO_MEM";
     if (!ok) {
         meo_sentence_cancel(&player);
         portENTER_CRITICAL(&lock);view.busy=false;stream_mode=false;portEXIT_CRITICAL(&lock);
@@ -352,27 +344,4 @@ void meo_voice_view(meo_voice_view_t *out)
 {
     if (!out) return;
     portENTER_CRITICAL(&lock);*out=view;portEXIT_CRITICAL(&lock);
-}
-
-bool meo_voice_demo_available(void)
-{
-#ifdef MEO_VOICE_FIXTURE
-    return true;
-#else
-    return false;
-#endif
-}
-
-bool meo_voice_demo(void)
-{
-#ifdef MEO_VOICE_FIXTURE
-    meo_voice_view_t state;meo_voice_view(&state);
-    if (state.busy || state.generation==UINT32_MAX) return false;
-    demo_generation=state.generation+1;
-    meo_sentence_t first;
-    if (!fixture_sentence(1,&first)) return false;
-    return start(&first,(const int16_t*)fixture_start,first.frames,true);
-#else
-    return false;
-#endif
 }

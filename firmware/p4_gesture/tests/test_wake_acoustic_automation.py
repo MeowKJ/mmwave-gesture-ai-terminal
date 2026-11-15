@@ -33,7 +33,8 @@ class Clock:
 class Hardware:
     def __init__(self,clock):
         self.clock=clock;self.count=0;self.chunks=0;self.pending=b'';self.commands=[]
-        self.event=False;self.ack_until=0;self.fail=False;self.text=0;self.played=0;self.drops=0
+        self.event=False;self.ack_until=0;self.speech_until=0;self.fill_seq=0
+        self.fail=False;self.text=0;self.played=0;self.drops=0
     def __enter__(self):return self
     def __exit__(self,*a):return False
     def write(self,data):
@@ -47,9 +48,11 @@ class Hardware:
         if self.event:
             self.pending+=f'MEO:WAKE source=ACOUSTIC_ESP_SR detected=1 count={self.count}\n'.encode();self.event=False
         ack=int(self.clock.now<self.ack_until)
+        visible=int(self.clock.now<self.speech_until)
+        if visible:self.fill_seq+=1
         self.pending+=(f'MEO:UI page=eyes eye=2 frames={self.chunks}\n'
           f'MEO:UI_AUDIO mic_running=1 wake_detected={ack} wake_detections={self.count}\n'
-          f'MEO:UI_CAPTURE visible=1 ack={ack} wave_seq={self.chunks} min_h=9 max_h=22 ink=ccaa55\n'
+          f'MEO:UI_CAPTURE visible={visible} ack={ack*visible} seq={self.fill_seq} level={visible*60} fill_h={visible*6} ink=ccaa55\n'
           'MEO:WAKE_STATUS linked=1 loaded=1 keyword_ready=1 requested=1 armed=1 guarded=0 '
           f'error=NONE chunks={self.chunks} drops={self.drops} resets=0 acoustic={self.count} text_tests={self.text}\n').encode()
         return len(data)
@@ -61,6 +64,7 @@ class Hardware:
     def start(self,path):
         self.played+=1
         if self.fail or self.played==getattr(self,'fail_at',-1):raise OSError('speaker unavailable')
+        self.speech_until=self.clock.now+.7
         if path.name=='positive.wav':
             self.count+=1;self.event=True;self.ack_until=self.clock.now+1.8
             if getattr(self,'drop_on_wake',False):self.drops+=4
@@ -136,6 +140,21 @@ class AcousticTest(unittest.TestCase):
         m.run(self.args,self.report)
         trial=copy.deepcopy(self.report['attempts'][0]);trial['events']=[]
         self.assertIn('missing/unexpected acoustic event',m.assess(trial,self.report['initial'],True))
+
+    def test_badge_is_input_only_and_quiet_does_not_require_visibility(self):
+        m.run(self.args,self.report)
+        self.assertEqual(self.report['initial']['capture']['visible'],'0')
+        trial=copy.deepcopy(self.report['attempts'][0])
+        # Wake feedback can legitimately outlast the last sound. It must not
+        # force a visible microphone just to make a test pass.
+        for sample in trial['samples']:sample['capture']['ack']='0'
+        self.assertEqual(m.assess(trial,self.report['initial'],True),[])
+        for sample in trial['samples']:sample['capture']['fill_h']='0'
+        self.assertIn('input-driven microphone fill not observed during speech',
+                      m.assess(trial,self.report['initial'],True))
+        quiet=copy.deepcopy(self.report['controls'][0]);quiet['samples'][-1]['capture']['visible']='1'
+        self.assertIn('listening indicator did not hide in silence',
+                      m.assess(quiet,self.report['initial'],False))
 
     def test_quiet_false_wake_and_text_injection_rejected(self):
         m.run(self.args,self.report)

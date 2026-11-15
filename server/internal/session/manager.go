@@ -35,6 +35,9 @@ func (m *Manager) Start(parent context.Context, generation uint32) (context.Cont
 func (m *Manager) Finish(generation uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if cancel, ok := m.active[generation]; ok {
+		cancel()
+	}
 	delete(m.active, generation)
 }
 

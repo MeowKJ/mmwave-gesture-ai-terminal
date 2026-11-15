@@ -1,5 +1,50 @@
 # Meoave Go Server
 
+## 当前电脑本地部署（2026-11-15）
+
+唯一运行时仍是 Go，不需要 Python、FFmpeg 或本地大模型。
+电脑负责 HTTP 会话、云端模型调用、Edge-TTS、解码及原生 USB 下发；
+这不是离线 LLM/TTS，也尚未接入麦克风 ASR。
+
+1. 复制 `server/config.example.json` 为 `server/config.local.json`，填写本机配置。
+   后者已被 Git 忽略。API key 只放该文件或 `MEOAVE_LLM_API_KEY` 环境变量，不写入脚本。
+2. 从仓库根目录运行：
+
+```powershell
+./tools/server.ps1 Start
+./tools/server.ps1 Status
+./tools/server.ps1 Test
+./tools/server.ps1 Stop
+```
+
+`Start` 增量编译并后台运行；只监听 `127.0.0.1:8787`，不开放公网或改防火墙。
+自动端口识别仅接受 P4 应用态原生 USB VID/PID `303A:4005`，不回退 COM3、ROM 下载或硬件复位。
+配置变化需要 `Stop` 后重新 `Start`。不连设备时 `Start -ServerOnly`；
+只测云端模型和 TTS 时 `Test -ServerOnly`。后者不能当作设备播放成功。
+
+当前模板使用 DeepSeek 官方端点、`deepseek-flash`、非思考 `none` 和 JSON 输出。
+如果使用第三方服务，必须按该服务的实际 API 地址、模型 ID 和参数配置，不能只替换密钥。
+`llm_configured` 仅表示配置存在，不代表账号鉴权或余额检查通过。
+环境变量里的 API key 优先于本机文件；启动日志和进程参数不携带 key。
+
+`Test` 使用真正的 HTTP `/v1/chat`，每次只发一轮，不自动重试；
+报告保存在 `test-results/local-server/acceptance-*.json`，失败返回非零退出码。
+报告检查每句表情链、实际 PCM SHA/帧数和设备的完整 DMA 播放回执；不写入整段 Base64 或密钥。
+离线测试的替身、设备遥测与用户听感／实屏验收必须分开。
+
+```http
+POST /v1/chat
+Content-Type: application/json
+
+{"generation":1794744000,"text":"猫猫，今天有点累。","play":true}
+```
+
+generation 必须比该服务当前值更新；每轮包含一到两句，句子 ID 从 1 递增，
+共享同一 generation。所有句子均完成表情链和音频时轴校验后才开始物理播放；
+取消上下文覆盖整个合成／播放过程，不在合成结束时提前丢弃。
+`play:false` 只生成语音，不让设备出声。响应明确标注 `input:text`、`asr_tested:false`。
+本轮实际结果与尚未完成项目见 `docs/LOCAL_SERVER_20261115.md`；以下旧版 CLI 示例保留为历史接口说明。
+
 这是 Meoave 唯一的服务端实现。它是一个模块化单体，不需要 Python 或 FFmpeg 运行：
 
 1. Go 调用 Edge-TTS。

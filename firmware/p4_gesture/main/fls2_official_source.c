@@ -280,8 +280,9 @@ void fls2_official_demo(void)
     BOOT_STAGE(5, "ui");
     meoave_app_create();
     BOOT_STAGE(6, "ui-done");
-#elif LV_USE_DEMO_WIDGETS
-    lv_demo_widgets();
+#else
+    /* There is intentionally no legacy widgets/demo fallback. Product builds
+       must select the audited Meoave UI entry explicitly. */
 #endif
 
     lvgl_port_unlock();

@@ -15,15 +15,30 @@ import (
 
 	"github.com/meoave/meoave/server/internal/audio"
 	"github.com/meoave/meoave/server/internal/device"
+	"github.com/meoave/meoave/server/internal/dialogue"
+	"github.com/meoave/meoave/server/internal/llm"
 	"github.com/meoave/meoave/server/internal/protocol"
 	"github.com/meoave/meoave/server/internal/session"
 	"github.com/meoave/meoave/server/internal/tts"
 )
 
+type Synthesizer interface {
+	Synthesize(context.Context, string) (tts.Result, error)
+}
+
+type Completer interface {
+	Complete(context.Context, string, string) (llm.CompletionResult, error)
+}
+
+type Player interface {
+	Play(context.Context, protocol.SentenceResponse) (device.Receipt, error)
+}
+
 type Server struct {
-	TTS      *tts.Edge
+	TTS      Synthesizer
+	LLM      Completer
 	Sessions *session.Manager
-	Device   *device.Device
+	Device   Player
 	Log      *slog.Logger
 }
 
@@ -31,12 +46,18 @@ func New(ttsClient *tts.Edge, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{TTS: ttsClient, Sessions: session.NewManager(), Log: log}
+	s := &Server{Sessions: session.NewManager(), Log: log}
+	if ttsClient != nil {
+		s.TTS = ttsClient
+	}
+	return s
 }
 
 func NewWithDevice(ttsClient *tts.Edge, log *slog.Logger, dev *device.Device) *Server {
 	s := New(ttsClient, log)
-	s.Device = dev
+	if dev != nil {
+		s.Device = dev
+	}
 	return s
 }
 
@@ -45,12 +66,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("POST /v1/synthesize", s.synthesize)
 	mux.HandleFunc("POST /v1/play", s.play)
+	mux.HandleFunc("POST /v1/chat", s.chat)
 	mux.HandleFunc("POST /v1/cancel", s.cancel)
 	return logging(mux, s.Log)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "meoave-server", "generation": s.Sessions.Current()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "meoave-server", "generation": s.Sessions.Current(),
+		"tts_configured": s.TTS != nil, "llm_configured": s.LLM != nil, "device_configured": s.Device != nil, "asr_configured": false})
 }
 
 func (s *Server) synthesize(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +109,11 @@ func (s *Server) synthesizeSentence(parent context.Context, req protocol.Sentenc
 		return protocol.SentenceResponse{}, err
 	}
 	defer s.Sessions.Finish(req.Generation)
+	return s.renderSentence(ctx, req)
+}
+
+// The caller owns the generation until synthesis AND playback have ended.
+func (s *Server) renderSentence(ctx context.Context, req protocol.SentenceRequest) (protocol.SentenceResponse, error) {
 	started := time.Now()
 	ttsResult, err := s.TTS.Synthesize(ctx, req.Text)
 	if err != nil {
@@ -152,12 +180,18 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	response, err := s.synthesizeSentence(r.Context(), req)
+	ctx, err := s.Sessions.Start(r.Context(), req.Generation)
 	if err != nil {
 		s.writeSynthesisError(w, r.Context(), err)
 		return
 	}
-	receipt, err := s.Device.Play(r.Context(), response)
+	defer s.Sessions.Finish(req.Generation)
+	response, err := s.renderSentence(ctx, req)
+	if err != nil {
+		s.writeSynthesisError(w, r.Context(), err)
+		return
+	}
+	receipt, err := s.Device.Play(ctx, response)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			writeError(w, http.StatusRequestTimeout, "device playback cancelled")
@@ -167,6 +201,78 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": receipt, "sentence": response})
+}
+
+func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Generation uint32 `json:"generation"`
+		Text       string `json:"text"`
+		Play       bool   `json:"play"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if err := d.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat request")
+		return
+	}
+	var extra any
+	if err := d.Decode(&extra); err != io.EOF || req.Generation == 0 || strings.TrimSpace(req.Text) == "" || len(req.Text) > protocol.MaxTextBytes {
+		writeError(w, http.StatusBadRequest, "chat requires non-zero generation and 1..768 UTF-8 text bytes, without trailing JSON")
+		return
+	}
+	if s.LLM == nil || s.TTS == nil || (req.Play && s.Device == nil) {
+		writeError(w, http.StatusServiceUnavailable, "required LLM, TTS or device transport is not configured")
+		return
+	}
+	ctx, err := s.Sessions.Start(r.Context(), req.Generation)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	defer s.Sessions.Finish(req.Generation)
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	started := time.Now()
+	completion, err := s.LLM.Complete(ctx, dialogue.SystemPrompt, req.Text)
+	llmMS := time.Since(started).Milliseconds()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "stage": "llm", "error": err.Error(),
+			"generation": req.Generation, "llm_ms": llmMS, "total_ms": time.Since(started).Milliseconds()})
+		return
+	}
+	plan, err := dialogue.Parse(completion.Content)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "stage": "expression_plan", "error": err.Error(),
+			"generation": req.Generation, "model": completion.Model, "llm_ms": llmMS, "total_ms": time.Since(started).Milliseconds()})
+		return
+	}
+	// Validate every chain/audio timeline before the first physical side effect.
+	sentences := make([]protocol.SentenceResponse, 0, len(plan.Sentences))
+	for i, sentence := range plan.Sentences {
+		response, err := s.renderSentence(ctx, protocol.SentenceRequest{Generation: req.Generation, SentenceID: uint32(i + 1), Text: sentence.Text, Expressions: sentence.Expressions})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "stage": "synthesis", "error": err.Error(),
+				"generation": req.Generation, "model": completion.Model, "llm_ms": llmMS, "total_ms": time.Since(started).Milliseconds()})
+			return
+		}
+		sentences = append(sentences, response)
+	}
+	receipts := make([]device.Receipt, 0, len(sentences))
+	if req.Play {
+		for _, sentence := range sentences {
+			receipt, err := s.Device.Play(ctx, sentence)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "stage": "device_playback", "error": err.Error(),
+					"generation": req.Generation, "model": completion.Model, "llm_ms": llmMS, "total_ms": time.Since(started).Milliseconds(), "sentences": sentences, "device": receipts})
+				return
+			}
+			receipts = append(receipts, receipt)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "generation": req.Generation, "model": completion.Model,
+		"llm_ms": llmMS, "total_ms": time.Since(started).Milliseconds(), "sentences": sentences, "device": receipts,
+		"input": "text", "asr_tested": false})
 }
 
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {

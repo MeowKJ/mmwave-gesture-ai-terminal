@@ -69,6 +69,15 @@ LV_FONT_DECLARE(meo_font_44);
 #define WIFI_ROW_STEP      80
 #define WIFI_NAME_X        66
 #define WIFI_NAME_W        194
+#define HOME_CAPTURE_X     400
+#define HOME_CAPTURE_Y     396
+#define HOME_CAPTURE_SIZE  32
+#define HOME_CAPTURE_FILL_H 10
+#define HOME_VOICE_SHOW_LEVEL 0.20f
+#define HOME_VOICE_HIDE_LEVEL 0.12f
+#define HOME_VOICE_ATTACK_MS 60u
+#define HOME_VOICE_TAIL_MS 240u
+#define HOME_MIC_STALE_MS  350u
 #define POWER_BODY_W       56
 #define POWER_BODY_H       28
 #define POWER_BORDER       2
@@ -142,11 +151,13 @@ static struct {
     meo_ui_config_t config;
     lv_obj_t *pages[MEO_PAGE_COUNT];
     face_view_t home_face;
-    lv_obj_t *home_capture_ring, *home_capture_mic;
-    lv_obj_t *home_capture_wave[8];
-    bool home_capture_active, home_wake_detected;
-    uint32_t home_wave_seq;
-    int home_wave_height[8];
+    lv_obj_t *home_capture_mic;
+    bool home_capture_active, home_wake_detected, home_capture_blocked;
+    bool home_voice_active;
+    uint64_t home_voice_above_at, home_voice_last_at, home_mic_at;
+    uint32_t home_fill_seq;
+    int home_fill_height;
+    float home_level_shown;
     struct {
         meo_model_t model;
         face_view_t face;
@@ -502,6 +513,8 @@ static void expression_preview_enter(void);
 static void expression_preview_select(int delta);
 static void expression_preview_controls(void);
 static void expression_preview_tick(void);
+static void home_capture_present(bool show);
+static void home_capture_reset(void);
 static void page_leaving(meo_page_t from, meo_page_t to)
 {
     if (from == MEO_EXPRESSIONS && to != MEO_EXPRESSIONS) {
@@ -521,6 +534,7 @@ static void page_leaving(meo_page_t from, meo_page_t to)
         ui.config.ai_mic_test(false);
     if (to == MEO_HOME && from != MEO_HOME && ui.config.ai_mic_test)
         ui.config.ai_mic_test(true);
+    if (from == MEO_HOME || to == MEO_HOME) home_capture_reset();
     if (from == MEO_PASSWORD && to != MEO_PASSWORD) {
         memset(s_pwd.text, 0, sizeof(s_pwd.text));
         s_pwd.len = 0; s_pwd.last_key = -1; pwd_render();
@@ -1176,6 +1190,21 @@ static void face_mouth_create(face_view_t *face, lv_obj_t *parent, int y)
     }
 }
 
+static void draw_home_capture_fill(lv_event_t *event)
+{
+    if (ui.home_fill_height<=0) return;
+    lv_area_t icon_area;
+    lv_obj_get_coords(lv_event_get_target_obj(event),&icon_area);
+    /* Fill the inside of the native Lucide capsule, never its outline or
+       stand. No extra bars, ring, labels or animation unrelated to input. */
+    lv_area_t fill={icon_area.x1+14,icon_area.y1+16-ui.home_fill_height,
+                    icon_area.x1+17,icon_area.y1+15};
+    lv_draw_rect_dsc_t d;lv_draw_rect_dsc_init(&d);
+    d.bg_color=color(ui.home_wake_detected ? ACCENT_AMBER : ACCENT_CYAN);
+    d.bg_opa=LV_OPA_COVER;d.radius=2;
+    lv_draw_rect(lv_event_get_layer(event),&d,&fill);
+}
+
 static void home_create(void)
 {
     lv_obj_t *p = ui.pages[MEO_HOME];
@@ -1184,30 +1213,27 @@ static void home_create(void)
     /* Home deliberately retains the approved eyes-only composition. */
     face_create(&ui.home_face,p,1.0f);
     face_mouth_create(&ui.home_face,p,286);
-    /* A quiet, full-width listening rail. It is hidden unless the audio task
-       has actually started I2S RX, so a dead codec never looks like recording. */
-    /* Keep the capture rail on the top layer so the proven home page child
-       layout remains unchanged for the renderer/geometry tests. It is still
-       non-clickable and is explicitly hidden outside the AI dial. */
-    lv_obj_t *capture_layer=lv_layer_top();
-    /* Listening feedback is part of the character, not a toolbar.  Keep the
-       microphone small and surround it with a quiet circular pulse; the old
-       dark pill looked like a debug button and stole focus from the eyes. */
-    ui.home_capture_ring=box(capture_layer,194,350,72,72,BG,36);
-    lv_obj_set_style_bg_opa(ui.home_capture_ring,LV_OPA_TRANSP,0);
-    lv_obj_set_style_border_width(ui.home_capture_ring,1,0);
-    lv_obj_set_style_border_color(ui.home_capture_ring,color(ACCENT_CYAN),0);
-    lv_obj_set_style_border_opa(ui.home_capture_ring,LV_OPA_70,0);
-    ui.home_capture_mic=icon(capture_layer,ICON_MIC,32,ACCENT_CYAN);
-    lv_obj_set_pos(ui.home_capture_mic,214,370);
-    static const int xs[8]={96,124,152,180,280,308,336,364};
-    for (int i=0;i<8;++i) {
-        ui.home_capture_wave[i]=box(capture_layer,xs[i],383,5,6,ACCENT_CYAN,3);
-        ui.home_wave_height[i]=6;
-    }
-    visible(ui.home_capture_ring,false);
+    /* A single non-interactive 32px mark, outside the eyes/mouth footprint.
+       An armed microphone alone is deliberately invisible. */
+    ui.home_capture_mic=icon(lv_layer_top(),ICON_MIC,HOME_CAPTURE_SIZE,0xD1D7DB);
+    lv_obj_set_pos(ui.home_capture_mic,HOME_CAPTURE_X,HOME_CAPTURE_Y);
+    lv_obj_add_event_cb(ui.home_capture_mic,draw_home_capture_fill,LV_EVENT_DRAW_MAIN,NULL);
     visible(ui.home_capture_mic,false);
-    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],false);
+}
+
+static void home_capture_present(bool show)
+{
+    visible(ui.home_capture_mic,show && ui.model.page==MEO_HOME &&
+            lv_screen_active()==ui.pages[MEO_HOME] && !ui.navigating && !s_overlay_up);
+}
+
+static void home_capture_reset(void)
+{
+    ui.home_voice_active=false;
+    ui.home_voice_above_at=ui.home_voice_last_at=0;
+    ui.home_level_shown=0;
+    ui.home_fill_height=0;
+    home_capture_present(false);
 }
 
 /* The icon rail moves; its two caption targets are siblings on the screen.
@@ -1859,28 +1885,47 @@ static void mic_create(void)
 void meo_ui_set_mic(const float level[2],bool running)
 {
     if (!ui.ready || !level) return;
-    for (int c=0;c<2;++c) ui.mic_target[c]=running ? LV_CLAMP(0.0f,level[c],1.0f) : 0;
+    bool valid=isfinite(level[0]) && isfinite(level[1]);
+    for (int c=0;c<2;++c)
+        ui.mic_target[c]=running && valid ? LV_CLAMP(0.0f,level[c],1.0f) : 0;
     if (ui.mic_state) label_text_if_changed(ui.mic_state,running ? "正在聆听" : "未就绪");
     ui.home_capture_active=running;
-    bool show=(ui.model.page==MEO_HOME) && (running || ui.home_wake_detected);
-    visible(ui.home_capture_ring,show);
-    visible(ui.home_capture_mic,show);
-    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],show);
+    ui.home_mic_at=ui.clock_ms;
+    if (!running || !valid || ui.model.page!=MEO_HOME || ui.home_capture_blocked) {
+        home_capture_reset();
+        return;
+    }
+    /* This is a local input-activity gate, not a claim of ASR/VAD. Two fresh
+       10Hz samples reject short ticks; hysteresis and a brief tail stop
+       flicker between syllables. No wake event can manufacture input. */
+    float input=LV_MAX(ui.mic_target[0],ui.mic_target[1]);
+    if (!ui.home_voice_active) {
+        if (input>=HOME_VOICE_SHOW_LEVEL) {
+            if (!ui.home_voice_above_at) ui.home_voice_above_at=ui.clock_ms;
+            if (ui.clock_ms-ui.home_voice_above_at>=HOME_VOICE_ATTACK_MS) {
+                ui.home_voice_active=true;
+                ui.home_voice_last_at=ui.clock_ms;
+            }
+        } else ui.home_voice_above_at=0;
+    } else if (input>=HOME_VOICE_HIDE_LEVEL) {
+        ui.home_voice_last_at=ui.clock_ms;
+    }
+    home_capture_present(ui.home_voice_active);
+}
+
+void meo_ui_set_capture_blocked(bool blocked)
+{
+    if (!ui.ready) return;
+    ui.home_capture_blocked=blocked;
+    if (blocked) home_capture_reset();
 }
 
 void meo_ui_set_wake_state(bool wake_detected)
 {
-    if (!ui.ready) return;
+    if (!ui.ready || ui.home_wake_detected==wake_detected) return;
     ui.home_wake_detected=wake_detected;
-    uint32_t ink=wake_detected ? ACCENT_AMBER : ACCENT_CYAN;
-    if (ui.home_capture_ring) lv_obj_set_style_border_color(ui.home_capture_ring,color(ink),0);
-    if (ui.home_capture_mic) lv_obj_set_style_line_color(ui.home_capture_mic,color(ink),0);
-    for (int i=0;i<8;++i) if (ui.home_capture_wave[i])
-        lv_obj_set_style_bg_color(ui.home_capture_wave[i],color(ink),0);
-    bool show=(ui.model.page==MEO_HOME) && (ui.home_capture_active || wake_detected);
-    visible(ui.home_capture_ring,show);
-    visible(ui.home_capture_mic,show);
-    for (int i=0;i<8;++i) visible(ui.home_capture_wave[i],show);
+    if (ui.home_voice_active) lv_obj_invalidate(ui.home_capture_mic);
+    /* Acknowledgement only recolors an already visible input fill. */
 }
 
 void meo_ui_set_audio(const meo_audio_view_t *view)
@@ -1897,20 +1942,37 @@ void meo_ui_capture_view(meo_ui_capture_view_t *out)
 {
     if (!out) return;
     memset(out,0,sizeof(*out));
-    if (!ui.ready || !ui.home_capture_ring || !ui.home_capture_wave[0]) return;
-    out->visible=ui.model.page==MEO_HOME && lv_obj_is_visible(ui.home_capture_ring) &&
-                 lv_obj_is_visible(ui.home_capture_mic);
-    out->wave_seq=ui.home_wave_seq;
-    out->ink=lv_color_to_u32(lv_obj_get_style_bg_color(ui.home_capture_wave[0],0)) & 0xFFFFFF;
-    out->ack=out->visible && out->ink==ACCENT_AMBER;
-    out->min_height=UINT32_MAX;
-    for (int i=0;i<8;++i) {
-        out->visible=out->visible && lv_obj_is_visible(ui.home_capture_wave[i]);
-        unsigned h=(unsigned)lv_obj_get_height(ui.home_capture_wave[i]);
-        if (h<out->min_height) out->min_height=h;
-        if (h>out->max_height) out->max_height=h;
+    if (!ui.ready || !ui.home_capture_mic) return;
+    out->visible=ui.model.page==MEO_HOME && lv_obj_is_visible(ui.home_capture_mic);
+    out->ack=out->visible && ui.home_wake_detected;
+    out->seq=ui.home_fill_seq;
+    out->level=out->visible ? (unsigned)lroundf(ui.home_level_shown*100.0f) : 0;
+    out->fill_height=out->visible ? (unsigned)ui.home_fill_height : 0;
+    out->ink=ui.home_wake_detected ? ACCENT_AMBER : ACCENT_CYAN;
+}
+
+/* Always serviced, even off-page/under the shutdown overlay: old input may
+   never linger on the top layer or imply listening during local playback. */
+static void home_capture_tick(void)
+{
+    if (ui.model.page!=MEO_HOME || !ui.home_capture_active || ui.home_capture_blocked ||
+        s_overlay_up || ui.clock_ms-ui.home_mic_at>HOME_MIC_STALE_MS ||
+        (ui.home_voice_active && ui.clock_ms-ui.home_voice_last_at>=HOME_VOICE_TAIL_MS)) {
+        home_capture_reset();
+        return;
     }
-    out->ack=out->ack && out->visible;
+    if (ui.home_voice_active) {
+        float target=LV_MAX(ui.mic_target[0],ui.mic_target[1]);
+        ui.home_level_shown+=(target-ui.home_level_shown)*
+            (target>ui.home_level_shown ? .55f : .15f);
+        int height=LV_CLAMP(1,(int)lroundf(ui.home_level_shown*HOME_CAPTURE_FILL_H),HOME_CAPTURE_FILL_H);
+        if (height!=ui.home_fill_height) {
+            ui.home_fill_height=height;
+            ++ui.home_fill_seq;
+            lv_obj_invalidate(ui.home_capture_mic);
+        }
+    }
+    home_capture_present(ui.home_voice_active);
 }
 
 /* Called from the UI tick: smooth + repaint only the segments that flipped. */
@@ -1936,30 +1998,7 @@ static void mic_tick(void)
             lv_obj_set_style_bg_color(ui.mic_seg[c][i], color(ink), 0);
         }
     }
-    if (ui.model.page==MEO_HOME && ui.home_capture_ring &&
-        (ui.home_capture_active || ui.home_wake_detected)) {
-        float level=(ui.mic_shown[0]+ui.mic_shown[1])*.5f;
-        float phase=(float)(ui.clock_ms%900)/900.0f;
-        for (int i=0;i<8;++i) {
-            float wave=ui.home_capture_active ? (0.14f+level*.86f) : .12f;
-            int side=i<4 ? i : 7-i;
-            float ripple=0.5f+0.5f*sinf((phase*2.0f*PI)+(float)side*.72f);
-            float envelope=0.38f+0.62f*(1.0f-(float)side/4.0f);
-            int h=LV_CLAMP(5,(int)lroundf(5.0f+wave*(11.0f+13.0f*ripple)*envelope),28);
-            if (h==ui.home_wave_height[i]) continue;
-            ui.home_wave_height[i]=h;
-            int y=386-h/2;
-            lv_obj_set_pos(ui.home_capture_wave[i],lv_obj_get_x(ui.home_capture_wave[i]),y);
-            lv_obj_set_height(ui.home_capture_wave[i],h);
-            ++ui.home_wave_seq;
-        }
-        float pulse=0.5f+0.5f*sinf((phase*2.0f*PI));
-        int border=ui.home_wake_detected ? 2 : 1;
-        lv_obj_set_style_border_width(ui.home_capture_ring,border,0);
-        lv_obj_set_style_border_opa(ui.home_capture_ring,
-                                    (lv_opa_t)(ui.home_wake_detected ?
-                                               145 : 70+(int)lroundf(pulse*55)),0);
-    }
+
 }
 
 static void breathe_create(void)
@@ -2427,6 +2466,7 @@ static void tick(lv_timer_t *timer)
     if (ui.pwd_notice_hide_at && ui.clock_ms>=ui.pwd_notice_hide_at) {
         visible(ui.pwd_notice,false);visible(ui.pwd_ssid,true);ui.pwd_notice_hide_at=0;
     }
+    home_capture_tick();
     /* The overlay is fully opaque and covers the whole panel: animating the
        face underneath would repaint ~91k px per tick for nobody to see. */
     if (!s_overlay_up) {
@@ -2434,12 +2474,7 @@ static void tick(lv_timer_t *timer)
         else if (ui.model.page == MEO_EXPRESSIONS) expression_preview_tick();
         else if (ui.model.page == MEO_BREATHE) update_breathe();
 
-        /* Home is both the eye dial and the live listening surface.  Keep
-           the VU/waveform tick independent from the face branch above;
-           using else-if here made the home waveform freeze at its initial
-           height while the microphone page continued to work. */
-        if (ui.model.page == MEO_MIC || ui.model.page == MEO_HOME)
-            mic_tick();
+        if (ui.model.page == MEO_MIC) mic_tick();
     }
     shutdown_tick();
     /* Animation windows must also expire on a completely static page, where

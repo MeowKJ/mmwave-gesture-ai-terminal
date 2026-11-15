@@ -23,10 +23,9 @@ void meo_voice_view(meo_voice_view_t *out);
 #define MEO_VOICE_STREAM_BLOCK_BYTES 960u
 void meo_voice_stream_init(void);
 bool meo_voice_stream_begin_sentence(const meo_sentence_t *sentence);
+/* Diagnostic detail for a false begin result. The value is static and only
+ * valid until the next begin attempt; it contains no user text or secrets. */
+const char *meo_voice_stream_start_error(void);
 bool meo_voice_stream_push_pcm(const uint8_t *pcm, size_t bytes);
 bool meo_voice_stream_end(void);
 bool meo_voice_stream_active(void);
-/* Optional local, synthesized two-sentence fixture. Not a live AI reply or
- * IndexTTS benchmark; absent on a clean build unless explicitly generated. */
-bool meo_voice_demo(void);
-bool meo_voice_demo_available(void);

@@ -2,7 +2,7 @@
  * Only the UI creation call differs, not its init table or timing. */
 #include "meoave_app.h"
 #include "meoave_ui.h"
-#include "meoave_conversation.h"
+#include "meoave_model.h"
 #include "meoave_voice.h"
 #include "meoave_voice_link.h"
 #include "meoave_wake.h"
@@ -83,16 +83,11 @@ static bsp_audio_mic_route_t s_last_route;
 static bool s_route_dirty;
 static int64_t s_route_save_at;
 static const char *s_wifi_name = "UNAVAILABLE";
-/* The conversation engine is intentionally transport-free for this first
-   vertical slice.  The app task owns it; the GUI only receives expression
-   changes under the LVGL lock. */
-static meo_conversation_t s_conversation;
-static meo_conversation_view_t s_ai_view;
-static uint32_t s_ai_view_seq;
-static uint32_t s_ai_applied_seq;
-static volatile int s_ai_request;       /* 0 none, 1 demo, 2 cancel */
+/* Production AI state is driven by the validated voice stream and wake
+   pipeline.  There is no local fixed conversation/demo state machine. */
+static volatile bool s_ai_cancel_request;
 static volatile bool s_ai_report_request;
-static bool s_voice_demo_request,s_voice_ui_owned;
+static bool s_voice_ui_owned;
 static uint32_t s_voice_applied_seq;
 static uint32_t s_voice_logged_generation,s_voice_logged_sentence;
 static unsigned s_voice_logged_cue=UINT32_MAX;
@@ -100,6 +95,7 @@ static volatile bool s_wake_text_pending;
 static char s_wake_text[48];
 static uint32_t s_wake_logged;
 static bool s_wake_started;
+static int64_t s_capture_resume_at;
 /* Written by actual page transitions, not inferred from lock availability. */
 static bool s_home_listening;
 
@@ -115,9 +111,9 @@ static void wake_audio_frame(const int16_t *stereo, size_t frames, uint64_t now_
 static void report_voice(const meo_voice_view_t *v)
 {
     char line[320];
-    snprintf(line,sizeof(line),"MEO:VOICE busy=%d fixture=%d generation=%lu sentence=%lu "
+    snprintf(line,sizeof(line),"MEO:VOICE busy=%d generation=%lu sentence=%lu "
         "played=%lu frames=%lu cue=%u expression=%s intensity=%u underruns=%lu error=%d\n",
-        v->busy,meo_voice_demo_available(),(unsigned long)v->generation,(unsigned long)v->sentence_id,
+        v->busy,(unsigned long)v->generation,(unsigned long)v->sentence_id,
         (unsigned long)(v->has_frame ? v->frame.played_frames : 0),(unsigned long)v->total_frames,
         v->has_frame ? v->frame.cue_index : 0,
         meo_expression_name(v->has_frame ? v->frame.expression : MEO_EYE_CALM),
@@ -163,40 +159,18 @@ static void changed(const meo_settings_t *settings)
     (void)xQueueOverwrite(s_changes, settings);
 }
 
-static void conversation_changed(const meo_conversation_view_t *view, void *ctx)
-{
-    (void)ctx;
-    s_ai_view = *view;
-    ++s_ai_view_seq;
-    if (s_ai_view_seq == 0) ++s_ai_view_seq;
-}
-
 static void report_ai_status(void)
 {
+    meo_voice_view_t voice;
+    meo_voice_view(&voice);
+    const char *state = voice.busy ? "SPEAKING" : "IDLE";
+    const char *expression = voice.busy && voice.has_frame
+        ? meo_expression_name(voice.frame.expression) : "CALM";
     char line[224];
     snprintf(line, sizeof(line),
-             "MEO:AI state=%s expression=%s active=%d generation=%lu prompt=%s response=%s\n",
-             meo_conversation_state_name(s_ai_view.state),
-             meo_conversation_expression_name(s_ai_view.expression),
-             s_ai_view.active, (unsigned long)s_ai_view.generation,
-             meo_conversation_demo_prompt(), meo_conversation_demo_response());
+             "MEO:AI state=%s expression=%s active=%d generation=%lu\n",
+             state, expression, voice.busy, (unsigned long)voice.generation);
     (void)bsp_usb_cdc_write(line);
-}
-
-static void apply_ai_expression(void)
-{
-    if (!s_ai_view_seq || s_ai_view_seq == s_ai_applied_seq) return;
-    if (!lvgl_port_lock(5)) return;
-    /* IDLE returns ownership to the normal home-page mood cycle. Every other
-       phase is an explicit hold so the idle slideshow cannot overwrite the
-       conversation expression halfway through a turn. */
-    if (s_ai_view.state == MEO_CONV_IDLE) {
-        meo_ui_auto_expression();
-    } else {
-        meo_ui_set_expression(s_ai_view.expression, 0);
-    }
-    lvgl_port_unlock();
-    s_ai_applied_seq = s_ai_view_seq;
 }
 
 /* Test output from the speaker page. The melody blocks for its whole
@@ -381,8 +355,6 @@ void meoave_app_create(void)
     config.wifi_connect = wifi_connect_request;
 #endif
     meo_ui_create(&config);
-    meo_conversation_init(&s_conversation, (uint64_t)(esp_timer_get_time() / 1000),
-                          conversation_changed, NULL);
     /* The ESP-SR tap consumes the existing mic worker's blocks.  It never
        opens I2S RX itself, so UI metering and wake detection share one reader
        without racing the IDF channel lock. */
@@ -417,35 +389,13 @@ bool meoave_app_request_wake_text(const char *text)
     return true;
 }
 
-bool meoave_app_request_ai_demo(void)
-{
-    if (!s_ready || s_shutdown) return false;
-    meo_voice_view_t voice;meo_voice_view(&voice);
-    portENTER_CRITICAL(&s_lock);
-    bool accepted = s_ai_request == 0 && !s_voice_demo_request && !voice.busy && !meo_conversation_active(&s_conversation);
-    if (accepted) s_ai_request = 1;
-    portEXIT_CRITICAL(&s_lock);
-    return accepted;
-}
-
-bool meoave_app_request_voice_demo(void)
-{
-    if (!s_ready || s_shutdown || !meo_voice_demo_available()) return false;
-    meo_voice_view_t voice;meo_voice_view(&voice);
-    portENTER_CRITICAL(&s_lock);
-    bool ok=!s_voice_demo_request && !voice.busy && !s_ai_request && !meo_conversation_active(&s_conversation);
-    if (ok) s_voice_demo_request=true;
-    portEXIT_CRITICAL(&s_lock);
-    return ok;
-}
-
 bool meoave_app_request_ai_cancel(void)
 {
     if (!s_ready || s_shutdown) return false;
     meo_voice_view_t voice;meo_voice_view(&voice);
     portENTER_CRITICAL(&s_lock);
-    bool accepted = s_ai_request == 0 && (meo_conversation_active(&s_conversation) || voice.busy || s_voice_demo_request);
-    if (accepted) s_ai_request = 2;
+    bool accepted = voice.busy;
+    if (accepted) s_ai_cancel_request = true;
     portEXIT_CRITICAL(&s_lock);
     return accepted;
 }
@@ -558,7 +508,7 @@ void meoave_app_key_tick(void)
     if (poweroff) power_off_now();
 }
 
-void meoave_app_request_page(const char *name)
+bool meoave_app_request_page(const char *name)
 {
     static const struct { const char *name; meo_page_t page; } map[] = {
         {"eyes", MEO_HOME}, {"apps", MEO_APPS}, {"settings", MEO_SETTINGS},
@@ -567,7 +517,8 @@ void meoave_app_request_page(const char *name)
         {"mic", MEO_MIC}, {"speaker", MEO_SPEAKER}, {"expressions", MEO_EXPRESSIONS},
     };
     for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); ++i)
-        if (name && strcmp(name, map[i].name) == 0) { s_page_req = (int)map[i].page; return; }
+        if (name && strcmp(name, map[i].name) == 0) { s_page_req = (int)map[i].page; return true; }
+    return false;
 }
 
 void meoave_app_request_volume(int percent)
@@ -593,29 +544,15 @@ void meoave_app_service(void)
     portEXIT_CRITICAL(&s_lock);
     if (!ready) return;
     if (s_shutdown) return;           /* rail released: keep the UI frozen */
-    int ai_request;
+    bool ai_cancel_request;
     bool ai_report;
-    bool voice_demo;
     portENTER_CRITICAL(&s_lock);
-    ai_request = s_ai_request;
-    s_ai_request = 0;
+    ai_cancel_request = s_ai_cancel_request;
+    s_ai_cancel_request = false;
     ai_report = s_ai_report_request;
     s_ai_report_request = false;
-    voice_demo=s_voice_demo_request;s_voice_demo_request=false;
     portEXIT_CRITICAL(&s_lock);
-    uint64_t ai_now_ms = (uint64_t)(esp_timer_get_time() / 1000);
-    if (ai_request == 1) (void)meo_conversation_start(&s_conversation, ai_now_ms);
-    else if (ai_request == 2) {
-        (void)meo_conversation_cancel(&s_conversation, ai_now_ms);
-        (void)meo_voice_cancel();voice_demo=false;
-    }
-    if (voice_demo) {
-        bool ok=meo_voice_demo();
-        (void)bsp_usb_cdc_write(ok ? "MEO:VOICE_START accepted=1 offline=1\n" :
-            "MEO:VOICE_START accepted=0 reason=BUSY_OR_FIXTURE_INVALID\n");
-    }
-    meo_conversation_tick(&s_conversation, ai_now_ms);
-    apply_ai_expression();
+    if (ai_cancel_request) (void)meo_voice_cancel();
     if (ai_report) report_ai_status();
     apply_voice_expression(ai_report);
     if (s_volume_req >= 0 && lvgl_port_lock(5)) {
@@ -715,12 +652,14 @@ void meoave_app_service(void)
     portENTER_CRITICAL(&s_lock);
     home = s_home_listening;
     meo_wake_set_armed(s_wake_started && home && !s_shutdown && !wake_voice.busy &&
-                       !meo_conversation_active(&s_conversation) && bsp_audio_mic_capturing(), now_ms);
+                       bsp_audio_mic_capturing(), now_ms);
     portEXIT_CRITICAL(&s_lock);
     if (wake_text_pending) (void)meo_wake_submit_text(wake_text, now_ms);
     meo_wake_service(now_ms);
     meo_wake_tick(now_ms);
     meo_wake_view_t wake; meo_wake_view(&wake);
+    bool local_output=bsp_audio_speaker_on() || wake_voice.busy || audio_selftest_busy();
+    if (local_output) s_capture_resume_at=now_us+300000;
     bool wake_fresh = wake.detections != s_wake_logged;
     if (wake_fresh) {
         s_wake_logged = wake.detections;
@@ -730,6 +669,7 @@ void meoave_app_service(void)
         (void)bsp_usb_cdc_write(line);
     }
     if (lvgl_port_lock(5)) {
+        meo_ui_set_capture_blocked(local_output || now_us<s_capture_resume_at);
         if (wake_fresh && home) meo_ui_set_expression(MEO_EYE_CURIOUS, 1200);
         meo_ui_set_wake_state(wake.detected);
         lvgl_port_unlock();
@@ -952,9 +892,9 @@ void meoave_app_service(void)
         meo_ui_capture_view(&capture);
         char capture_line[192];
         snprintf(capture_line, sizeof(capture_line),
-                 "MEO:UI_CAPTURE visible=%d ack=%d wave_seq=%lu min_h=%u max_h=%u ink=%06lx\n",
-                 capture.visible, capture.ack, (unsigned long)capture.wave_seq,
-                 capture.min_height, capture.max_height, (unsigned long)capture.ink);
+                 "MEO:UI_CAPTURE visible=%d ack=%d seq=%lu level=%u fill_h=%u ink=%06lx\n",
+                 capture.visible, capture.ack, (unsigned long)capture.seq,
+                 capture.level, capture.fill_height, (unsigned long)capture.ink);
         char audio[320];
         snprintf(audio, sizeof(audio),
                  "MEO:UI_AUDIO volume=%u mic_gain=%u preview_busy=%d preview_error=%d preview_seq=%lu "

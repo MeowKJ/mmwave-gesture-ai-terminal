@@ -53,5 +53,5 @@ CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 
 # ---- 电源键 ----
-# 电源键只负责开机（按住 SW1 -> PWR_HOLD 自锁），不做长按动作、不做软件关机。
-# 长按 3 s 进 USB 下载模式的兜底由 Kconfig.projbuild 默认关闭，需要时 menuconfig 打开。
+# SW1 上电后由 PWR_HOLD 自锁；产品应用负责长按 3 s 关机。
+# 程序复位/下载由原生 USB 命令触发，不复用电源键的长按动作。

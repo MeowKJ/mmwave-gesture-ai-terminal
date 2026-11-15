@@ -8,6 +8,7 @@
 static int64_t now;
 static bool output_owned,task_failure,gui_busy,ui_busy,key_down,selftest_busy;
 static bool capturing;
+static bool speaker_on,voice_busy,capture_blocked;
 static bool volume_applied;
 static int applied_volume=-1;
 static bool volume_failure;
@@ -75,11 +76,12 @@ esp_err_t bsp_audio_mic_start(void){++mic_starts;return ESP_OK;}
 void bsp_audio_mic_stop(void){++mic_stops;}
 bool bsp_audio_mic_active(void){return false;}
 bool bsp_audio_mic_capturing(void){return capturing;}
-bool bsp_audio_speaker_on(void){return false;}
+bool bsp_audio_speaker_on(void){return speaker_on;}
 esp_err_t bsp_audio_mic_set_frame_callback(bsp_audio_mic_frame_cb_t cb,void *ctx)
 {(void)cb;(void)ctx;return ESP_OK;}
 void meo_voice_link_init(void){}
 void meo_ui_set_wake_state(bool detected){(void)detected;}
+void meo_ui_set_capture_blocked(bool blocked){capture_blocked=blocked;}
 void meo_ui_capture_view(meo_ui_capture_view_t *v){memset(v,0,sizeof(*v));}
 void bsp_audio_mic_level(int rms[2],int peak[2]){rms[0]=rms[1]=peak[0]=peak[1]=0;}
 void bsp_audio_status(bsp_audio_status_t*out){memset(out,0,sizeof(*out));out->route=actual_route;out->volume=30;}
@@ -87,9 +89,7 @@ bool audio_selftest_busy(void){return selftest_busy;}
 void audio_selftest_start(const char*t,int ms){(void)t;(void)ms;}
 void audio_selftest_result(audio_loop_result_t*r){memset(r,0,sizeof(*r));}
 void meo_ui_create(const meo_ui_config_t*c){meo_model_init(&fake_model,0,&c->settings);}
-void meo_voice_view(meo_voice_view_t *v){memset(v,0,sizeof(*v));}
-bool meo_voice_demo_available(void){return false;}
-bool meo_voice_demo(void){return false;}
+void meo_voice_view(meo_voice_view_t *v){memset(v,0,sizeof(*v));v->busy=voice_busy;}
 bool meo_voice_cancel(void){return false;}
 void meo_ui_set_sentence_pose(meo_expression_t e,float level,const meo_face_pose_t *p)
 {meo_model_set_media_pose(&fake_model,e,level,p);}
@@ -186,17 +186,6 @@ int main(void)
     assert(s_interaction_requests==8 && s_interaction_played==3);
     s_ready=false;assert(!meoave_app_request_interaction_sound());s_ready=true;
     puts("PASS: dong coalescing, current enable switch, mute without amp cue, playback lease and failed-volume guard");
-    s_ai_view_seq=s_ai_applied_seq=0;
-    s_ai_request=0;
-    meo_conversation_init(&s_conversation,0,conversation_changed,NULL);
-    assert(meoave_app_request_ai_demo());
-    service_at(0);    assert(fake_model.expression==MEO_EYE_CURIOUS && fake_model.expression_override);
-    service_at(1200); assert(fake_model.expression==MEO_EYE_SLEEPY && fake_model.expression_override);
-    service_at(2000); assert(fake_model.expression==MEO_EYE_HAPPY && fake_model.expression_override);
-    service_at(3800); assert(fake_model.expression==MEO_EYE_CALM && fake_model.expression_override);
-    service_at(4500); assert(fake_model.expression==MEO_EYE_CALM && !fake_model.expression_override);
-    assert(!meoave_app_request_ai_cancel());
-    puts("PASS: app-level offline AI demo drives CURIOUS/SLEEPY/HAPPY/CALM and restores idle expressions");
     capture_status=wide_status=true;
     fake_model.page=MEO_EXPRESSIONS;fake_model.elapsed_ms=UINT64_MAX;
     meoave_app_request_status();service_at(4600);
@@ -216,6 +205,15 @@ int main(void)
     meo_wake_view(&wake);assert(!wake.requested);
     gui_busy=false;capturing=false;
     puts("PASS: renderer lock contention preserves listening; real page exit disarms");
+    service_at(5200);assert(!capture_blocked);
+    speaker_on=true;service_at(5210);assert(capture_blocked);
+    speaker_on=false;service_at(5400);assert(capture_blocked);
+    service_at(5510);assert(!capture_blocked);
+    voice_busy=true;service_at(5520);assert(capture_blocked);
+    voice_busy=false;service_at(5830);assert(!capture_blocked);
+    selftest_busy=true;service_at(5840);assert(capture_blocked);
+    selftest_busy=false;service_at(6150);assert(!capture_blocked);
+    puts("PASS: local output, pending voice and acoustic tests suppress listening, with 300ms output tail");
     s_shutdown=false;key_down=true;now=6000000;meoave_app_key_tick();
     now=7500000;meoave_app_key_tick();assert(shown==3);
     gui_busy=true;key_down=false;now=7600000;meoave_app_key_tick();assert(shown==3);

@@ -44,7 +44,9 @@ python tools/meoave.py all
 - 麦克风页自动开始电平检测，离页停止；设置行只显示真实设置百分比，不重复“灵敏度”文字。扬声器试听为约 1.32 秒 CC0 拨弦音乐，遵循当前音量，包括静音；“咚”交互音在辅助功能开关，最新听感验收状态见 `docs/UI_POLISH_20261113.md`。
 - Wi-Fi 走 ESP-Hosted（C5），凭据存 NVS、开机自动重连，屏幕「设置 → 网络」可扫描并点选已保存的网络；
   也可用 USB 命令 `WIFI STATUS|SCAN|APS|SET|JOIN`。默认 `--profile product` 已包含 Hosted Wi-Fi，不必另换 profile。
-- AI 对话当前已提供离线垂直切片，可用 USB 命令 `AI DEMO|STATUS|CANCEL` 检查状态与眼睛表情联动；
-  该演示不读麦克风、不联网、不保存录音，真实云端对话仍按 `docs/AI_VOICE_PLAN.md` 分阶段接入。
+- AI 对话生产链路通过原生 USB `VOICE OPEN` 二进制会话接收服务器生成的句子、PCM
+  和表情链；`AI STATUS` 只报告真实播放状态，`AI CANCEL` 取消当前生产会话。
+  不再保留固定回复或内置语音 demo。旧 Demo #1 及其独占驱动也已移除，
+  构建不再回退旧演示程序；清理与验收边界见 `docs/PRODUCTION_CLEANUP_20261115.md`。
 
 最新小屏网络布局、三列输入法、Lucide 图标与音乐来源见 `docs/UI_POLISH_20261113.md`；其他 UI 行为及历史实机验收见 `docs/UI_INTERACTION_20261112.md`。

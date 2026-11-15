@@ -43,3 +43,17 @@ func TestCancelCurrentGeneration(t *testing.T) {
 		t.Fatal("cancel did not close context")
 	}
 }
+
+func TestFinishReleasesContextWithoutCancellingNewerTurn(t *testing.T) {
+	m := NewManager()
+	old, _ := m.Start(context.Background(), 1)
+	m.Finish(1)
+	if old.Err() != context.Canceled || m.Cancel(1) {
+		t.Fatal("finished context was not released")
+	}
+	current, _ := m.Start(context.Background(), 2)
+	m.Finish(1)
+	if current.Err() != nil {
+		t.Fatal("finishing old generation cancelled the new one")
+	}
+}

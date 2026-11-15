@@ -114,7 +114,7 @@ static void rx_reassemble(const uint8_t *frame)
         ++s_stats.rx_dropped;
         return;
     }
-    if (total == 0 || index >= total) {
+    if (total == 0 || total > MEO_LINK_MAX_FRAGMENTS || index >= total) {
         ++s_stats.rx_dropped;
         return;
     }
@@ -142,6 +142,10 @@ static void rx_reassemble(const uint8_t *frame)
     s_rx_next = (uint8_t)(index + 1);
 
     if (s_rx_next == s_rx_total) {
+        /* Reports are fixed-size. The last fragment is zero padded by the
+         * desktop HID client; NUL is not valid in a command line, so remove
+         * only the padding at the end before dispatching. */
+        while (s_rx_len && s_rx_buf[s_rx_len - 1] == '\0') --s_rx_len;
         s_rx_buf[s_rx_len] = '\0';
         s_rx_active = false;
         ++s_stats.rx_messages;
@@ -183,7 +187,10 @@ static void send_message(const tx_msg_t *msg)
 {
     size_t total = (msg->len + MEO_LINK_PAYLOAD_SIZE - 1) / MEO_LINK_PAYLOAD_SIZE;
     if (total == 0) total = 1;                 /* 空消息也要占一帧，用于探测 */
-    if (total > 255) total = 255;              /* frag_total 是 uint8_t */
+    if (total > MEO_LINK_MAX_FRAGMENTS) {
+        ++s_stats.tx_dropped;
+        return;
+    }
 
     uint8_t id = s_tx_id++;
     for (size_t i = 0; i < total; ++i) {
@@ -269,6 +276,14 @@ bool meo_link_handle_builtin(const char *line)
         (void)meo_link_send(MEO_LINK_KIND_REPLY, reply);
     } else if (strcmp(verb, "PING") == 0) {
         snprintf(reply, sizeof(reply), "MEO:PONG token=%s via=hid\n", token);
+        (void)meo_link_send(MEO_LINK_KIND_REPLY, reply);
+    } else if (strcmp(verb, "CAPS") == 0) {
+        snprintf(reply, sizeof(reply),
+                 "MEO:LINK token=%s caps=1 version=1 report_id=%u report_size=%u "
+                 "payload=%u max_message=%u max_fragments=%u kinds=RLE transport=hid\n",
+                 token, (unsigned)MEO_LINK_REPORT_ID,
+                 (unsigned)MEO_LINK_REPORT_SIZE, (unsigned)MEO_LINK_PAYLOAD_SIZE,
+                 (unsigned)MEO_LINK_MESSAGE_MAX, (unsigned)MEO_LINK_MAX_FRAGMENTS);
         (void)meo_link_send(MEO_LINK_KIND_REPLY, reply);
     } else {
         snprintf(reply, sizeof(reply), "MEO:LINK token=%s reason=unknown_op\n", token);

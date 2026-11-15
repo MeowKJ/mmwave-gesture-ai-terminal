@@ -25,7 +25,7 @@
 - `meoave_ui.c`：预览与首页共享 renderer，独立模型／缓存；说话才出现小嘴巴。减少动态效果时 cue 仍切换，取消连续微动作／口型形变。
 - 发现并修复像素量化缺陷：眨眼／形变过程中全部路径点重合会被 LVGL 跳过，导致一只眼瞬间消失；现在保留最小 1px 圆角脊线。
 
-**尚未完成**：P4 WSS 音频接收、连续录音／VAD／ASR／真实 LLM、IndexTTS2 权重部署与本机测速、AEC／自然打断。不能把本地语音 fixture 说成联网 AI 完成。
+**尚未完成**：连续录音／VAD／ASR／真实 LLM、IndexTTS2 权重部署与本机测速、AEC／自然打断。生产播放链路只接受服务器生成并校验过的句子元数据和 PCM 流。
 
 ## 3. 一句一包协议 v1
 
@@ -102,24 +102,18 @@ python tools/voice_gateway.py synthesize --plan tools/voice_plan.example.json --
 - https://github.com/FunAudioLLM/CosyVoice （双流式与官方测量范围）
 - 本机锁定 ESP-IDF v6.1 `esp_driver_i2s/i2s_common.c` 的 on_sent 与 DMA cache writeback 实现。
 
-## 5. 本地实音频验证与分层验收
+## 5. 生产链路与分层验收
 
-可选 fixture 留在被 Git 忽略的 `build_ui_assets/voice_fixture`，未生成时干净构建仍可编译，命令明确返回无 fixture。
-`tools/build_voice_fixture.py` 接收两句 48k/S16/mono WAV，记录来源和 SHA，**不是生产 TTS 模型**。
-本轮使用 Windows SAPI Microsoft Huihui Desktop 合成「你好，我在这里。」「今天也陪着你。」作为实际播放源；不冒称 IndexTTS2 生成。
-
-```text
-AI VOICE DEMO  # 本地两句实音频＋每句三个 cue；没有联网／录音
-AI STATUS     # MEO:VOICE 含 played/frames/cue/intensity/underruns
-AI CANCEL     # 同时取消本地语音或旧的无音频状态演示
-AI DEMO       # 旧固定状态机，不播放回答，不是语音验收
-```
+生产语音不再内置演示音频，也不提供固定回复状态机。服务器通过 `VOICE OPEN`
+建立会话，再发送经过句子协议校验的 META、PCM 和 END 帧；P4 按实际 DMA
+完成帧驱动嘴巴和表情链。`AI STATUS` 只报告真实语音状态，`AI CANCEL` 只取消
+当前生产会话。
 
 测试只针对当前改动，不全跑历史 C5／黑屏／音频回环长压测：
 
 ```powershell
 cmake --build firmware/p4_gesture/tests/desktop/build -j 8
-ctest --test-dir firmware/p4_gesture/tests/desktop/build -R 'ui\.|model.state|conversation\.|audio.adapter' --output-on-failure -j 2
+ctest --test-dir firmware/p4_gesture/tests/desktop/build -R 'ui\.|model.state|audio.adapter|conversation\.sentence|conversation\.voice_worker' --output-on-failure -j 2
 python -m unittest discover -s firmware/p4_gesture/tests -p test_voice_gateway.py -v
 & $go -C server test ./...
 python tools/meoave.py build --profile product
@@ -130,7 +124,7 @@ python tools/meoave.py hardware --cycles 1 --restarts 0 --report <本轮新报�
 1. 纯 C／解析：16 种姿态与动画不同、强度 0 归中、过渡、缺链拒绝、畸形／深度／随机输入、暂停／欠载／取消／旧轮隔离。
 2. 生产 worker：真实代码＋模拟 DMA，排空／完成、长度、任务创建失败、取消及无进度超时；不等于物理扬声器。
 3. 同套 LVGL：16 种、强度、嘴型、触摸、首页无状态条；桌面不是实屏。
-4. 板上：新 ELF 身份、同一次启动、两句音频各自完整播放帧数、每句三个 cue、零故障，音量遵循用户设置；还需用户听感与实屏确认。
+4. 板上：新 ELF 身份、同一次启动、生产服务器下发的句子完整播放帧数、表情 cue、零故障，音量遵循用户设置；还需用户听感与实屏确认。
 5. 真实 AI：P4 录音→ASR／LLM→GPU TTS→WSS→P4 播放及表情；**尚未完成**。
 
 ## 6. 不动的硬边界与既有证据
@@ -153,12 +147,10 @@ python tools/meoave.py hardware --cycles 1 --restarts 0 --report <本轮新报�
 
 ### 无声追查与用户验收
 
-- `no-speech-diagnostic-01.json`：只读原生 USB 检查；原设置音量 100%，codec 身份／寄存器／静音状态正常，fixture 在镜像内且 PCM 非零。没有复位、刷写或修改 C5。
-- `no-speech-comparison-01.json`：仍为同一 ELF、同一 boot，将临时测试音量设为 50%，先试听音乐，再播放两句语音。两句分别完成 111822／98028 帧、六 cue、零欠载／播放错误；结束恢复原 100% 音量。
-- 用户明确反馈「只有语音，没有音乐」及「表情和嘴巴联动正常」。因此**本地两句语音＋表情＋口型联动样例实机通过**；音乐未响是独立未决项，不能顺带标记通过。
+- `no-speech-diagnostic-01.json`：只读原生 USB 检查；原设置音量 100%，codec 身份／寄存器／静音状态正常。没有复位、刷写或修改 C5。
+- 历史本地语音样例不再作为当前产品验收依据；生产验收必须使用服务器生成的句子和真实 VOICE 流。
 - `physical-acceptance-followup-01.json`：最终只读检查仍为原 boot，回到 `eyes`、`eye_auto=1`、语音 idle/error=0、音量恢复 100%、FAULT valid=0。用户反馈与串口证据分开记录。
 - 首轮无声根因尚未确定：30% 到 50% 的对比及先播放音乐不是单变量因果实验，不能断言仅是音量问题，也不能宣称彻底修复音频链路。
-- `voice_acceptance.py` 现提供显式 `--volume 1..100`，默认使用已听到的 50% 测试点，报告记录 `test_volume`；正常／异常均恢复原设置，不改变产品音量曲线、不在固件内偷偷放大语音。四项离线工具回归通过，覆盖默认值、显式音量、原静音恢复和失败恢复／非法参数拒绝。
 
 ### 尚不算完成的部分
 
@@ -181,7 +173,7 @@ python tools/meoave.py hardware --cycles 1 --restarts 0 --report <本轮新报�
 
 ### 2026-11-14 AI 页面监听提示与「猫猫」唤醒词
 
-- AI 眼睛页保持纯黑和黑白眼睛主体；当 P4 的 I2S RX 确实处于运行态时，底部显示原生麦克风图标和左右动态波形。波形来自 `bsp_audio_mic_level()` 的实时 RMS，快速上升、缓慢回落；离开 AI 页后采集停止，回到 AI 页恢复。
+- 历史版本曾在 I2S RX 工作时常驻显示麦克风和波形；2026-11-15 按用户最新要求改为：AI 页保持待命，但只有新鲜且持续的说话输入电平才显示右下角 32px 麦克风，胶囊内部随实时 RMS 填充，静音隐藏。自身播放及其 300ms 尾窗不显示；不遮挡表情、不变更采集／ESP-SR。实现边界与本轮验收见 `docs/LISTENING_INDICATOR_20261115.md`；电平门限不是 ASR/VAD 人声分类。
 - P4 的可观测状态增加 `MEO:UI_AUDIO mic_running=1 wake_armed=1`，用于区分「页面看起来像在听」和「硬件确实已启动采集」。本轮实机报告确认这两个状态均为 1。
 - 唤醒词统一为 `猫猫`，公共接口在 `meoave_wake.[ch]`；唤醒后波形/环颜色短暂变为琥珀色，事件通过 `MEO:WAKE ... detected=1` 输出。
 - 本轮已修复 USB CDC 对 UTF-8 字节的过滤以及 `AI WAKE ` 前缀长度错误，`AI WAKE 猫猫` 已在 COM10 上实际触发并通过 `TEXT_BRIDGE` 记录。

@@ -85,16 +85,17 @@ void meo_ui_set_shutdown(int seconds_left);
 /* Per-channel microphone level in 0..1 (0 = silence), [0] = left, [1] = right.
  * Driven from the app task; the page only animates the bars, never I2S. */
 void meo_ui_set_mic(const float level[2], bool running);
-/* AI/home capture feedback. The home dial stays visually quiet until the
- * microphone is actually running; wake_detected changes the ring/accent for a
- * short, unmistakable acknowledgement. */
+/* Suppress the home listening mark during local output and its acoustic tail.
+ * Does not stop capture, change the settings meter, or alter face ownership. */
+void meo_ui_set_capture_blocked(bool blocked);
+/* Wake alone never shows the mark; only fresh, sustained input does. */
 void meo_ui_set_wake_state(bool wake_detected);
 /* Actual LVGL object state, not a copy of the wake model. LVGL lock required.
  * This diagnoses rendering inputs; it cannot inspect physical panel pixels. */
 typedef struct {
     bool visible, ack;
-    uint32_t wave_seq, ink;
-    unsigned min_height, max_height;
+    uint32_t seq, ink;
+    unsigned level, fill_height; /* input level 0..100, capsule fill 0..10px */
 } meo_ui_capture_view_t;
 void meo_ui_capture_view(meo_ui_capture_view_t *out);
 /* Push a fresh audio snapshot; called with the LVGL lock held. */

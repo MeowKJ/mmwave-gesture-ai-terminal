@@ -1,0 +1,3 @@
+# Optional desktop HID command client.  Keep this separate from the ESP-IDF
+# environment because hidapi is not needed to build or flash the firmware.
+hidapi>=0.14,<1

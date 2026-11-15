@@ -300,8 +300,7 @@ level=null（未知），不能把寄存器零值当成真实低电平。
 - 目标、协议、TTS 选型与分层验收：`docs/AI_VOICE_PLAN.md`。
 - `python tools/voice_gateway.py validate --plan tools/voice_plan.example.json`：无依赖、无网络，逐句校验每句非空表情链。
 - `voice_gateway.py synthesize`：在独立 IndexTTS Python 环境中生成 PCM＋设备 JSON；本机路径／模型／音色配置在私有 `config.toml [voice]`。不是 WSS／ASR／LLM 服务，不自动下载模型。
-- `build_voice_fixture.py <句1.wav> <句2.wav> --provenance <真实来源>`：可选本地测试音频打包，输出到忽略的 build_ui_assets；不把它冒称生产 TTS。
-- `python tools/voice_acceptance.py --volume 50 --report <新的绝对路径.json>`：板上两句 PCM 完成、六 cue、重复启动／取消、恢复音量与同 boot；不刷写、不复位、不访问 C5。需要已烧入可选 fixture 的产品固件。临时音量默认 50%，`--volume` 范围 1..100；报告记录实际测试音量，结束／失败恢复原设置。50% 是本板已获听感确认的测试点，不代表声音响度校准或其他音量均已验收。
+- 生产语音验收使用 Go 服务端的 `/v1/play`，通过 `VOICE OPEN` 和带 CRC 的 META/PCM/END 帧联调；不使用内置测试音频或固定 demo。
 - 软件门禁：`ctest --test-dir firmware/p4_gesture/tests/desktop/build -R 'conversation\.|ui\.|model.state|audio.adapter' --output-on-failure`；网关测试为 `python -m unittest discover -s firmware/p4_gesture/tests -p test_voice_gateway.py -v`。
 - 串口/DMA 通过不能替代用户听感／实屏验收；真实 GPU TTS、P4 WSS、录音／识别尚待接入。
 
@@ -338,7 +337,7 @@ python tools/meoave.py wake-acoustic --flash --port COM10 --report firmware/p4_g
 - `--flash` 可选：复用已验证的 P4 原生 USB 下载与 CPU-only 启动，先校验四段 Hash，再核对运行 ELF/boot/供电；不重置 C5、不切下载脚、不触碰 COM3。
 - 默认先枚举并选择本机已启用的中文 Windows SAPI，离线生成“Hi，喵喵”与不含关键词的负例；这是测试音源，不是替换 Go/Edge-TTS 产品服务端，也不是“猫猫”定制模型。
 - 电脑默认扬声器→空气→板上真实麦克风→ESP-SR；不通过 USB 注入音频或 `AI WAKE`，不取消设备自身扬声器的防误唤醒保护。**板子必须已经上电、接着原生 USB，且处于电脑扬声器的可听范围。** 主机音量/默认音频设备均不擅自改动；静音或输出端点太远会真实失败，不伪造通过。
-- 播放为异步，USB 持续采样，避免错过 1.8 s 确认；每轮检查独立声学计数及事件、来源、无文本注入、好奇表情与实际 LVGL 琥珀提示、波形刷新。
+- 播放为异步，USB 持续采样，避免错过 1.8 s 确认；每轮检查独立声学计数／事件／来源、无文本注入和好奇表情。2026-11-15 起监听标志改为输入电平驱动的微型胶囊填充：声源播放时可见、填充序号增长，静默结束必须隐藏；不再要求安静时常驻波形，唤醒确认也不能强制点亮麦克风。
 - 默认静默/非关键词负例、3 次正例、轮间冷却、420 s 持续推理；最终要求同 boot、正确 ELF、干净 fault、回到监听态。只允许有界的加载/模型重建暂态，永久失效/停推理/复位均失败。
 - `--wav 正例.wav --negative-wav 负例.wav` 可用自备单/双声道 PCM16 WAV，跳过 SAPI；每段 0.1–15 s。`--repeat 1..10` 控制轮数；`--soak-seconds 0` 只做短冒烟，不构成 7 分钟稳定性验收。
 - `queue_drops_delta/warnings` 单独报告队列掉块；连续推理恢复不等于零掉块通过，也不能将 7 分钟窗口推广为长期可靠性。

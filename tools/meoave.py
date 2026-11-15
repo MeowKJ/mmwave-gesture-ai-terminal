@@ -9,6 +9,7 @@ Examples:
   python tools/meoave.py c5
   python tools/meoave.py fonts --set wenkai
   python tools/meoave.py hardware --cycles 1 --restarts 3
+  python tools/meoave.py hid --suite safe
 
 Machine-specific ESP-IDF paths belong in tools/config.toml, which is ignored
 by Git. The tool also accepts the normal IDF_PATH/PATH environment setup.
@@ -430,6 +431,9 @@ def tests(config: dict) -> None:
     p4 = project_dir(config)
     run([python_command(config), "-m", "unittest", "discover", "-s", "tests",
          "-p", "test_*.py", "-v"], p4, environment(config), "python tests")
+    run([python_command(config), "-m", "unittest", "discover", "-s", str(TOOLS),
+         "-p", "test_hid_command.py", "-v"], ROOT, environment(config),
+        "desktop HID protocol tests")
 
 
 def wifi_status(config: dict, args: argparse.Namespace) -> int:
@@ -594,6 +598,26 @@ def hardware(config: dict, args: argparse.Namespace) -> None:
     run(command, p4, environment(config), "native USB hardware acceptance")
 
 
+def hid_acceptance(config: dict, args: argparse.Namespace) -> int:
+    """Run the desktop HID command client without touching CDC or COM ports."""
+    command = [python_command(config), str(TOOLS / "hid_command.py")]
+    if args.list:
+        command.append("--list")
+    elif args.command:
+        command += ["--command", args.command]
+    else:
+        command += ["--suite", args.suite]
+        if args.allow_side_effects:
+            command.append("--allow-side-effects")
+    if args.verbose:
+        command.append("--verbose")
+    if args.report and not args.list:
+        command += ["--report", str(resolve(args.report))]
+    print("\n== desktop HID acceptance ==", flush=True)
+    print("$ " + " ".join(command), flush=True)
+    return subprocess.run(command, cwd=ROOT, env=environment(config)).returncode
+
+
 def doctor(config: dict) -> int:
     p4 = project_dir(config)
     print(f"root        : {ROOT}")
@@ -667,6 +691,15 @@ def main() -> int:
     hw.add_argument("--cycles", type=int, default=1)
     hw.add_argument("--restarts", type=int, default=3)
     hw.add_argument("--report", default="test-results/tools_usb_iteration.json")
+    hid = sub.add_parser("hid", help="run the desktop HID command client and acceptance suites")
+    hid_mode = hid.add_mutually_exclusive_group(required=True)
+    hid_mode.add_argument("--list", action="store_true", help="list registered command coverage")
+    hid_mode.add_argument("--command", help="send one raw command over HID")
+    hid_mode.add_argument("--suite", choices=("safe", "full"), help="run a safe or functional suite")
+    hid.add_argument("--allow-side-effects", action="store_true",
+                     help="allow UI, Wi-Fi scan, audio and mic functional checks")
+    hid.add_argument("--verbose", action="store_true")
+    hid.add_argument("--report", default="test-results/hid-acceptance.json")
     wake = sub.add_parser("wake-acoustic", help="play a local phrase and verify real ESP-SR acoustic/UI feedback")
     wake.add_argument("--build-dir", default="firmware/p4_gesture/build_meoave")
     wake.add_argument("--port")
@@ -749,6 +782,8 @@ def main() -> int:
         tests(config)
     elif args.command == "hardware":
         hardware(config, args)
+    elif args.command == "hid":
+        return hid_acceptance(config, args)
     elif args.command == "wake-acoustic":
         command = [python_command(config), str(TOOLS / "wake_acoustic_acceptance.py"),
                    "--build-dir", str(resolve(args.build_dir)),

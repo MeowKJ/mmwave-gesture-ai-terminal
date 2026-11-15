@@ -1,4 +1,4 @@
-/* Diagnostic-only link wrappers. Do not modify official CST820 or demo sources.
+/* Diagnostic-only link wrappers. Do not modify official CST820 or product sources.
  * Passive counters observe normal LVGL reads; explicit TOUCH ON probes use the
  * same IO and a mutex, without a second I2C bus or address scanning. Probe reads
  * are counted separately and do not prove that LVGL is processing input.

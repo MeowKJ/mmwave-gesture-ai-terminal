@@ -3,7 +3,6 @@ if(CONFIG_APP_FLS2_OFFICIAL_BASELINE)
     set(product_requires)
     if(CONFIG_APP_MEOAVE_UI)
         list(APPEND product_sources "meoave_ui.c" "meoave_icons.c" "meoave_model.c" "meoave_app.c"
-             "meoave_conversation.c"
              "meoave_wake.c"
              "meoave_espsr.c"
              "meoave_sr_alloc.c"
@@ -88,12 +87,6 @@ if(CONFIG_APP_FLS2_OFFICIAL_BASELINE)
     endif()
     if(CONFIG_APP_MEOAVE_UI)
         target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)
-        set(voice_fixture "${CMAKE_CURRENT_LIST_DIR}/../build_ui_assets/voice_fixture")
-        if(EXISTS "${voice_fixture}/voice_fixture.pcm" AND EXISTS "${voice_fixture}/voice_fixture.h")
-            target_compile_definitions(${COMPONENT_LIB} PRIVATE MEO_VOICE_FIXTURE=1)
-            target_include_directories(${COMPONENT_LIB} PRIVATE "${voice_fixture}")
-            target_add_binary_data(${COMPONENT_LIB} "${voice_fixture}/voice_fixture.pcm" BINARY RENAME_TO voice_fixture_pcm)
-        endif()
     endif()
     if(CONFIG_APP_C5_SDIO_LOADER)
         target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_BINARY_DIR}")
@@ -112,22 +105,16 @@ if(CONFIG_APP_FLS2_OFFICIAL_BASELINE)
     return()
 endif()
 
-idf_component_register(
-    SRCS "main.c"
-         "demo_ui.c"
-         "bsp_common.c"
-         "bsp_power.c"
-         "bsp_display.c"
-         "bsp_touch.c"
-         "bsp_audio.c"
-         "audio_selftest.c"
-         "meoave_pcm.c"
-         "bsp_radar.c"
-         "bsp_usb.c"
-         "bsp_usb_tx.c"
-    INCLUDE_DIRS "."
-    REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio esp_driver_uart
-             esp_driver_i2s esp_adc esp_hw_support esp_timer esp_app_format
-    PRIV_REQUIRES esp_lcd_touch_cst820 esp_lcd_touch nvs_flash
-)
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
+# IDF expands this file once before sdkconfig is available. Register the
+# common dependencies in that pass; never fall back to the retired demo.
+if(CMAKE_BUILD_EARLY_EXPANSION)
+    idf_component_register(
+        INCLUDE_DIRS "."
+        REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio esp_driver_i2s esp_adc
+                 esp_event esp_hw_support esp_timer esp_app_format meo_link
+        PRIV_REQUIRES esp_lcd_touch_cst820 esp_lcd_touch nvs_flash mbedtls esp_driver_uart
+    )
+else()
+    message(FATAL_ERROR
+        "The legacy application entry has been removed. Use tools/meoave.py build --profile product.")
+endif()

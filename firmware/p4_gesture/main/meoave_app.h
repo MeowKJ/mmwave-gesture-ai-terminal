@@ -15,15 +15,13 @@ bool meoave_app_request_interaction_sound(void);
 void meoave_app_request_volume(int percent);
 /* Jump to a page by name from the USB shell ("UI GO mic"); applied on the app
  * task under the GUI lock, so it is safe to call from the USB callback. */
-void meoave_app_request_page(const char *name);
+bool meoave_app_request_page(const char *name);
 /* Show/hide the shutdown countdown overlay from the shell (n<0 hides). */
 void meoave_app_request_shutdown(int seconds);
 /* Frame pacing probe: >0 starts a measurement window of that many ms,
    0 reports the most recent published window over USB. */
 void meoave_app_request_fps(int ms);
-/* Offline vertical slice for validating the future voice transport seam. */
-bool meoave_app_request_ai_demo(void);
-bool meoave_app_request_voice_demo(void);
+/* Cancel the active production conversation/voice session. */
 bool meoave_app_request_ai_cancel(void);
 void meoave_app_request_ai_status(void);
 /* Queue a recognized phrase from a future C5/server ASR bridge. The current

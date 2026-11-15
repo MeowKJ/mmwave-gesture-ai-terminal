@@ -14,17 +14,21 @@ import (
 )
 
 type Config struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	Timeout time.Duration
+	BaseURL         string
+	APIKey          string
+	Model           string
+	Timeout         time.Duration
+	ReasoningEffort string
+	JSONOutput      bool
 }
 
 type Client struct {
-	baseURL string
-	apiKey  string
-	model   string
-	http    *http.Client
+	baseURL         string
+	apiKey          string
+	model           string
+	reasoningEffort string
+	jsonOutput      bool
+	http            *http.Client
 }
 
 type Message struct {
@@ -33,11 +37,17 @@ type Message struct {
 }
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []Message       `json:"messages"`
+	Temperature     float64         `json:"temperature,omitempty"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
+}
+
+type responseFormat struct {
+	Type string `json:"type"`
 }
 
 type chatResponse struct {
@@ -72,25 +82,32 @@ func New(config Config) (*Client, error) {
 		config.Timeout = 60 * time.Second
 	}
 	return &Client{
-		baseURL: base,
-		apiKey:  config.APIKey,
-		model:   config.Model,
-		http:    &http.Client{Timeout: config.Timeout},
+		baseURL:         base,
+		apiKey:          config.APIKey,
+		model:           config.Model,
+		reasoningEffort: config.ReasoningEffort,
+		jsonOutput:      config.JSONOutput,
+		http:            &http.Client{Timeout: config.Timeout},
 	}, nil
 }
 
 func (c *Client) Model() string { return c.model }
 
 func (c *Client) Complete(ctx context.Context, systemPrompt, userPrompt string) (CompletionResult, error) {
-	body, err := json.Marshal(chatRequest{
+	request := chatRequest{
 		Model: c.model,
 		Messages: []Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
-		Temperature: 0,
-		MaxTokens:   768,
-	})
+		Temperature:     0,
+		MaxTokens:       768,
+		ReasoningEffort: c.reasoningEffort,
+	}
+	if c.jsonOutput {
+		request.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return CompletionResult{}, err
 	}

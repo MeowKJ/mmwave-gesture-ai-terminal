@@ -14,6 +14,7 @@ import (
 
 	"github.com/meoave/meoave/server/internal/api"
 	"github.com/meoave/meoave/server/internal/device"
+	"github.com/meoave/meoave/server/internal/llm"
 	"github.com/meoave/meoave/server/internal/tts"
 )
 
@@ -47,7 +48,18 @@ func main() {
 		log.Info("Meoave native USB voice transport enabled", "port", *devicePort, "baud", *deviceBaud)
 	}
 	service := api.NewWithDevice(ttsClient, log, dev)
-	server := &http.Server{Addr: *listen, Handler: service.Routes(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 90 * time.Second}
+	if key := os.Getenv("MEOAVE_LLM_API_KEY"); key != "" {
+		client, err := llm.New(llm.Config{BaseURL: envOr("MEOAVE_LLM_BASE_URL", "https://api.deepseek.com"), APIKey: key,
+			Model: envOr("MEOAVE_LLM_MODEL", "deepseek-flash"), Timeout: 60 * time.Second,
+			ReasoningEffort: envOr("MEOAVE_LLM_REASONING_EFFORT", ""), JSONOutput: envOr("MEOAVE_LLM_JSON_OUTPUT", "") == "true"})
+		if err != nil {
+			log.Error("configure LLM", "error", err)
+			os.Exit(1)
+		}
+		service.LLM = client
+	}
+	server := &http.Server{Addr: *listen, Handler: service.Routes(), ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout: 10 * time.Second, WriteTimeout: 180 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
